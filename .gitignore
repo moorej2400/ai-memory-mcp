@@ -1,0 +1,14 @@
+.venv/
+.graphify-runtime/
+.migration-archive/
+.env
+.coverage
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+benchmarks/runs/
+docs/archive/
+!AGENTS.md

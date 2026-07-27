@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "exact-ticket",
+      "query": "ALPHA-142",
+      "expected_any": ["mem-alpha-retry"],
+      "tags": ["identifier"]
+    },
+    {
+      "id": "exact-error",
+      "query": "What should happen after NX-401?",
+      "expected_any": ["mem-alpha-retry"],
+      "tags": ["identifier", "error-string"]
+    },
+    {
+      "id": "retry-paraphrase",
+      "query": "How do we avoid hammering the service when a temporary login failure happens?",
+      "expected_any": ["mem-alpha-retry"],
+      "tags": ["paraphrase", "semantic"]
+    },
+    {
+      "id": "exact-path",
+      "query": "Which memory documents scripts/launch-hidden.vbs?",
+      "expected_any": ["mem-hidden-startup"],
+      "tags": ["path", "identifier"]
+    },
+    {
+      "id": "startup-paraphrase",
+      "query": "How is the proxy started in the background without showing a terminal?",
+      "expected_any": ["mem-hidden-startup"],
+      "tags": ["paraphrase", "semantic"]
+    },
+    {
+      "id": "authority",
+      "query": "Is Graphify the source of truth for memory?",
+      "expected_any": ["mem-memory-authority"],
+      "tags": ["decision", "semantic"]
+    },
+    {
+      "id": "graph-provider",
+      "query": "What role does Graphify play in the memory system?",
+      "expected_any": ["mem-memory-authority", "mem-graph-refresh"],
+      "tags": ["architecture", "graph"]
+    },
+    {
+      "id": "refresh-order",
+      "query": "What are the guarded refresh phases before a graph is published?",
+      "expected_any": ["mem-graph-refresh"],
+      "tags": ["workflow", "semantic"]
+    },
+    {
+      "id": "delta-refresh",
+      "query": "How should a one-note memory change be indexed efficiently?",
+      "expected_any": ["mem-graph-refresh"],
+      "tags": ["workflow", "paraphrase"]
+    },
+    {
+      "id": "beta-cache",
+      "query": "BETA-219 stale cache pointer",
+      "expected_any": ["mem-beta-cache"],
+      "tags": ["identifier", "exact"]
+    },
+    {
+      "id": "beta-scope",
+      "query": "How is the generation counter used?",
+      "expected_any": ["mem-beta-cache"],
+      "scope": {"repository": "beta"},
+      "forbidden": ["mem-alpha-generation"],
+      "tags": ["scope", "repository"]
+    },
+    {
+      "id": "alpha-scope",
+      "query": "How is the generation counter used?",
+      "expected_any": ["mem-alpha-generation"],
+      "scope": {"repository": "alpha"},
+      "forbidden": ["mem-beta-cache"],
+      "tags": ["scope", "repository"]
+    },
+    {
+      "id": "active-policy",
+      "query": "What is the current credential rotation interval?",
+      "expected_any": ["mem-active-rotation"],
+      "forbidden": ["mem-old-rotation"],
+      "tags": ["freshness", "supersession"]
+    },
+    {
+      "id": "superseded-policy",
+      "query": "What did the old credential rotation policy require?",
+      "expected_any": ["mem-old-rotation"],
+      "scope": {"status": "superseded"},
+      "tags": ["supersession", "scope"]
+    },
+    {
+      "id": "project-scope",
+      "query": "Which color is used for release markers?",
+      "expected_any": ["mem-project-orion"],
+      "scope": {"project": "orion"},
+      "forbidden": ["mem-project-nova"],
+      "tags": ["scope", "project"]
+    },
+    {
+      "id": "multi-hop-start",
+      "query": "Which ticket introduced the refresh workflow that protects canonical memory?",
+      "expected_any": ["mem-demo-777", "mem-graph-refresh"],
+      "tags": ["multi-hop", "graph"]
+    },
+    {
+      "id": "constraint",
+      "query": "Why are old SQLite index snapshots retained?",
+      "expected_any": ["mem-index-recovery"],
+      "tags": ["constraint", "paraphrase"]
+    },
+    {
+      "id": "citation",
+      "query": "Where is the MCP stable version constraint recorded?",
+      "expected_any": ["mem-mcp-version"],
+      "expected_path": "Tools/MCP Version.md",
+      "tags": ["citation", "path"]
+    },
+    {
+      "id": "missing-product",
+      "query": "What is the launch date of Project Zephyr?",
+      "no_answer": true,
+      "tags": ["no-answer"]
+    },
+    {
+      "id": "missing-secret",
+      "query": "What is the production database password?",
+      "no_answer": true,
+      "tags": ["no-answer", "safety"]
+    }
+  ]
+}

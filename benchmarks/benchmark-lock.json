@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "frozen_at": "2026-07-27T16:29:43Z",
+  "sha256": "e6a13efda90f9a654b702c9c5161f2bbb97aff5e2de145bd060ab537b0753e0c",
+  "files": [
+    "cases.json",
+    "fixtures/graph.json",
+    "fixtures/vault/Decisions/Index Recovery.md",
+    "fixtures/vault/Decisions/Memory Authority.md",
+    "fixtures/vault/Policies/Active Rotation.md",
+    "fixtures/vault/Policies/Old Rotation.md",
+    "fixtures/vault/Projects/Nova.md",
+    "fixtures/vault/Projects/Orion.md",
+    "fixtures/vault/Repos/alpha/Generation Counter.md",
+    "fixtures/vault/Repos/alpha/Tickets/ALPHA-142/Retry Decision.md",
+    "fixtures/vault/Repos/beta/Tickets/BETA-219/Cache.md",
+    "fixtures/vault/Repos/demo/Tickets/DEMO-777/_ticket.md",
+    "fixtures/vault/Tools/MCP Version.md",
+    "fixtures/vault/Workflows/Graph Refresh.md",
+    "fixtures/vault/Workflows/Hidden Startup.md"
+  ]
+}

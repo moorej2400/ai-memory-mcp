@@ -1,0 +1,213 @@
+# AI Memory MCP
+
+AI Memory MCP gives agents one stable interface for durable memory.
+The server combines exact, lexical, semantic, and graph search results.
+
+Markdown files are the source of truth.
+The system derives SQLite indexes and Graphify graphs from Markdown.
+
+## Architecture decision
+
+The system is built around Graphify.
+Graphify remains a replaceable provider behind the stable AI Memory MCP interface.
+
+The MCP facade owns scope, ranking, evidence, health, feedback, and refresh control.
+Clients do not depend on Graphify commands, files, or response formats.
+
+This boundary permits a future graph-provider change without a client configuration change.
+Read the complete [architecture guide](docs/architecture.md) for the design rules.
+
+## System architecture
+
+```mermaid
+flowchart LR
+    subgraph Clients["MCP clients"]
+        Codex[Codex]
+        Claude[Claude]
+        Copilot[Copilot]
+        OpenCode[OpenCode]
+        VSCode[VS Code]
+    end
+
+    subgraph Repository["AI Memory MCP repository"]
+        MCP["MCP facade<br/>Eight public tools"]
+        Service["MemoryService<br/>Policy and orchestration"]
+        Retrieval["RetrievalEngine<br/>Scope, fusion, and reranking"]
+        Indexer["Memory indexer<br/>Validation and snapshots"]
+        Adapter["GraphifyAdapter<br/>Replaceable provider boundary"]
+        Skill["Canonical ai-memory skill"]
+    end
+
+    subgraph Authority["Canonical authority"]
+        Markdown["Markdown memory<br/>Durable source of truth"]
+    end
+
+    subgraph Derived["Derived state"]
+        SQLite["Versioned SQLite<br/>FTS5 and semantic vectors"]
+        Graph["Graphify graph<br/>Nodes, edges, and paths"]
+    end
+
+    Clients --> MCP
+    MCP --> Service
+    Service --> Retrieval
+    Retrieval --> SQLite
+    Retrieval --> Adapter
+    Adapter --> Graph
+    Markdown --> Indexer
+    Indexer --> SQLite
+    Markdown --> Graph
+    Skill -. guides .-> Clients
+```
+
+## Main components
+
+| Component | Responsibility |
+|---|---|
+| Markdown memory | Stores canonical durable records. |
+| Memory indexer | Validates records and publishes versioned SQLite snapshots. |
+| SQLite FTS5 | Supplies exact and lexical candidates. |
+| Local semantic index | Supplies paraphrase candidates without an external API. |
+| Graphify adapter | Supplies relationships, neighbors, and paths. |
+| Retrieval engine | Applies scope, RRF fusion, reranking, and context expansion. |
+| MCP facade | Supplies the stable public tools and evidence packets. |
+| Canonical skill | Gives agents the memory workflow and safety rules. |
+| Client installer | Registers the MCP server and repository-linked skill stubs. |
+
+## Query architecture
+
+`memory_search` is the normal recall tool.
+The retrieval engine plans and combines all provider work internally.
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant MCP as MCP facade
+    participant Service as MemoryService
+    participant Engine as RetrievalEngine
+    participant SQLite as SQLite index
+    participant Graphify as GraphifyAdapter
+
+    Agent->>MCP: memory_search query and scope
+    MCP->>Service: Validate tool input
+    Service->>Engine: Search request
+    Engine->>Engine: Resolve scope and ticket identifiers
+    Engine->>SQLite: Get scoped lexical candidates
+    SQLite-->>Engine: Ranked lexical hits
+    Engine->>SQLite: Get scoped semantic vectors
+    SQLite-->>Engine: Ranked semantic hits
+    Engine->>Graphify: Rank scoped candidate paths
+    Graphify-->>Engine: Relationship signals
+    Engine->>Engine: Fuse results with RRF
+    Engine->>Engine: Deduplicate and rerank
+    Engine->>SQLite: Expand bounded context
+    Engine-->>Service: Evidence packet with source paths
+    Service-->>MCP: Structured result
+    MCP-->>Agent: Cited memory evidence
+```
+
+The engine applies scope before it ranks each provider result.
+Exact identifiers receive bounded bonuses during reranking.
+
+Graph traversal contributes one retrieval signal.
+It does not replace lexical or semantic retrieval.
+
+## Refresh architecture
+
+An index refresh updates SQLite after a normal Markdown change.
+A full refresh also rebuilds the Graphify graph.
+
+```mermaid
+flowchart TD
+    Change[Canonical Markdown change] --> Mode{Refresh mode}
+    Mode -->|index| IndexStage[Build staged SQLite snapshot]
+    Mode -->|full| GraphStage[Build staged Graphify data]
+    GraphStage --> GraphValidate{Graph validation}
+    GraphValidate -->|pass| GraphPublish[Publish Graphify graph]
+    GraphValidate -->|fail| GraphKeep[Keep the last satisfactory graph]
+    GraphPublish --> IndexStage
+    IndexStage --> IndexValidate{Index validation}
+    IndexValidate -->|pass| Pointer[Publish the current-index pointer]
+    IndexValidate -->|fail| IndexKeep[Keep the last satisfactory index]
+    Pointer --> Health[Run health and retrieval checks]
+```
+
+The full refresh uses staging, validation, publication, health checks, and rollback.
+A failed refresh does not change the Markdown authority.
+
+## Reliability and performance
+
+- The repository pins Graphify 0.9.26 in an isolated environment.
+- Scope filters run before provider ranking.
+- RRF combines independent provider rankings.
+- Bounded reranking limits query work.
+- Incremental indexing skips unchanged Markdown files.
+- Versioned snapshots preserve the last satisfactory index.
+- Full graph refreshes validate staged data before publication.
+- Evidence packets include canonical source paths.
+
+## Quick start
+
+Install these items:
+
+- Git
+- Python 3.11 or later
+- PowerShell 5.1 or later
+- A Markdown memory directory
+
+Open PowerShell in the repository root.
+Then, run this command:
+
+```powershell
+.\scripts\setup.ps1 -MemoryRoot 'C:\path\to\AI-Memory' -InstallClients
+```
+
+Restart each configured client after the setup procedure is complete.
+
+For more setup information, read the [installation guide](docs/installation.md).
+
+## MCP tools
+
+| Tool | Function |
+|---|---|
+| `memory_search` | Finds relevant memory evidence. |
+| `memory_get` | Gets one memory by its identity or path. |
+| `memory_neighbors` | Gets related memories. |
+| `memory_path` | Finds a relationship path. |
+| `memory_explain` | Explains why evidence matches a query. |
+| `memory_refresh` | Updates derived indexes. |
+| `memory_health` | Gives health and version data. |
+| `memory_feedback` | Records retrieval feedback. |
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `src/ai_memory_mcp/` | MCP server, retrieval engine, indexer, and adapters |
+| `scripts/` | Setup, client installation, and Graphify operations |
+| `skill/ai-memory/` | Canonical AI Memory skill |
+| `tests/` | Automated behavior and portability tests |
+| `benchmarks/` | Frozen retrieval contract and fixtures |
+| `docs/` | Architecture, setup, operations, and validation guides |
+
+## Documentation
+
+The [documentation index](docs/README.md) gives links to all project guides.
+
+- [Installation](docs/installation.md)
+- [Configuration](docs/configuration.md)
+- [Operations](docs/operations.md)
+- [Architecture](docs/architecture.md)
+- [Development](docs/development.md)
+- [Validation](docs/validation-report.md)
+- [Writing standard](docs/writing-standard.md)
+
+## Source boundary
+
+This is a public repository.
+This repository contains all project source files.
+It contains only neutral examples and synthetic benchmark fixtures.
+The user memory directory stays outside Git.
+Generated indexes, logs, and recovery files also stay outside Git.
+Machine-specific and organization-specific values stay in the ignored `.env` file.
+
+Read [AGENTS.md](AGENTS.md) before you change this repository.

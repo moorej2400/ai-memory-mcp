@@ -1,0 +1,17 @@
+{
+  "directed": false,
+  "multigraph": false,
+  "nodes": [
+    {"id": "authority", "label": "Canonical memory authority", "source_file": "Decisions/Memory Authority.md"},
+    {"id": "refresh", "label": "Guarded Graphify memory refresh", "source_file": "Workflows/Graph Refresh.md"},
+    {"id": "demo777", "label": "DEMO-777 memory refresh safety", "source_file": "Repos/demo/Tickets/DEMO-777/_ticket.md"},
+    {"id": "retry", "label": "ALPHA-142 transient authentication retry", "source_file": "Repos/alpha/Tickets/ALPHA-142/Retry Decision.md"},
+    {"id": "recovery", "label": "Immutable index snapshot recovery", "source_file": "Decisions/Index Recovery.md"}
+  ],
+  "links": [
+    {"source": "demo777", "target": "refresh", "relation": "introduced", "confidence": "EXTRACTED"},
+    {"source": "refresh", "target": "authority", "relation": "protects", "confidence": "EXTRACTED"},
+    {"source": "refresh", "target": "recovery", "relation": "preserves", "confidence": "EXTRACTED"},
+    {"source": "retry", "target": "refresh", "relation": "uses_bounded_retry", "confidence": "INFERRED"}
+  ]
+}

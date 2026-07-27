@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI Memory"
+  short_description: "Automatic durable memory and Graphify recall"
+  default_prompt: "Use $ai-memory to capture and organize durable learnings from this work."
