@@ -309,10 +309,9 @@ class MemoryIndex:
         ] = {}
         self.path = current_index_path(settings)
         if self.path is None:
-            build_index(settings)
-            self.path = current_index_path(settings)
-        if self.path is None:
-            raise RuntimeError("Index publication completed without a snapshot")
+            raise FileNotFoundError(
+                "Memory index is not available. Call memory_sync before recall."
+            )
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -326,20 +325,95 @@ class MemoryIndex:
                 for row in connection.execute("SELECT key, value FROM metadata")
             }
 
-    def document(self, identity: str) -> dict[str, object] | None:
+    def document(
+        self,
+        identity: str,
+        scope: ScopeFilter | None = None,
+    ) -> dict[str, object] | None:
+        where, parameters = scope_sql(scope or ScopeFilter(status=""))
+        scope_clause = where.replace("WHERE", "AND", 1) if where else ""
         with self.connection() as connection:
             row = connection.execute(
-                """
-                SELECT * FROM documents
-                WHERE memory_id = ? OR path = ? OR path LIKE ?
+                f"""
+                SELECT d.* FROM documents d
+                WHERE (
+                    d.memory_id = ?
+                    OR d.path = ?
+                    OR lower(d.title) = lower(?)
+                    OR d.path LIKE ?
+                    OR d.title LIKE ?
+                )
+                {scope_clause}
                 ORDER BY
-                    CASE WHEN memory_id = ? THEN 0 WHEN path = ? THEN 1 ELSE 2 END,
-                    length(path)
+                    CASE
+                        WHEN d.memory_id = ? THEN 0
+                        WHEN d.path = ? THEN 1
+                        WHEN lower(d.title) = lower(?) THEN 2
+                        ELSE 3
+                    END,
+                    length(d.path)
                 LIMIT 1
                 """,
-                (identity, identity, f"%{identity}%", identity, identity),
+                (
+                    identity,
+                    identity,
+                    identity,
+                    f"%{identity}%",
+                    f"%{identity}%",
+                    *parameters,
+                    identity,
+                    identity,
+                    identity,
+                ),
             ).fetchone()
         return decode_document(row) if row else None
+
+    def mentioned_documents(
+        self,
+        query: str,
+        scope: ScopeFilter,
+        *,
+        limit: int = 3,
+    ) -> list[dict[str, object]]:
+        where, parameters = scope_sql(scope)
+        with self.connection() as connection:
+            rows = connection.execute(
+                f"SELECT d.* FROM documents d {where}",
+                parameters,
+            ).fetchall()
+        query_text = query.casefold()
+        matches: list[tuple[int, int, dict[str, object]]] = []
+        for row in rows:
+            document = decode_document(row)
+            path = str(document["path"])
+            identities = {
+                str(document["memory_id"]),
+                path,
+                Path(path).stem,
+                str(document["title"]),
+            }
+            matched = [
+                (query_text.index(identity.casefold()), len(identity))
+                for identity in identities
+                if len(identity) >= 4 and identity.casefold() in query_text
+            ]
+            if matched:
+                position, matched_length = min(
+                    matched,
+                    key=lambda item: (item[0], -item[1]),
+                )
+                matches.append((position, matched_length, document))
+        matches.sort(
+            key=lambda item: (
+                item[0],
+                -item[1],
+                str(item[2]["title"]).casefold(),
+            )
+        )
+        return [
+            document
+            for _, _, document in matches[: max(1, limit)]
+        ]
 
     def all_vectors(
         self, scope: ScopeFilter
@@ -375,15 +449,28 @@ class MemoryIndex:
         self._vector_cache[cache_key] = decoded
         return decoded
 
-    def chunks_for_memory(self, memory_id: str) -> list[sqlite3.Row]:
+    def chunks_for_memories(
+        self,
+        memory_ids: list[str],
+    ) -> dict[str, list[sqlite3.Row]]:
+        if not memory_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in memory_ids)
         with self.connection() as connection:
-            return connection.execute(
-                """
-                SELECT * FROM chunks WHERE memory_id = ?
-                ORDER BY ordinal
+            rows = connection.execute(
+                f"""
+                SELECT * FROM chunks
+                WHERE memory_id IN ({placeholders})
+                ORDER BY memory_id, ordinal
                 """,
-                (memory_id,),
+                memory_ids,
             ).fetchall()
+        grouped: dict[str, list[sqlite3.Row]] = {
+            memory_id: [] for memory_id in memory_ids
+        }
+        for row in rows:
+            grouped[str(row["memory_id"])].append(row)
+        return grouped
 
 
 def decode_document(row: sqlite3.Row) -> dict[str, object]:
@@ -413,20 +500,62 @@ def scope_sql(scope: ScopeFilter) -> tuple[str, list[str]]:
         parameters.append(f"{scope.path_prefix.rstrip('/')}%")
     if scope.repository:
         clauses.append(
-            "(d.repos_json LIKE ? OR d.scope_id LIKE ? OR d.path LIKE ?)"
+            """
+            (
+                EXISTS (
+                    SELECT 1 FROM json_each(d.repos_json)
+                    WHERE lower(value) = lower(?)
+                )
+                OR lower(d.scope_id) = lower(?)
+                OR lower(d.path) LIKE lower(?)
+            )
+            """
         )
-        pattern = f"%{scope.repository}%"
-        parameters.extend((pattern, pattern, pattern))
+        parameters.extend(
+            (
+                scope.repository,
+                scope.repository,
+                f"%/{scope.repository}/%",
+            )
+        )
     if scope.project:
         clauses.append(
-            "(d.projects_json LIKE ? OR d.scope_id LIKE ? OR d.path LIKE ?)"
+            """
+            (
+                EXISTS (
+                    SELECT 1 FROM json_each(d.projects_json)
+                    WHERE lower(value) = lower(?)
+                )
+                OR lower(d.scope_id) = lower(?)
+                OR lower(d.path) LIKE lower(?)
+            )
+            """
         )
-        pattern = f"%{scope.project}%"
-        parameters.extend((pattern, pattern, pattern))
+        parameters.extend(
+            (
+                scope.project,
+                scope.project,
+                f"%/{scope.project}/%",
+            )
+        )
     if scope.ticket:
         clauses.append(
-            "(d.identifiers_json LIKE ? OR d.scope_id LIKE ? OR d.path LIKE ?)"
+            """
+            (
+                EXISTS (
+                    SELECT 1 FROM json_each(d.identifiers_json)
+                    WHERE lower(value) = lower(?)
+                )
+                OR lower(d.scope_id) = lower(?)
+                OR lower(d.path) LIKE lower(?)
+            )
+            """
         )
-        pattern = f"%{scope.ticket}%"
-        parameters.extend((pattern, pattern, pattern))
+        parameters.extend(
+            (
+                scope.ticket,
+                scope.ticket,
+                f"%/{scope.ticket}/%",
+            )
+        )
     return (f"WHERE {' AND '.join(clauses)}" if clauses else "", parameters)

@@ -1,28 +1,57 @@
 from __future__ import annotations
 
 import importlib.metadata
-import json
-import os
 import platform
-import shutil
-import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from .graphify import GraphifyAdapter
 from .index import MemoryIndex, build_index, current_index_path
-from .models import ScopeFilter
+from .models import (
+    CanonicalMemoryStatus,
+    GraphifyRuntimeStatus,
+    GraphifyStatus,
+    IndexStatus,
+    RecallCitation,
+    RecallEvidence,
+    RecallRelationship,
+    RecallResponse,
+    RuntimeStatus,
+    ScopeFilter,
+    SearchHit,
+    StatusResponse,
+    SyncIndexResult,
+    SyncResponse,
+)
 from .retrieval import RetrievalEngine
+from .text import tokenize
+
+RELATIONSHIP_TERMS = {
+    "connect",
+    "connected",
+    "connection",
+    "path",
+    "relate",
+    "related",
+    "relationship",
+}
 
 
 class MemoryService:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or Settings.from_env()
-        self.engine = RetrievalEngine(self.settings)
+        self._engine: RetrievalEngine | None = None
 
-    def search(
+    @property
+    def engine(self) -> RetrievalEngine:
+        if self._engine is None:
+            self._engine = RetrievalEngine(self.settings)
+        return self._engine
+
+    def recall(
         self,
         query: str,
         *,
@@ -33,8 +62,10 @@ class MemoryService:
         status: str = "active",
         path_prefix: str | None = None,
         limit: int | None = None,
-        explain: bool = True,
-    ) -> dict[str, Any]:
+    ) -> RecallResponse:
+        query = query.strip()
+        if not query:
+            raise ValueError("Query must not be empty.")
         scope = ScopeFilter(
             root_scope=root_scope,
             repository=repository,
@@ -43,137 +74,321 @@ class MemoryService:
             status=status,
             path_prefix=path_prefix,
         )
-        return self.engine.search(
-            query, scope=scope, limit=limit, explain=explain
-        ).to_dict()
-
-    def get(self, identity: str) -> dict[str, Any]:
-        return self.engine.get(identity)
-
-    def neighbors(self, identity: str, depth: int = 1) -> dict[str, Any]:
-        return self.engine.neighbors(identity, depth)
-
-    def path(self, source: str, target: str) -> dict[str, Any]:
-        return self.engine.path(source, target)
-
-    def explain(self, query: str, identity: str | None = None) -> dict[str, Any]:
-        packet = self.search(query, limit=5, explain=True)
-        if identity:
-            packet["results"] = [
-                result
-                for result in packet["results"]
-                if identity in (result["memory_id"], result["path"], result["title"])
-            ]
-        return packet
-
-    def refresh(self, mode: str = "index", force: bool = False) -> dict[str, Any]:
-        if mode not in {"index", "full"}:
-            raise ValueError("mode must be 'index' or 'full'")
-        graphify: dict[str, Any] | None = None
-        if mode == "full":
-            runtime = self._graphify_runtime()
-            if not runtime["consistent"]:
-                return {
-                    "ok": False,
-                    "graphify": {
-                        "ok": False,
-                        "failure": "graphify-runtime-preflight",
-                        "runtime": runtime,
-                    },
-                    "index": None,
-                }
-            script = self.settings.refresh_script
-            if not script or not script.exists():
-                raise FileNotFoundError(f"Graphify refresh script not found: {script}")
-            started = time.perf_counter()
-            environment = dict(os.environ)
-            scripts = Path(str(runtime["scripts_dir"]))
-            environment["PATH"] = f"{scripts}{os.pathsep}{environment.get('PATH', '')}"
-            environment["AI_MEMORY_GRAPHIFY_PYTHON"] = str(runtime["python"])
-            environment["AI_MEMORY_GRAPHIFY_MCP_EXE"] = str(runtime["mcp_executable"])
-            powershell = shutil.which("pwsh") or shutil.which("powershell")
-            if not powershell:
-                raise FileNotFoundError("PowerShell is required for Graphify refresh")
-            run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            refresh_log = (
-                self.settings.state_dir / f"graphify-refresh-{run_stamp}.log"
+        if current_index_path(self.settings) is None:
+            return RecallResponse(
+                status="no_answer",
+                intent="search",
+                query=query,
+                warnings=["Memory index is not available. Call memory_sync."],
             )
-            self.settings.state_dir.mkdir(parents=True, exist_ok=True)
-            # The restarted MCP outlives PowerShell. A real file avoids the
-            # inherited-pipe EOF wait that would otherwise strand this caller.
-            with refresh_log.open("w", encoding="utf-8") as handle:
-                process = subprocess.run(
-                    [
-                        powershell,
-                        "-NoProfile",
-                        "-ExecutionPolicy",
-                        "Bypass",
-                        "-File",
-                        str(script),
-                    ],
-                    stdout=handle,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    timeout=1800,
-                    check=False,
-                    env=environment,
-                )
-            output_tail = refresh_log.read_text(
-                encoding="utf-8", errors="replace"
-            )[-4000:]
-            graphify = {
-                "ok": process.returncode == 0,
-                "exit_code": process.returncode,
-                "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
-                "log": str(refresh_log),
-                "output_tail": output_tail,
-            }
-            if process.returncode != 0:
-                return {"ok": False, "graphify": graphify, "index": None}
-        indexed = build_index(self.settings, force=force)
-        self.engine = RetrievalEngine(self.settings)
-        return {"ok": True, "graphify": graphify, "index": indexed}
 
-    def health(self) -> dict[str, Any]:
+        exact = self.engine.get(self._identity_candidate(query), scope)
+        if exact["found"]:
+            return self._exact_response(query, exact["memory"], scope)
+
+        mentioned = self.engine.mentioned_documents(query, scope, limit=3)
+        if self._is_relationship_query(query) and len(mentioned) >= 2:
+            return self._relationship_response(
+                query,
+                mentioned[0],
+                mentioned[1],
+                scope,
+            )
+
+        packet = self.engine.search(query, scope=scope, limit=limit)
+        evidence = [
+            RecallEvidence(
+                memory_id=hit.memory_id,
+                heading=hit.heading,
+                text=hit.text,
+                score=max(0.0, hit.score),
+                reasons=hit.reasons,
+            )
+            for hit in packet.results
+        ]
+        citations = [
+            RecallCitation(
+                memory_id=hit.memory_id,
+                path=hit.path,
+                title=hit.title,
+            )
+            for hit in packet.results
+        ]
+        relationships = self._result_relationships(packet.results, scope)
+        warnings = self._graph_warnings()
+        return RecallResponse(
+            status=packet.answer_status,
+            intent="search",
+            query=query,
+            evidence=evidence,
+            citations=citations,
+            relationships=relationships,
+            warnings=warnings,
+        )
+
+    def sync(self) -> SyncResponse:
+        indexed = build_index(self.settings, force=False)
+        self._engine = RetrievalEngine(self.settings)
+        return SyncResponse(
+            ok=True,
+            index=SyncIndexResult.model_validate(indexed),
+        )
+
+    def status(self) -> StatusResponse:
         index_path = current_index_path(self.settings)
-        index_meta: dict[str, Any] = {"available": False}
+        index_status = IndexStatus(available=False)
         if index_path:
             index = MemoryIndex(self.settings)
-            index_meta = {
-                "available": True,
-                "path": str(index.path),
-                **index.metadata(),
-            }
-        graph_health = self.engine.graph.health()
+            metadata = index.metadata()
+            index_status = IndexStatus(
+                available=True,
+                path=str(index.path),
+                schema_version=metadata.get("schema_version"),
+                built_at=metadata.get("built_at"),
+                memory_root=metadata.get("memory_root"),
+                semantic_dimensions=metadata.get("semantic_dimensions"),
+                documents=metadata.get("documents"),
+                chunks=metadata.get("chunks"),
+            )
+        graph_health = GraphifyAdapter(self.settings.graph_path).health()
         graph_age_seconds = (
             max(0.0, time.time() - self.settings.graph_path.stat().st_mtime)
             if self.settings.graph_path.exists()
             else None
         )
         mcp_version = importlib.metadata.version("mcp")
-        return {
-            "ok": bool(index_meta["available"]),
-            "canonical_memory_root": {
-                "path": str(self.settings.memory_root),
-                "available": self.settings.memory_root.is_dir(),
-                "authority": "canonical-markdown",
-            },
-            "index": index_meta,
-            "graphify": {
-                **graph_health,
-                "age_seconds": graph_age_seconds,
-                "provider_role": "internal-graph-signal",
-                "runtime": self._graphify_runtime(),
-            },
-            "runtime": {
-                "python": platform.python_version(),
-                "mcp": mcp_version,
-                "mcp_supported": mcp_version.startswith("1."),
-            },
-            "checked_at": datetime.now(timezone.utc).isoformat(),
-        }
+        return StatusResponse(
+            ok=index_status.available,
+            canonical_memory_root=CanonicalMemoryStatus(
+                path=str(self.settings.memory_root),
+                available=self.settings.memory_root.is_dir(),
+                authority="canonical-markdown",
+            ),
+            index=index_status,
+            graphify=GraphifyStatus(
+                available=bool(graph_health["available"]),
+                path=str(graph_health["path"]),
+                nodes=int(graph_health["nodes"]),
+                edges=int(graph_health["edges"]),
+                modified_ns=graph_health["modified_ns"],
+                age_seconds=graph_age_seconds,
+                provider_role="internal-graph-signal",
+                runtime=self._graphify_runtime(),
+            ),
+            runtime=RuntimeStatus(
+                python=platform.python_version(),
+                mcp=mcp_version,
+                mcp_supported=mcp_version.startswith("1."),
+            ),
+            checked_at=datetime.now(timezone.utc).isoformat(),
+        )
 
-    def _graphify_runtime(self) -> dict[str, Any]:
+    @staticmethod
+    def _identity_candidate(query: str) -> str:
+        words = query.split()
+        if not words:
+            return query
+        prefixes = (
+            ("get",),
+            ("open",),
+            ("show",),
+            ("recall",),
+            ("find", "memory"),
+            ("get", "memory"),
+            ("open", "memory"),
+            ("show", "memory"),
+        )
+        lowered = tuple(word.casefold().strip(":") for word in words)
+        for prefix in sorted(prefixes, key=len, reverse=True):
+            if lowered[: len(prefix)] == prefix and len(words) > len(prefix):
+                return " ".join(words[len(prefix) :]).strip(" :-")
+        return query
+
+    @staticmethod
+    def _is_relationship_query(query: str) -> bool:
+        return bool(set(tokenize(query)) & RELATIONSHIP_TERMS)
+
+    def _exact_response(
+        self,
+        query: str,
+        document: dict[str, object],
+        scope: ScopeFilter,
+    ) -> RecallResponse:
+        memory_id = str(document["memory_id"])
+        path = str(document["path"])
+        title = str(document["title"])
+        neighbor_packet = self.engine.neighbors(
+            memory_id,
+            self.settings.graph_depth,
+            scope,
+        )
+        return RecallResponse(
+            status="answered",
+            intent="exact",
+            query=query,
+            evidence=[
+                RecallEvidence(
+                    memory_id=memory_id,
+                    heading="",
+                    text=str(document["body"]),
+                    score=1.0,
+                    reasons=["exact identity"],
+                )
+            ],
+            citations=[
+                RecallCitation(memory_id=memory_id, path=path, title=title)
+            ],
+            relationships=self._neighbor_relationships(
+                document,
+                neighbor_packet,
+            )[:6],
+            warnings=self._graph_warnings(),
+        )
+
+    def _relationship_response(
+        self,
+        query: str,
+        source: dict[str, object],
+        target: dict[str, object],
+        scope: ScopeFilter,
+    ) -> RecallResponse:
+        result = self.engine.path(
+            str(source["memory_id"]),
+            str(target["memory_id"]),
+            scope,
+        )
+        relationships = [
+            RecallRelationship(
+                source_path=str(edge.get("source_path") or ""),
+                source_label=str(edge.get("source") or ""),
+                relation=str(edge.get("relation") or ""),
+                target_path=str(edge.get("target_path") or ""),
+                target_label=str(edge.get("target") or ""),
+                confidence=(
+                    str(edge["confidence"])
+                    if edge.get("confidence") is not None
+                    else None
+                ),
+            )
+            for edge in result.get("path", [])
+        ]
+        warnings = self._graph_warnings()
+        if not relationships:
+            warnings.append("No relationship path was found.")
+        documents = (source, target)
+        return RecallResponse(
+            status="answered" if relationships else "no_answer",
+            intent="relationship",
+            query=query,
+            evidence=[
+                RecallEvidence(
+                    memory_id=str(document["memory_id"]),
+                    heading="",
+                    text=str(document["body"])[:2000],
+                    score=1.0,
+                    reasons=["named relationship endpoint"],
+                )
+                for document in documents
+            ],
+            citations=[
+                RecallCitation(
+                    memory_id=str(document["memory_id"]),
+                    path=str(document["path"]),
+                    title=str(document["title"]),
+                )
+                for document in documents
+            ],
+            relationships=relationships,
+            warnings=warnings,
+        )
+
+    def _result_relationships(
+        self,
+        hits: list[SearchHit],
+        scope: ScopeFilter,
+    ) -> list[RecallRelationship]:
+        relationships: list[RecallRelationship] = []
+        seen: set[tuple[str | None, str | None, str | None]] = set()
+        # The highest-ranked record gives enough graph context for normal recall.
+        # Deeper relationship questions use the dedicated internal path route.
+        for hit in hits[:1]:
+            packet = self.engine.neighbors(
+                hit.memory_id,
+                self.settings.graph_depth,
+                scope,
+            )
+            for relationship in self._neighbor_relationships(
+                {
+                    "memory_id": hit.memory_id,
+                    "path": hit.path,
+                    "title": hit.title,
+                },
+                packet,
+            ):
+                key = (
+                    relationship.source_path,
+                    relationship.relation,
+                    relationship.target_path or relationship.target_label,
+                )
+                if key not in seen:
+                    seen.add(key)
+                    relationships.append(relationship)
+        return relationships[:1]
+
+    @staticmethod
+    def _neighbor_relationships(
+        document: dict[str, object],
+        packet: dict[str, Any],
+    ) -> list[RecallRelationship]:
+        source_memory_id = str(document["memory_id"])
+        source_path = str(document["path"])
+        relationships = [
+            RecallRelationship(
+                source_memory_id=source_memory_id,
+                source_path=source_path,
+                relation="declared-related",
+                target_label=str(target),
+            )
+            for target in packet.get("declared_related", [])
+        ]
+        relationships.extend(
+            RecallRelationship(
+                source_memory_id=source_memory_id,
+                source_path=source_path,
+                relation=(
+                    str(neighbor["relation"])
+                    if neighbor.get("relation") is not None
+                    else None
+                ),
+                target_path=(
+                    str(neighbor["path"])
+                    if neighbor.get("path") is not None
+                    else None
+                ),
+                target_label=(
+                    str(neighbor["label"])
+                    if neighbor.get("label") is not None
+                    else None
+                ),
+                confidence=(
+                    str(neighbor["confidence"])
+                    if neighbor.get("confidence") is not None
+                    else None
+                ),
+                distance=int(neighbor["distance"]),
+            )
+            for neighbor in packet.get("graph_neighbors", [])
+        )
+        return relationships
+
+    def _graph_warnings(self) -> list[str]:
+        return (
+            []
+            if self.engine.graph.health()["available"]
+            else ["Graph relationships are not available."]
+        )
+
+    def _graphify_runtime(self) -> GraphifyRuntimeStatus:
         project_root = Path(__file__).resolve().parents[2]
         scripts = project_root / ".graphify-runtime" / "Scripts"
         python = scripts / "python.exe"
@@ -222,36 +437,15 @@ class MemoryService:
             and mcp_executable.exists()
             and not errors
         )
-        return {
-            "consistent": consistent,
-            "expected": expected,
-            "package": package_version,
-            "cli": cli_version,
-            "skill": skill_version,
-            "skill_matches_runtime": skill_version == expected,
-            "python": str(python),
-            "mcp_executable": str(mcp_executable),
-            "scripts_dir": str(scripts),
-            "errors": errors,
-        }
-
-    def feedback(
-        self,
-        query: str,
-        memory_id: str,
-        relevance: str,
-        note: str = "",
-    ) -> dict[str, Any]:
-        if relevance not in {"relevant", "irrelevant", "partial"}:
-            raise ValueError("relevance must be relevant, irrelevant, or partial")
-        self.settings.state_dir.mkdir(parents=True, exist_ok=True)
-        event = {
-            "recorded_at": datetime.now(timezone.utc).isoformat(),
-            "query": query,
-            "memory_id": memory_id,
-            "relevance": relevance,
-            "note": note,
-        }
-        with self.settings.feedback_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
-        return {"recorded": True, **event}
+        return GraphifyRuntimeStatus(
+            consistent=consistent,
+            expected=expected,
+            package=package_version,
+            cli=cli_version,
+            skill=skill_version,
+            skill_matches_runtime=skill_version == expected,
+            python=str(python),
+            mcp_executable=str(mcp_executable),
+            scripts_dir=str(scripts),
+            errors=errors,
+        )

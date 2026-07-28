@@ -1,6 +1,6 @@
 # Validation Report
 
-Date: 2026-07-27
+Date: 2026-07-28
 
 Status: satisfactory
 
@@ -14,7 +14,7 @@ Status: satisfactory
 
 ## Automated tests
 
-All 25 automated tests passed.
+All 28 automated tests passed.
 The tests covered retrieval, MCP tools, client merging, backups, OpenCode schemas, skill links, and repository privacy.
 
 ## Frozen benchmark
@@ -30,8 +30,8 @@ All 20 cases passed.
 | No-answer accuracy | 1.000 |
 | Scope leakage | 0.000 |
 | Citation failures | 0.000 |
-| Median latency | 12.38 ms |
-| 95th percentile latency | 23.64 ms |
+| Median latency | 6.75 ms |
+| 95th percentile latency | 12.53 ms |
 
 The frozen contract SHA-256 value is:
 
@@ -40,8 +40,14 @@ The frozen contract SHA-256 value is:
 ## Transport tests
 
 The standard input and output transport passed.
-The server supplied all eight public tools.
-The `memory_health` call completed without an MCP error.
+The server supplied three public tools.
+The `memory_status` call completed without an MCP error.
+The read tools did not create a missing index.
+
+## Public response size
+
+A representative five-result recall used 30.3 percent fewer bytes.
+The comparison used the previous internal evidence packet.
 
 ## Graphify provider
 

@@ -44,7 +44,7 @@ Run this workflow at meaningful checkpoints and before the final response of sub
 1. **Classify the outcome.** Choose retrieval, durable memory, optional session or handoff, skill candidate, session-only context, or no write.
 2. **Choose the domain.** Select `work` or `personal` before selecting a path.
 3. **Choose one primary scope.** Use repository, ticket, project, area, tool, person, decision, reference, or session-only.
-4. **Search AI Memory MCP.** Use `memory_search` with the narrowest safe scope. It plans and fuses lexical, semantic, and Graphify retrieval internally. Treat legacy-corpus results as candidates, not write authority.
+4. **Recall memory.** Use `memory_recall` with the narrowest safe scope. The tool selects exact, search, neighbor, or relationship behavior internally. Treat legacy-corpus results as candidates, not write authority.
 5. **Inspect canonical Markdown.** Search the selected root with `rg` and read the exact candidate notes before deciding where to write.
 6. **Choose one action.** Update, create, merge, mark `needs-review`, supersede, route to `custom-skills-master`, retain session-only, or skip with a reason.
 7. **Write a small verified batch.** Apply concise Markdown changes and preserve identity, provenance, links, and predecessor state.
@@ -98,7 +98,7 @@ Create repository, ticket, and project folders only when there is a durable reco
 For recall requests:
 
 1. Determine work or personal scope and the likely repository, ticket, project, area, person, tool, or decision.
-2. Call `memory_search` first with work/personal, repository, ticket/project, status, or path scope when known.
+2. Call `memory_recall` first with work/personal, repository, ticket/project, status, or path scope when known.
 3. Inspect the returned Markdown source path, corpus, status, freshness, and provenance.
 4. Prefer an active canonical memory note over legacy session or vault results.
 5. Search canonical Markdown directly when the facade is unavailable, stale, ambiguous, or missing expected results.
@@ -152,11 +152,12 @@ Do not duplicate skill-authoring instructions inside ordinary memory notes.
 
 After one or more material memory writes:
 
-1. Call `memory_refresh` with `mode=index` after an ordinary Markdown batch; use `mode=full` only when the Graphify graph itself must be rebuilt.
-2. Do not run the global or all-corpora extractor for routine memory writes.
-3. Verify the configured Graphify endpoint or query path after the refresh finishes.
-4. Confirm that the canonical corpus is registered and the changed note can be retrieved when practical.
-5. If the note write succeeded but refresh or retrieval failed, report `saved, not indexed` and keep the canonical Markdown unchanged.
+1. Call `memory_sync` after an ordinary Markdown batch.
+2. Run the Graphify maintenance script only when the Graphify graph must be rebuilt.
+3. Do not run the global or all-corpora extractor for routine memory writes.
+4. Verify the configured Graphify endpoint or query path after the refresh finishes.
+5. Confirm that the canonical corpus is registered and the changed note can be retrieved when practical.
+6. If the note write succeeded but refresh or retrieval failed, report `saved, not indexed` and keep the canonical Markdown unchanged.
 
 Pure retrievals, no-op deduplication, and non-material timestamp-only changes do not require refresh.
 

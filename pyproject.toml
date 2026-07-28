@@ -9,6 +9,7 @@ description = "Hybrid AI-memory retrieval MCP built around Graphify"
 requires-python = ">=3.11"
 dependencies = [
   "mcp>=1.26,<2",
+  "pydantic>=2.11,<3",
   "PyYAML>=6.0,<7",
 ]
 

@@ -22,13 +22,14 @@ Use the standard input and output transport for local agents:
 .\.venv\Scripts\ai-memory-mcp.exe --transport stdio
 ```
 
-Use the HTTP transport when a remote-capable client needs an endpoint:
+Use the HTTP transport when a local client needs an endpoint:
 
 ```powershell
 .\.venv\Scripts\ai-memory-mcp.exe --transport streamable-http
 ```
 
 The default HTTP endpoint is `http://127.0.0.1:4334/mcp`.
+The server rejects non-loopback hosts because this transport has no authentication.
 
 ## Update client registrations
 
@@ -44,13 +45,14 @@ Restart each configured client after the command finishes.
 
 ## Refresh Graphify
 
-Use `memory_refresh` with `mode=index` after an ordinary memory update.
-Use `mode=full` only when the Graphify graph must change.
+Use `memory_sync` after an ordinary memory update.
+The tool updates only the derived SQLite index.
 
-The full refresh uses staging and validation.
-The refresh keeps the last satisfactory graph if a validation fails.
+Use the maintenance script when the Graphify graph must change.
+The script uses staging and validation.
+The script keeps the last satisfactory graph if validation fails.
 
-Run the full refresh script directly only for maintenance:
+Run this script for Graphify maintenance:
 
 ```powershell
 .\scripts\graphify\refresh-ai-memory-graph.ps1
@@ -78,7 +80,7 @@ Install the logon launcher:
 
 ## Check health
 
-Call `memory_health` from an MCP client.
+Call `memory_status` from an MCP client.
 Check the canonical root, index, graph, package, and MCP version fields.
 
 A saved Markdown file can exist before its derived indexes change.

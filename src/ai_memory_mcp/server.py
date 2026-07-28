@@ -1,23 +1,41 @@
 from __future__ import annotations
 
 import argparse
-from typing import Any
+import ipaddress
+from typing import Annotated, Literal
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from .config import Settings
+from .models import RecallResponse, StatusResponse, SyncResponse
 from .service import MemoryService
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.casefold() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def create_server(settings: Settings | None = None) -> FastMCP:
     settings = settings or Settings.from_env()
+    # Streamable HTTP has no authentication boundary in this release.
+    if not _is_loopback_host(settings.host):
+        raise ValueError(
+            "AI Memory MCP requires a loopback host until authentication is available."
+        )
     service = MemoryService(settings)
     mcp = FastMCP(
         "ai-memory",
         instructions=(
-            "Use memory_search for normal recall. The server plans and fuses "
-            "lexical, semantic, and Graphify retrieval internally; do not call "
-            "separate provider tools."
+            "Use memory_recall for all memory retrieval. The server selects exact, "
+            "search, neighbor, and relationship behavior. Use memory_sync after "
+            "canonical Markdown changes. Use memory_status for diagnostics."
         ),
         host=settings.host,
         port=settings.port,
@@ -26,19 +44,75 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         stateless_http=True,
     )
 
-    @mcp.tool()
-    def memory_search(
-        query: str,
-        root_scope: str | None = None,
-        repository: str | None = None,
-        project: str | None = None,
-        ticket: str | None = None,
-        status: str = "active",
-        path_prefix: str | None = None,
-        limit: int = 8,
-    ) -> dict[str, Any]:
-        """Retrieve cited memory evidence; filters are applied before ranking."""
-        return service.search(
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+        structured_output=True,
+    )
+    def memory_recall(
+        query: Annotated[
+            str,
+            Field(
+                min_length=1,
+                max_length=2000,
+                description="Natural-language question or exact memory identity.",
+            ),
+        ],
+        root_scope: Annotated[
+            Literal["work", "personal"] | None,
+            Field(description="Optional memory domain."),
+        ] = None,
+        repository: Annotated[
+            str | None,
+            Field(
+                min_length=1,
+                max_length=200,
+                description="Optional repository identifier.",
+            ),
+        ] = None,
+        project: Annotated[
+            str | None,
+            Field(
+                min_length=1,
+                max_length=200,
+                description="Optional project identifier.",
+            ),
+        ] = None,
+        ticket: Annotated[
+            str | None,
+            Field(
+                min_length=1,
+                max_length=100,
+                description="Optional ticket identifier.",
+            ),
+        ] = None,
+        status: Annotated[
+            Literal["active", "needs-review", "superseded", "archived"],
+            Field(description="Memory lifecycle status."),
+        ] = "active",
+        path_prefix: Annotated[
+            str | None,
+            Field(
+                min_length=1,
+                max_length=500,
+                description="Optional canonical path prefix.",
+            ),
+        ] = None,
+        limit: Annotated[
+            int,
+            Field(
+                ge=1,
+                le=20,
+                description="Maximum evidence records.",
+            ),
+        ] = 8,
+    ) -> RecallResponse:
+        """Recall cited memory and its applicable relationships."""
+        return service.recall(
             query,
             root_scope=root_scope,
             repository=repository,
@@ -49,45 +123,31 @@ def create_server(settings: Settings | None = None) -> FastMCP:
             limit=limit,
         )
 
-    @mcp.tool()
-    def memory_get(identity: str) -> dict[str, Any]:
-        """Get one memory by memory_id, canonical relative path, or title fragment."""
-        return service.get(identity)
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=False,
+        ),
+        structured_output=True,
+    )
+    def memory_sync() -> SyncResponse:
+        """Update the derived index from canonical Markdown."""
+        return service.sync()
 
-    @mcp.tool()
-    def memory_neighbors(identity: str, depth: int = 1) -> dict[str, Any]:
-        """Return declared and Graphify-derived neighbors for one memory."""
-        return service.neighbors(identity, depth)
-
-    @mcp.tool()
-    def memory_path(source: str, target: str) -> dict[str, Any]:
-        """Return a Graphify relationship path between two memories."""
-        return service.path(source, target)
-
-    @mcp.tool()
-    def memory_explain(query: str, identity: str | None = None) -> dict[str, Any]:
-        """Explain why cited memories answer a query."""
-        return service.explain(query, identity)
-
-    @mcp.tool()
-    def memory_refresh(mode: str = "index", force: bool = False) -> dict[str, Any]:
-        """Refresh the local index; mode=full runs guarded Graphify refresh first."""
-        return service.refresh(mode, force)
-
-    @mcp.tool()
-    def memory_health() -> dict[str, Any]:
-        """Report canonical-source, index, Graphify, freshness, and runtime health."""
-        return service.health()
-
-    @mcp.tool()
-    def memory_feedback(
-        query: str,
-        memory_id: str,
-        relevance: str,
-        note: str = "",
-    ) -> dict[str, Any]:
-        """Append relevance feedback for later evaluation and ranking analysis."""
-        return service.feedback(query, memory_id, relevance, note)
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+        structured_output=True,
+    )
+    def memory_status() -> StatusResponse:
+        """Report source, index, Graphify, and runtime status."""
+        return service.status()
 
     return mcp
 
@@ -105,4 +165,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

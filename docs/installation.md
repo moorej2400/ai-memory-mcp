@@ -23,8 +23,8 @@ Install these items before you start:
 
 4. Wait for the setup procedure to complete.
 5. Restart each configured client.
-6. Call `memory_health` from an agent session.
-7. Make sure that the health result is satisfactory.
+6. Call `memory_status` from an agent session.
+7. Make sure that the status result is satisfactory.
 
 ## Setup results
 

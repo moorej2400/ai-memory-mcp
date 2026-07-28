@@ -249,8 +249,12 @@ class RetrievalEngine:
         return ranked[:limit]
 
     def _expand_context(self, hits: list[SearchHit]) -> None:
+        # One query avoids a database round trip for each fused result.
+        chunks_by_memory = self.index.chunks_for_memories(
+            [hit.memory_id for hit in hits]
+        )
         for hit in hits:
-            chunks = self.index.chunks_for_memory(hit.memory_id)
+            chunks = chunks_by_memory.get(hit.memory_id, [])
             selected = next(
                 (chunk for chunk in chunks if chunk["heading"] == hit.heading),
                 chunks[0] if chunks else None,
@@ -351,8 +355,12 @@ class RetrievalEngine:
             },
         )
 
-    def get(self, identity: str) -> dict[str, Any]:
-        document = self.index.document(identity)
+    def get(
+        self,
+        identity: str,
+        scope: ScopeFilter | None = None,
+    ) -> dict[str, Any]:
+        document = self.index.document(identity, scope)
         if not document:
             return {"found": False, "identity": identity}
         return {
@@ -364,8 +372,13 @@ class RetrievalEngine:
             },
         }
 
-    def neighbors(self, identity: str, depth: int = 1) -> dict[str, Any]:
-        document = self.index.document(identity)
+    def neighbors(
+        self,
+        identity: str,
+        depth: int = 1,
+        scope: ScopeFilter | None = None,
+    ) -> dict[str, Any]:
+        document = self.index.document(identity, scope)
         if not document:
             return {"found": False, "identity": identity, "neighbors": []}
         return {
@@ -381,9 +394,14 @@ class RetrievalEngine:
             ),
         }
 
-    def path(self, source: str, target: str) -> dict[str, Any]:
-        left = self.index.document(source)
-        right = self.index.document(target)
+    def path(
+        self,
+        source: str,
+        target: str,
+        scope: ScopeFilter | None = None,
+    ) -> dict[str, Any]:
+        left = self.index.document(source, scope)
+        right = self.index.document(target, scope)
         if not left or not right:
             return {
                 "found": False,
@@ -400,3 +418,12 @@ class RetrievalEngine:
             "target": {"memory_id": right["memory_id"], "path": right["path"]},
             "path": chain,
         }
+
+    def mentioned_documents(
+        self,
+        query: str,
+        scope: ScopeFilter,
+        *,
+        limit: int = 3,
+    ) -> list[dict[str, object]]:
+        return self.index.mentioned_documents(query, scope, limit=limit)

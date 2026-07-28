@@ -48,7 +48,6 @@ class Settings:
     memory_root: Path
     state_dir: Path
     graph_path: Path
-    refresh_script: Path | None
     graphify_mcp_url: str
     host: str = "127.0.0.1"
     port: int = 4334
@@ -74,20 +73,10 @@ class Settings:
             / "graphify-out"
             / "graph.json",
         )
-        refresh_raw = os.getenv("GRAPHIFY_MEMORY_REFRESH_SCRIPT")
-        refresh = (
-            Path(os.path.expandvars(refresh_raw)).expanduser()
-            if refresh_raw
-            else project_root()
-            / "scripts"
-            / "graphify"
-            / "refresh-ai-memory-graph.ps1"
-        )
         return cls(
             memory_root=root,
             state_dir=state,
             graph_path=graph,
-            refresh_script=refresh,
             graphify_mcp_url=os.getenv(
                 "GRAPHIFY_GLOBAL_MCP_URL", "http://127.0.0.1:4324/mcp"
             ),
@@ -104,7 +93,3 @@ class Settings:
     @property
     def pointer_path(self) -> Path:
         return self.state_dir / "current-index.json"
-
-    @property
-    def feedback_path(self) -> Path:
-        return self.state_dir / "feedback.jsonl"

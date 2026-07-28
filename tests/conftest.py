@@ -22,9 +22,7 @@ def benchmark_settings(project_root: Path) -> Settings:
         memory_root=benchmark / "fixtures" / "vault",
         state_dir=benchmark / "runs" / f"pytest-state-{stamp}",
         graph_path=benchmark / "fixtures" / "graph.json",
-        refresh_script=None,
         graphify_mcp_url="",
     )
     build_index(settings, force=True)
     return settings
-

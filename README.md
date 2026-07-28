@@ -75,8 +75,9 @@ flowchart LR
 
 ## Query architecture
 
-`memory_search` is the normal recall tool.
-The retrieval engine plans and combines all provider work internally.
+`memory_recall` is the only recall tool.
+The service selects exact, search, neighbor, or relationship behavior.
+The retrieval engine combines all provider work internally.
 
 ```mermaid
 sequenceDiagram
@@ -87,9 +88,10 @@ sequenceDiagram
     participant SQLite as SQLite index
     participant Graphify as GraphifyAdapter
 
-    Agent->>MCP: memory_search query and scope
+    Agent->>MCP: memory_recall query and scope
     MCP->>Service: Validate tool input
-    Service->>Engine: Search request
+    Service->>Service: Select recall intent
+    Service->>Engine: Recall request
     Engine->>Engine: Resolve scope and ticket identifiers
     Engine->>SQLite: Get scoped lexical candidates
     SQLite-->>Engine: Ranked lexical hits
@@ -100,7 +102,7 @@ sequenceDiagram
     Engine->>Engine: Fuse results with RRF
     Engine->>Engine: Deduplicate and rerank
     Engine->>SQLite: Expand bounded context
-    Engine-->>Service: Evidence packet with source paths
+    Engine-->>Service: Evidence and relationships
     Service-->>MCP: Structured result
     MCP-->>Agent: Cited memory evidence
 ```
@@ -113,26 +115,26 @@ It does not replace lexical or semantic retrieval.
 
 ## Refresh architecture
 
-An index refresh updates SQLite after a normal Markdown change.
-A full refresh also rebuilds the Graphify graph.
+`memory_sync` updates SQLite after a normal Markdown change.
+The maintenance script rebuilds the Graphify graph.
 
 ```mermaid
 flowchart TD
-    Change[Canonical Markdown change] --> Mode{Refresh mode}
-    Mode -->|index| IndexStage[Build staged SQLite snapshot]
-    Mode -->|full| GraphStage[Build staged Graphify data]
+    Change[Canonical Markdown change] --> Sync[memory_sync]
+    Sync --> IndexStage[Build staged SQLite snapshot]
+    Maintenance[Graphify maintenance script] --> GraphStage[Build staged Graphify data]
     GraphStage --> GraphValidate{Graph validation}
     GraphValidate -->|pass| GraphPublish[Publish Graphify graph]
     GraphValidate -->|fail| GraphKeep[Keep the last satisfactory graph]
-    GraphPublish --> IndexStage
+    GraphPublish --> Sync
     IndexStage --> IndexValidate{Index validation}
     IndexValidate -->|pass| Pointer[Publish the current-index pointer]
     IndexValidate -->|fail| IndexKeep[Keep the last satisfactory index]
     Pointer --> Health[Run health and retrieval checks]
 ```
 
-The full refresh uses staging, validation, publication, health checks, and rollback.
-A failed refresh does not change the Markdown authority.
+The maintenance script uses staging, validation, publication, health checks, and rollback.
+A failed rebuild does not change the Markdown authority.
 
 ## Reliability and performance
 
@@ -140,6 +142,8 @@ A failed refresh does not change the Markdown authority.
 - Scope filters run before provider ranking.
 - RRF combines independent provider rankings.
 - Bounded reranking limits query work.
+- One query loads context for all returned records.
+- Recall results omit internal provider diagnostics.
 - Incremental indexing skips unchanged Markdown files.
 - Versioned snapshots preserve the last satisfactory index.
 - Full graph refreshes validate staged data before publication.
@@ -169,14 +173,9 @@ For more setup information, read the [installation guide](docs/installation.md).
 
 | Tool | Function |
 |---|---|
-| `memory_search` | Finds relevant memory evidence. |
-| `memory_get` | Gets one memory by its identity or path. |
-| `memory_neighbors` | Gets related memories. |
-| `memory_path` | Finds a relationship path. |
-| `memory_explain` | Explains why evidence matches a query. |
-| `memory_refresh` | Updates derived indexes. |
-| `memory_health` | Gives health and version data. |
-| `memory_feedback` | Records retrieval feedback. |
+| `memory_recall` | Returns cited evidence and applicable relationships. |
+| `memory_sync` | Updates the derived index from canonical Markdown. |
+| `memory_status` | Reports source, index, Graphify, and runtime status. |
 
 ## Repository layout
 

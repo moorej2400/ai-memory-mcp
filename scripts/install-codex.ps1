@@ -42,20 +42,26 @@ $config = if (Test-Path -LiteralPath $configPath) {
 else {
   ''
 }
-$pattern = '(?ms)^\[mcp_servers(?:\.ai-memory|\."ai-memory")\]\r?\n.*?(?=^\[|\z)'
-if ([regex]::IsMatch($config, $pattern)) {
-  $updatedConfig = [regex]::Replace($config, $pattern, $mainBlock, 1)
+$serverPattern = '(?ms)^\[mcp_servers(?:\.ai-memory|\."ai-memory")\]\r?\n.*?(?=^\[|\z)'
+$toolPattern = '(?ms)^\[mcp_servers(?:\.ai-memory|\."ai-memory")\.tools\.[^\]]+\]\r?\n.*?(?=^\[|\z)'
+$withoutOldToolBlocks = [regex]::Replace($config, $toolPattern, '')
+if ([regex]::IsMatch($withoutOldToolBlocks, $serverPattern)) {
+  $updatedConfig = [regex]::Replace(
+    $withoutOldToolBlocks,
+    $serverPattern,
+    $mainBlock,
+    1
+  )
 }
 else {
-  $approvalBlocks = @"
-[mcp_servers.ai-memory.tools.memory_refresh]
+  $updatedConfig = $withoutOldToolBlocks.TrimEnd() + [Environment]::NewLine + [Environment]::NewLine + $mainBlock
+}
+$syncApprovalBlock = @"
+[mcp_servers.ai-memory.tools.memory_sync]
 approval_mode = "approve"
 
-[mcp_servers.ai-memory.tools.memory_feedback]
-approval_mode = "approve"
 "@
-  $updatedConfig = $config.TrimEnd() + [Environment]::NewLine + [Environment]::NewLine + $mainBlock + $approvalBlocks + [Environment]::NewLine
-}
+$updatedConfig = $updatedConfig.TrimEnd() + [Environment]::NewLine + [Environment]::NewLine + $syncApprovalBlock
 
 if ($updatedConfig -ne $config) {
   if (Test-Path -LiteralPath $configPath) {
@@ -99,4 +105,3 @@ if ($existingStub -ne $stub) {
 }
 
 Write-Host 'Restart Codex to load the updated MCP command and skill source.' -ForegroundColor Yellow
-

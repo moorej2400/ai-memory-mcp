@@ -66,7 +66,6 @@ def run_benchmark(label: str) -> dict[str, Any]:
         memory_root=root / "fixtures" / "vault",
         state_dir=state_dir,
         graph_path=root / "fixtures" / "graph.json",
-        refresh_script=None,
         graphify_mcp_url="",
     )
     index_result = build_index(settings, force=True)
@@ -82,15 +81,15 @@ def run_benchmark(label: str) -> dict[str, Any]:
     for case in cases:
         scope = case.get("scope", {})
         started = time.perf_counter()
-        packet = service.search(case["query"], limit=5, **scope)
+        packet = service.recall(case["query"], limit=5, **scope)
         elapsed = (time.perf_counter() - started) * 1000
         latencies.append(elapsed)
-        ids = [item["memory_id"] for item in packet["results"]]
+        ids = [item.memory_id for item in packet.evidence]
         expected = set(case.get("expected_any", []))
         forbidden = set(case.get("forbidden", []))
         if case.get("no_answer"):
             no_answer_cases += 1
-            passed = packet["answer_status"] == "no_answer"
+            passed = packet.status == "no_answer"
             correct_no_answer += int(passed)
             rank = None
         else:
@@ -104,7 +103,8 @@ def run_benchmark(label: str) -> dict[str, Any]:
         scope_leaks += int(leaked)
         expected_path = case.get("expected_path")
         citation_ok = not expected_path or any(
-            item["path"] == expected_path for item in packet["results"]
+            citation.path == expected_path
+            for citation in packet.citations
         )
         citation_failures += int(not citation_ok)
         final_pass = passed and not leaked and citation_ok
@@ -115,7 +115,7 @@ def run_benchmark(label: str) -> dict[str, Any]:
                 "id": case["id"],
                 "passed": final_pass,
                 "rank": rank,
-                "status": packet["answer_status"],
+                "status": packet.status,
                 "returned": ids,
                 "latency_ms": round(elapsed, 3),
                 "leaked": leaked,
@@ -163,4 +163,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

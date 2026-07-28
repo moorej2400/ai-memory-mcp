@@ -61,7 +61,6 @@ def test_changed_note_rebuilds_only_one_document(
         memory_root=vault,
         state_dir=run_root / "state",
         graph_path=project_root / "benchmarks" / "fixtures" / "graph.json",
-        refresh_script=None,
         graphify_mcp_url="",
     )
     first = build_index(settings, force=True)
@@ -89,4 +88,3 @@ def test_index_snapshot_integrity(benchmark_settings: Settings) -> None:
     metadata = index.metadata()
     assert metadata["documents"] == "13"
     assert int(metadata["chunks"]) >= 13
-

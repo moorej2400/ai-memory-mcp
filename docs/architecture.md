@@ -69,8 +69,8 @@ The adapter keeps Graphify replaceable.
 
 ### MCP facade
 
-The MCP facade gives agents eight public tools.
-The facade applies authorization and scope rules before retrieval.
+The MCP facade gives agents three public tools.
+The facade applies scope rules before retrieval.
 The facade returns source paths and retrieval evidence.
 
 ## Query procedure
@@ -98,9 +98,9 @@ Graph traversal is not the only retrieval method.
 6. Reload the applicable service.
 7. Run a retrieval health check.
 
-The refresh keeps the last satisfactory data after a failure.
-An ordinary Markdown change uses an index refresh.
-A full refresh also updates the Graphify graph.
+The update keeps the last satisfactory data after a failure.
+An ordinary Markdown change uses `memory_sync`.
+The maintenance script updates the Graphify graph.
 
 ## Provider boundary
 
@@ -114,9 +114,10 @@ Examples include unsafe updates, unstable serialization, or insufficient provena
 
 - Apply scope filters before ranking.
 - Use exact matches for stable identifiers.
-- Run independent retrieval providers concurrently when possible.
 - Use reciprocal rank fusion for provider results.
 - Limit reranking to a bounded candidate set.
+- Load context for all results in one database query.
+- Keep normal recall responses compact.
 - Process only changed Markdown files during normal refreshes.
 - Keep full graph clustering as a maintenance task.
 
@@ -134,14 +135,20 @@ Examples include unsafe updates, unstable serialization, or insufficient provena
 
 | Tool | Function |
 |---|---|
-| `memory_search` | Finds memory evidence. |
-| `memory_get` | Gets one canonical record. |
-| `memory_neighbors` | Gets related records. |
-| `memory_path` | Finds a graph path. |
-| `memory_explain` | Explains a retrieval result. |
-| `memory_refresh` | Updates derived data. |
-| `memory_health` | Gives system health data. |
-| `memory_feedback` | Records result feedback. |
+| `memory_recall` | Returns cited evidence and applicable relationships. |
+| `memory_sync` | Updates the derived index from canonical Markdown. |
+| `memory_status` | Reports source, index, Graphify, and runtime status. |
+
+`memory_recall` selects its internal behavior from the query.
+An exact identity returns the complete record.
+A relationship question returns a graph path when a path exists.
+A general question runs lexical, semantic, and graph retrieval.
+
+The MCP does not expose provider diagnostics in normal recall results.
+The MCP does not expose full Graphify rebuilds.
+Use the Graphify maintenance script for a full rebuild.
+
+Each recall result contains `status`, `intent`, `evidence`, `citations`, `relationships`, and `warnings`.
 
 ## Research sources
 

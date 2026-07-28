@@ -47,6 +47,9 @@ A full Graphify refresh can need the optional API values.
 | `AI_MEMORY_MCP_RRF_K` | `60` | Sets the RRF constant. |
 | `AI_MEMORY_MCP_GRAPH_DEPTH` | `2` | Sets the graph traversal depth. |
 
+The server accepts only a loopback host.
+The HTTP transport does not provide authentication.
+
 ## Repository privacy
 
 | Variable | Function |

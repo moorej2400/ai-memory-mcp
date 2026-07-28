@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
 
 from ai_memory_mcp.config import Settings
 from ai_memory_mcp.server import create_server
@@ -10,16 +14,16 @@ def test_public_tool_surface_is_small_and_stable(
     benchmark_settings: Settings,
 ) -> None:
     server = create_server(benchmark_settings)
-    assert {tool.name for tool in server._tool_manager.list_tools()} == {
-        "memory_search",
-        "memory_get",
-        "memory_neighbors",
-        "memory_path",
-        "memory_explain",
-        "memory_refresh",
-        "memory_health",
-        "memory_feedback",
+    tools = {
+        tool.name: tool for tool in server._tool_manager.list_tools()
     }
+    assert set(tools) == {"memory_recall", "memory_sync", "memory_status"}
+    assert tools["memory_recall"].annotations.readOnlyHint is True
+    assert tools["memory_status"].annotations.readOnlyHint is True
+    assert tools["memory_sync"].annotations.readOnlyHint is False
+    assert tools["memory_recall"].output_schema["additionalProperties"] is False
+    assert tools["memory_recall"].parameters["properties"]["limit"]["maximum"] == 20
+    assert tools["memory_sync"].parameters["properties"] == {}
 
 
 def test_tool_call_runs_full_retrieval_internally(
@@ -29,11 +33,60 @@ def test_tool_call_runs_full_retrieval_internally(
 
     async def call() -> dict:
         return await server._tool_manager.call_tool(
-            "memory_search", {"query": "ALPHA-142", "limit": 1}
+            "memory_recall",
+            {
+                "query": "What is the transient authentication retry policy "
+                "for ALPHA-142?",
+                "limit": 1,
+            },
         )
 
     result = asyncio.run(call())
-    assert result["answer_status"] == "answered"
-    assert result["results"][0]["memory_id"] == "mem-alpha-retry"
-    assert result["plan"]["retrievers"] == ["lexical", "semantic", "graphify"]
+    assert result.status == "answered"
+    assert result.evidence[0].memory_id == "mem-alpha-retry"
+    assert result.citations[0].path.endswith("Retry Decision.md")
+    assert result.intent == "search"
 
+
+def test_sync_updates_only_the_derived_index(
+    benchmark_settings: Settings,
+) -> None:
+    server = create_server(benchmark_settings)
+
+    async def call() -> object:
+        return await server._tool_manager.call_tool("memory_sync", {})
+
+    result = asyncio.run(call())
+    assert result.ok is True
+    assert result.index.documents == 13
+    assert result.index.removed == 0
+
+
+def test_read_tools_do_not_build_a_missing_index(
+    benchmark_settings: Settings,
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "missing-index"
+    server = create_server(
+        replace(benchmark_settings, state_dir=state_dir)
+    )
+
+    async def call(name: str, arguments: dict) -> object:
+        return await server._tool_manager.call_tool(name, arguments)
+
+    status = asyncio.run(call("memory_status", {}))
+    recall = asyncio.run(call("memory_recall", {"query": "ALPHA-142"}))
+
+    assert status.index.available is False
+    assert recall.status == "no_answer"
+    assert recall.warnings == [
+        "Memory index is not available. Call memory_sync."
+    ]
+    assert not state_dir.exists()
+
+
+def test_server_rejects_non_loopback_host(
+    benchmark_settings: Settings,
+) -> None:
+    with pytest.raises(ValueError, match="requires a loopback host"):
+        create_server(replace(benchmark_settings, host="0.0.0.0"))
