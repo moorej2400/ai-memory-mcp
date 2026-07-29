@@ -214,34 +214,56 @@ def _install_skill(
     repository_root: Path,
     destination_root: Path,
     skill_name: str,
-) -> Path | None:
+) -> list[Path]:
     relative = SKILLS[skill_name]
     source = repository_root / relative
     if not source.is_file():
         raise FileNotFoundError(f"Canonical skill is missing: {source}")
     destination = destination_root / skill_name / "SKILL.md"
-    return _write_text(
-        destination,
-        _skill_stub(repository_root, skill_name),
-    )
+    changed = [
+        path
+        for path in (
+            _write_text(
+                destination,
+                _skill_stub(repository_root, skill_name),
+            ),
+        )
+        if path is not None
+    ]
+    if skill_name == "graphify":
+        requirements = (
+            repository_root / "requirements-graphify.txt"
+        ).read_text(encoding="utf-8")
+        match = re.search(
+            r"^graphifyy(?:\[[^\]]+\])?==([^\s]+)$",
+            requirements,
+            re.MULTILINE,
+        )
+        if match is None:
+            raise ValueError("Pinned Graphify version is missing.")
+        marker = _write_text(
+            destination.with_name(".graphify_version"),
+            f"{match.group(1)}\n",
+        )
+        if marker is not None:
+            changed.append(marker)
+    return changed
 
 
 def _install_skills(
     repository_root: Path,
     destination_root: Path,
 ) -> list[Path]:
-    return [
-        changed
-        for skill_name in SKILLS
-        if (
-            changed := _install_skill(
+    changed: list[Path] = []
+    for skill_name in SKILLS:
+        changed.extend(
+            _install_skill(
                 repository_root,
                 destination_root,
                 skill_name,
             )
         )
-        is not None
-    ]
+    return changed
 
 
 def _opencode_major() -> int | None:

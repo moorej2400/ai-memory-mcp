@@ -130,6 +130,18 @@ Then read the SKILL.md in full from '$skillPath'
     [System.IO.File]::WriteAllText($stubPath, $stub, [System.Text.UTF8Encoding]::new($false))
     Write-Host "Installed the $($skillSpec.Name) discovery stub at $stubPath" -ForegroundColor Green
   }
+  if ($skillSpec.Name -eq 'graphify') {
+    $requirements = Get-Content -LiteralPath (Join-Path $RepositoryRoot 'requirements-graphify.txt') -Raw
+    if ($requirements -notmatch '(?m)^graphifyy(?:\[[^\]]+\])?==(?<version>[^\s]+)$') {
+      throw 'Pinned Graphify version is missing.'
+    }
+    $versionPath = Join-Path $skillDirectory '.graphify_version'
+    [System.IO.File]::WriteAllText(
+      $versionPath,
+      "$($Matches.version)`n",
+      [System.Text.UTF8Encoding]::new($false)
+    )
+  }
 }
 
 Write-Host 'Restart Codex to load the updated MCP command and skill sources.' -ForegroundColor Yellow

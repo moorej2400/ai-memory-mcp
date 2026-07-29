@@ -26,6 +26,10 @@ def portable_repository(tmp_path: Path) -> Path:
     )
     python.parent.mkdir(parents=True)
     python.write_text("", encoding="utf-8")
+    (repository / "requirements-graphify.txt").write_text(
+        "graphifyy[openai,mcp]==0.9.26\n",
+        encoding="utf-8",
+    )
     skill.parent.mkdir(parents=True)
     skill.write_text(
         "---\nname: ai-memory\ndescription: Test AI Memory skill.\n---\n",
@@ -91,6 +95,9 @@ def test_installs_json_client_and_preserves_existing_servers(
             skill_root / "graphify" / "SKILL.md"
         ).read_text(encoding="utf-8")
         assert "graphify-codebase/skill/graphify/SKILL.md" in graphify_stub
+        assert (
+            skill_root / "graphify" / ".graphify_version"
+        ).read_text(encoding="utf-8") == "0.9.26\n"
 
 
 def test_installs_opencode_v1_and_repo_linked_skill(
@@ -160,7 +167,10 @@ def test_new_shared_skill_reports_a_change(
 
     skill = home / ".agents" / "skills" / "ai-memory" / "SKILL.md"
     graphify = home / ".agents" / "skills" / "graphify" / "SKILL.md"
-    assert changed == [skill, graphify]
+    graphify_version = (
+        home / ".agents" / "skills" / "graphify" / ".graphify_version"
+    )
+    assert changed == [skill, graphify, graphify_version]
     assert skill.is_file()
     assert graphify.is_file()
 
