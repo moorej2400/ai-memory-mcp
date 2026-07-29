@@ -12,12 +12,29 @@ from .text import tokenize
 class GraphifyAdapter:
     """Expose only provider-neutral graph operations to the retrieval engine."""
 
-    def __init__(self, graph_path: Path):
+    def __init__(
+        self,
+        graph_path: Path,
+        *,
+        primary_source_id: str = "core",
+        source_ids: tuple[str, ...] = (),
+    ):
         self.graph_path = graph_path
+        self.primary_source_id = primary_source_id
+        self.source_ids = frozenset((primary_source_id, *source_ids))
         self._stamp: tuple[int, int] | None = None
         self.nodes: dict[str, dict[str, Any]] = {}
         self.adjacency: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
         self.source_nodes: dict[str, set[str]] = defaultdict(set)
+
+    def _source_path(self, value: object) -> str:
+        path = str(value or "").replace("\\", "/").lstrip("./")
+        if not path:
+            return ""
+        prefix = path.split("/", 1)[0].casefold()
+        if prefix in self.source_ids:
+            return path
+        return f"{self.primary_source_id}/{path}"
 
     def _load(self) -> None:
         if not self.graph_path.exists():
@@ -35,8 +52,10 @@ class GraphifyAdapter:
         self.adjacency = defaultdict(list)
         self.source_nodes = defaultdict(set)
         for node_id, node in self.nodes.items():
-            source = str(node.get("source_file") or "").replace("\\", "/").casefold()
+            canonical_source = self._source_path(node.get("source_file"))
+            source = canonical_source.casefold()
             if source:
+                node["source_file"] = canonical_source
                 self.source_nodes[source].add(node_id)
         for edge in payload.get("links", payload.get("edges", [])):
             source = str(edge.get("source", ""))
@@ -67,7 +86,7 @@ class GraphifyAdapter:
         for node_id, node in self.nodes.items():
             label_tokens = set(tokenize(str(node.get("label", ""))))
             overlap = len(query_tokens & label_tokens)
-            source = str(node.get("source_file") or "").replace("\\", "/").casefold()
+            source = self._source_path(node.get("source_file")).casefold()
             path_score = path_priority.get(source, 0)
             if overlap or path_score:
                 scores.append((overlap * 4.0 + path_score * 0.25, node_id))
@@ -76,14 +95,14 @@ class GraphifyAdapter:
         seen: set[str] = set()
         for _, node_id in scores[: max(limit * 3, limit)]:
             node = self.nodes[node_id]
-            source = str(node.get("source_file") or "").replace("\\", "/")
+            source = self._source_path(node.get("source_file"))
             if source and source.casefold() not in seen:
                 ranked_paths.append(source)
                 seen.add(source.casefold())
             for neighbor_id, _ in self.adjacency.get(node_id, []):
-                neighbor_source = str(
-                    self.nodes[neighbor_id].get("source_file") or ""
-                ).replace("\\", "/")
+                neighbor_source = self._source_path(
+                    self.nodes[neighbor_id].get("source_file")
+                )
                 if neighbor_source and neighbor_source.casefold() not in seen:
                     ranked_paths.append(neighbor_source)
                     seen.add(neighbor_source.casefold())
@@ -160,4 +179,3 @@ class GraphifyAdapter:
             )
             cursor = parent
         return list(reversed(chain))
-

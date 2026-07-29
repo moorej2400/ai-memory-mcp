@@ -69,3 +69,59 @@ function Get-AiMemoryGraphifyMcpExecutable {
   return Join-Path $RepositoryRoot '.graphify-runtime\Scripts\graphify-mcp.exe'
 }
 
+function Get-AiMemorySources {
+  $primaryRoot = $env:AI_MEMORY_WORK_DIR
+  if ([string]::IsNullOrWhiteSpace($primaryRoot)) {
+    $primaryRoot = $env:AI_MEMORY_DIR
+  }
+  if ([string]::IsNullOrWhiteSpace($primaryRoot)) {
+    throw 'AI_MEMORY_WORK_DIR is not set.'
+  }
+
+  $primaryId = if ([string]::IsNullOrWhiteSpace($env:AI_MEMORY_PRIMARY_SOURCE_ID)) {
+    'core'
+  } else {
+    $env:AI_MEMORY_PRIMARY_SOURCE_ID.Trim().ToLowerInvariant()
+  }
+  $configured = [ordered]@{
+    $primaryId = $primaryRoot
+  }
+
+  if (![string]::IsNullOrWhiteSpace($env:AI_MEMORY_RETRIEVAL_SOURCES)) {
+    try {
+      $additional = $env:AI_MEMORY_RETRIEVAL_SOURCES | ConvertFrom-Json
+    } catch {
+      throw 'AI_MEMORY_RETRIEVAL_SOURCES must be a JSON object.'
+    }
+    foreach ($property in $additional.PSObject.Properties) {
+      $sourceId = $property.Name.ToLowerInvariant()
+      if ($configured.Contains($sourceId)) {
+        throw "Duplicate memory source ID: $sourceId"
+      }
+      $configured[$sourceId] = [string]$property.Value
+    }
+  }
+  if (![string]::IsNullOrWhiteSpace($env:AI_MEMORY_PERSONAL_DIR) -and !$configured.Contains('personal')) {
+    $configured['personal'] = $env:AI_MEMORY_PERSONAL_DIR
+  }
+
+  $sources = @()
+  $seenRoots = @{}
+  foreach ($entry in $configured.GetEnumerator()) {
+    if ($entry.Key -notmatch '^[a-z][a-z0-9-]{0,62}$') {
+      throw "Invalid memory source ID: $($entry.Key)"
+    }
+    $resolved = (Resolve-Path -LiteralPath ([Environment]::ExpandEnvironmentVariables($entry.Value))).Path
+    $rootKey = $resolved.ToLowerInvariant()
+    if ($seenRoots.ContainsKey($rootKey)) {
+      throw "Duplicate memory source directory: $resolved"
+    }
+    $seenRoots[$rootKey] = $true
+    $sources += [pscustomobject]@{
+      SourceId = $entry.Key
+      Root = $resolved
+      Writable = $entry.Key -eq $primaryId
+    }
+  }
+  return $sources
+}

@@ -103,7 +103,7 @@ def run_benchmark(label: str) -> dict[str, Any]:
         scope_leaks += int(leaked)
         expected_path = case.get("expected_path")
         citation_ok = not expected_path or any(
-            citation.path == expected_path
+            citation.path.endswith(expected_path)
             for citation in packet.citations
         )
         citation_failures += int(not citation_ok)

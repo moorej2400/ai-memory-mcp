@@ -10,7 +10,7 @@ Run this command after a normal Markdown change:
 .\.venv\Scripts\ai-memory-index.exe
 ```
 
-The command reads the canonical Markdown files.
+The command reads Markdown from all configured memory sources.
 The command publishes a new SQLite index snapshot.
 The command does not change the Markdown files.
 
@@ -51,6 +51,8 @@ The tool updates only the derived SQLite index.
 Use the maintenance script when the Graphify graph must change.
 The script uses staging and validation.
 The script keeps the last satisfactory graph if validation fails.
+The script extracts each configured memory source separately.
+The script merges the source graphs into the AI Memory provider graph.
 
 Run this script for Graphify maintenance:
 
@@ -81,7 +83,7 @@ Install the logon launcher:
 ## Check health
 
 Call `memory_status` from an MCP client.
-Check the canonical root, index, graph, package, and MCP version fields.
+Check the primary source, retrieval sources, index, graph, package, and MCP fields.
 
 A saved Markdown file can exist before its derived indexes change.
 Report the Markdown and index results as separate results.

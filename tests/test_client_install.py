@@ -17,10 +17,25 @@ def portable_repository(tmp_path: Path) -> Path:
     repository = tmp_path / "ai-memory-mcp"
     python = repository / ".venv" / "Scripts" / "python.exe"
     skill = repository / "skill" / "ai-memory" / "SKILL.md"
+    graphify_skill = (
+        repository
+        / "graphify-codebase"
+        / "skill"
+        / "graphify"
+        / "SKILL.md"
+    )
     python.parent.mkdir(parents=True)
     python.write_text("", encoding="utf-8")
     skill.parent.mkdir(parents=True)
-    skill.write_text("---\nname: ai-memory\n---\n", encoding="utf-8")
+    skill.write_text(
+        "---\nname: ai-memory\ndescription: Test AI Memory skill.\n---\n",
+        encoding="utf-8",
+    )
+    graphify_skill.parent.mkdir(parents=True)
+    graphify_skill.write_text(
+        "---\nname: graphify\ndescription: Test Graphify skill.\n---\n",
+        encoding="utf-8",
+    )
     return repository
 
 
@@ -65,6 +80,17 @@ def test_installs_json_client_and_preserves_existing_servers(
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
         assert settings["github.copilot.chat.skillTool.enabled"] is True
         assert settings_path in changed
+    skill_roots = {
+        "claude-code": home / ".claude" / "skills",
+        "copilot": home / ".copilot" / "skills",
+        "vscode": home / ".copilot" / "skills",
+    }
+    if skill_root := skill_roots.get(client):
+        assert (skill_root / "ai-memory" / "SKILL.md").is_file()
+        graphify_stub = (
+            skill_root / "graphify" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        assert "graphify-codebase/skill/graphify/SKILL.md" in graphify_stub
 
 
 def test_installs_opencode_v1_and_repo_linked_skill(
@@ -100,6 +126,15 @@ def test_installs_opencode_v1_and_repo_linked_skill(
         home / ".config" / "opencode" / "skills" / "ai-memory" / "SKILL.md"
     ).read_text(encoding="utf-8")
     assert portable_repository.as_posix() in stub
+    graphify_stub = (
+        home
+        / ".config"
+        / "opencode"
+        / "skills"
+        / "graphify"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "graphify-codebase/skill/graphify/SKILL.md" in graphify_stub
 
 
 def test_opencode_v2_uses_servers_container() -> None:
@@ -124,8 +159,10 @@ def test_new_shared_skill_reports_a_change(
     )
 
     skill = home / ".agents" / "skills" / "ai-memory" / "SKILL.md"
-    assert changed == [skill]
+    graphify = home / ".agents" / "skills" / "graphify" / "SKILL.md"
+    assert changed == [skill, graphify]
     assert skill.is_file()
+    assert graphify.is_file()
 
 
 def test_jsonc_parser_keeps_comment_markers_inside_strings() -> None:

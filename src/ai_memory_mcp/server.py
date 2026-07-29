@@ -62,6 +62,13 @@ def create_server(settings: Settings | None = None) -> FastMCP:
                 description="Natural-language question or exact memory identity.",
             ),
         ],
+        source_id: Annotated[
+            str | None,
+            Field(
+                pattern=r"^[a-z][a-z0-9-]{0,62}$",
+                description="Optional configured memory source ID.",
+            ),
+        ] = None,
         root_scope: Annotated[
             Literal["work", "personal"] | None,
             Field(description="Optional memory domain."),
@@ -114,6 +121,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         """Recall cited memory and its applicable relationships."""
         return service.recall(
             query,
+            source_id=source_id,
             root_scope=root_scope,
             repository=repository,
             project=project,

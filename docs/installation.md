@@ -26,6 +26,17 @@ Install these items before you start:
 6. Call `memory_status` from an agent session.
 7. Make sure that the status result is satisfactory.
 
+## Add retrieval-only vaults
+
+1. Open the untracked `.env` file.
+2. Add a JSON object to `AI_MEMORY_RETRIEVAL_SOURCES`.
+3. Give each vault a stable source ID.
+4. Run `memory_sync`.
+5. Run the Graphify maintenance script when graph relationships must change.
+
+The setup keeps `AI_MEMORY_WORK_DIR` as the only writable vault.
+The additional vaults remain retrieval-only sources.
+
 ## Setup results
 
 The setup script creates `.venv` for the MCP server.
@@ -34,7 +45,7 @@ The script installs the project in editable mode.
 The script creates `.env` if the file does not exist.
 The script builds the first derived index.
 The `-InstallClients` option configures all supported clients.
-The option installs repository-linked skill stubs for clients that support personal skills.
+The option installs repository-linked AI Memory and Graphify skill stubs.
 
 The installer supports these clients:
 

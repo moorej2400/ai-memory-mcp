@@ -84,12 +84,12 @@ The current system has several gaps:
 
 ## Design Principles
 
-1. **One workflow, not one physical location for all data.** The unified skill owns the workflow. Work and personal data may use separate roots when privacy, retention, or sync boundaries require it.
+1. **One write authority, multiple retrieval sources.** The unified skill writes only to the primary root. It can retrieve from additional configured roots.
 2. **Markdown is canonical.** Graphify discovers candidates and relationships. Before any write, the skill must inspect the canonical Markdown path, status, and provenance.
 3. **Scope before storage.** Determine whether knowledge is repository, ticket, cross-repository project, personal project, durable life area, tool, person, decision, reference, session-only, or a skill candidate before choosing a path.
 4. **Search before create.** Update, merge, or supersede an existing precise note rather than creating a near-duplicate.
 5. **Automatic capture is the baseline.** When the skill is active and the appropriate root is configured, it automatically saves qualifying durable memory without per-write confirmation. An explicit user request is an additional trigger, not a prerequisite.
-6. **Personal data is opt-in to personal storage.** A configured personal root enables automatic capture of qualifying personal memory there. Never infer that a personal health, immigration, finance, or travel record belongs in the work root.
+6. **Retrieval sources are read-only.** Never create, update, move, or remove a file in an additional source.
 7. **Recovery first.** Migration and retirement are staged, reversible, and never delete sources without separate explicit approval.
 8. **Small, verified writes.** A memory write is complete only when the note change succeeds. Indexing is a separate verified outcome.
 9. **One canonical skill, many discovery stubs.** Executable custom skill content lives once in Obsidian. Harness-local `SKILL.md` files contain only the metadata and redirect instructions required for discovery and loading.
@@ -100,13 +100,15 @@ The current system has several gaps:
 
 The final skill must resolve roots through explicit configuration:
 
-- `AI_MEMORY_WORK_DIR`: canonical root for shared/work durable memory. It replaces the practical role currently served by `AI_MEMORY_DIR`.
-- `AI_MEMORY_PERSONAL_DIR`: optional canonical root for personal durable memory. It must not default to a corporate-synced path.
-- `AI_MEMORY_DIR`: legacy compatibility fallback for work memory only. It must never be interpreted as a personal root.
+- `AI_MEMORY_WORK_DIR`: primary canonical root and the only write target. It replaces the practical role currently served by `AI_MEMORY_DIR`.
+- `AI_MEMORY_PRIMARY_SOURCE_ID`: stable source ID for the primary root. The default is `core`.
+- `AI_MEMORY_RETRIEVAL_SOURCES`: JSON object that maps stable source IDs to additional read-only roots.
+- `AI_MEMORY_PERSONAL_DIR`: optional legacy alias for a read-only source with the source ID `personal`.
+- `AI_MEMORY_DIR`: legacy compatibility fallback for the primary root.
 - `AI_CUSTOM_SKILLS_DIR`: canonical root for executable custom skills. It must resolve inside an explicitly approved Obsidian memory root, normally `<memory-root>/Skills/Custom`, and must not point to a harness installation directory.
 - `GRAPHIFY_OPENAI_BASE_URL`, `GRAPHIFY_OPENAI_API_KEY`, `GRAPHIFY_OPENAI_MODEL`, and `GRAPHIFY_OPENAI_TOKEN_BUDGET`: explicit semantic-extraction backend configuration used by the narrow AI-Memory refresh.
 
-If a request is personal and `AI_MEMORY_PERSONAL_DIR` is unset, the skill must stop and ask for a safe target. It must not fall back to the work root.
+If content must not enter the primary root, the skill must not save it. An additional retrieval source never becomes a write target.
 
 Harness stub locations must be configured explicitly per platform. The implementation may support Codex, Claude Code, GitHub Copilot CLI, or other harnesses, but it must not guess an installation directory or create a stub in an unconfigured target. If `AI_CUSTOM_SKILLS_DIR` is unset or unsafe, a procedural candidate may be recorded for review, but no canonical skill or harness stub is created.
 
@@ -114,10 +116,7 @@ Harness stub locations must be configured explicitly per platform. The implement
 
 Existing work and personal session vaults remain read-only legacy sources until separately audited. The unified skill may reference them through stable source metadata, but it must not move them or assume that their paths are synchronized with Graphify.
 
-New optional session or handoff notes may be written into the appropriate configured root only after the user has chosen the data domain:
-
-- Work session or handoff -> `AI_MEMORY_WORK_DIR`.
-- Personal session or handoff -> `AI_MEMORY_PERSONAL_DIR`.
+New optional session or handoff notes may be written only to `AI_MEMORY_WORK_DIR`. The skill must apply the normal privacy and scope checks before it writes.
 
 ### Legacy-session safety gate
 
@@ -206,8 +205,8 @@ Each configured root follows the same broad shape where relevant. Folders are cr
 | Ticket-specific implementation context | `Repos/<repo-key>/Tickets/<ticket-id>/` | Create only when there is a durable note, session, or handoff worth retaining. |
 | Ticket spanning multiple repositories | A ticket anchor in the primary work context plus explicit links to all repos/projects | Do not duplicate the same durable facts into every repository. |
 | Cross-repository initiative | `Projects/<project-key>/` | A project is not a substitute for a repository. |
-| Non-code personal project | `Projects/<project-key>/` in the personal root | Examples: home renovation, hobby build, family project, education plan. |
-| Ongoing personal area | `Areas/<area>/` in the personal root | Examples: Finance, Immigration, Health, Travel, Home, Learning. |
+| Non-code project | `Projects/<project-key>/` in the primary root | Write only when the primary-root privacy policy permits it. |
+| Ongoing area | `Areas/<area>/` in the primary root | Write only when the primary-root privacy policy permits it. |
 | Time-bound vacation or trip | `Areas/Travel/<trip-key>/` | Treat as a personal project with an anchor and scoped notes. |
 | Tool behavior or setup | `Tools/` | Only stable, reusable facts or known workarounds. |
 | Decision spanning scopes | `Decisions/` | Local decisions stay with the relevant repo/project/ticket and link outward only when cross-cutting. |
@@ -384,7 +383,7 @@ If a finding changes how agents should repeatedly perform a workflow, the unifie
 - Use this repository as the canonical `ai-memory` source and treat every harness installation plus the `j-skills` distribution copy as a discovery stub.
 - Confirm the exact Obsidian memory root that owns `Skills/Custom/` and configure `AI_CUSTOM_SKILLS_DIR` there. Obsidian is the canonical authoring home; harness-local copies are discovery stubs only.
 - Inventory the harness skill directories that may receive stubs and configure each target explicitly.
-- Decide whether personal memory is supported now and, if so, configure `AI_MEMORY_PERSONAL_DIR` outside the work root.
+- Configure each additional vault in `AI_MEMORY_RETRIEVAL_SOURCES` with a stable source ID.
 - Audit and explicitly resolve or quarantine session-vault conflicts and local/network drift.
 - Inventory registered Graphify corpora and establish corpus priority and default search scope.
 
@@ -427,9 +426,9 @@ If a finding changes how agents should repeatedly perform a workflow, the unifie
 - A Git repository with a canonical remote resolves to one stable `repo_id` and anchor; a fork, same-basename repository, worktree, and local-only repository do not collide.
 - Ticket-specific durable content, sessions, and handoffs route beneath the appropriate ticket scope when retained; unrelated repository facts route to repository notes.
 - A ticket spanning multiple repositories or a cross-repository project can link to all relevant scopes without duplicating facts or assigning a false single parent.
-- A non-code personal project routes to `Projects/<project-key>/` in the configured personal root.
-- Finance, immigration, health, travel, home, and learning material route to the appropriate `Areas/` location in the configured personal root.
-- If a personal root is not configured, the skill does not write personal information to the work root.
+- A non-code project can route to `Projects/<project-key>/` in the primary root when its privacy policy permits the write.
+- Finance, immigration, health, travel, home, and learning material can route to the appropriate `Areas/` location only when the primary-root privacy policy permits the write.
+- The skill never writes to an additional retrieval source.
 
 ### Identity, links, and idempotence
 
@@ -468,7 +467,7 @@ If a finding changes how agents should repeatedly perform a workflow, the unifie
 - Resolved: the canonical `ai-memory` source is `skill/ai-memory/SKILL.md` in the `ai-memory-mcp` repository.
 - Resolved: `AI_MEMORY_WORK_DIR` is supplied by the repository-local `.env` and points to the user's canonical Markdown vault.
 - Resolved: the supported harness stub targets are Codex, Claude, Copilot, and OpenCode under their configured user skill directories; `j-skills/ai-memory` is also a distribution stub to the same canonical source.
-- Confirm whether personal memory support is in the first implementation and provide the approved `AI_MEMORY_PERSONAL_DIR` if so.
+- Resolved: the primary root is the only write target. `AI_MEMORY_RETRIEVAL_SOURCES` and `AI_MEMORY_PERSONAL_DIR` add retrieval-only roots.
 - Define the material-write threshold and maximum Graphify indexing staleness.
 - Define default Graphify corpus priority and whether personal/legacy session corpora are searchable by default.
 - Assign an owner and target date for the legacy session-vault conflict and drift audit.

@@ -14,7 +14,7 @@ from .config import Settings
 from .models import MemoryChunk, MemoryDocument, ScopeFilter
 from .text import chunk_document, parse_document
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _utc_now() -> str:
@@ -41,6 +41,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         );
         CREATE TABLE IF NOT EXISTS documents (
             memory_id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL,
             path TEXT NOT NULL UNIQUE,
             title TEXT NOT NULL,
             body TEXT NOT NULL,
@@ -61,6 +62,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS chunks (
             chunk_id TEXT PRIMARY KEY,
             memory_id TEXT NOT NULL REFERENCES documents(memory_id) ON DELETE CASCADE,
+            source_id TEXT NOT NULL,
             path TEXT NOT NULL,
             title TEXT NOT NULL,
             heading TEXT NOT NULL,
@@ -70,7 +72,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_chunks_memory ON chunks(memory_id, ordinal);
         CREATE INDEX IF NOT EXISTS idx_documents_scope
-            ON documents(root_scope, status, scope_kind, scope_id);
+            ON documents(source_id, root_scope, status, scope_kind, scope_id);
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
             chunk_id UNINDEXED,
             title,
@@ -89,21 +91,31 @@ def _index_lock(state_dir: Path) -> Iterator[None]:
     state_dir.mkdir(parents=True, exist_ok=True)
     lock_path = state_dir / "index.lock"
     handle = lock_path.open("a+b")
+    locked = False
     try:
         if os.name == "nt":
             import msvcrt
 
-            handle.seek(0)
+            handle.seek(0, os.SEEK_END)
             if handle.tell() == 0:
                 handle.write(b"0")
                 handle.flush()
             handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            locked = True
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            locked = True
         yield
     finally:
-        if os.name == "nt":
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        if locked:
+            if os.name == "nt":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
 
 
@@ -129,7 +141,7 @@ def _insert_document(
     connection.execute(
         """
         INSERT INTO documents VALUES (
-            :memory_id, :path, :title, :body, :status, :root_scope,
+            :memory_id, :source_id, :path, :title, :body, :status, :root_scope,
             :scope_kind, :scope_id, :updated, :review_after, :related_json,
             :identifiers_json, :projects_json, :repos_json, :tools_json,
             :content_hash, :mtime_ns
@@ -147,10 +159,11 @@ def _insert_document(
     identifiers = " ".join(document.identifiers)
     for chunk in chunks:
         connection.execute(
-            "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 chunk.chunk_id,
                 chunk.memory_id,
+                chunk.source_id,
                 chunk.path,
                 chunk.title,
                 chunk.heading,
@@ -188,24 +201,40 @@ def current_index_path(settings: Settings) -> Path | None:
         try:
             payload = json.loads(settings.pointer_path.read_text(encoding="utf-8"))
             candidate = settings.state_dir / payload["snapshot"]
-            if candidate.exists():
+            if candidate.exists() and _schema_matches(candidate):
                 return candidate
         except (json.JSONDecodeError, KeyError, OSError):
             pass
     snapshots = sorted(settings.state_dir.glob("index-*.sqlite"), reverse=True)
-    return snapshots[0] if snapshots else None
+    return next((path for path in snapshots if _schema_matches(path)), None)
+
+
+def _schema_matches(path: Path) -> bool:
+    try:
+        with _connect(path, read_only=True) as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            return bool(row and int(row["value"]) == SCHEMA_VERSION)
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        return False
 
 
 def build_index(settings: Settings, *, force: bool = False) -> dict[str, object]:
     started = time.perf_counter()
-    if not settings.memory_root.is_dir():
-        raise FileNotFoundError(f"Memory root not found: {settings.memory_root}")
+    sources = settings.memory_sources
+    missing = [source for source in sources if not source.root.is_dir()]
+    if missing:
+        unavailable = ", ".join(
+            f"{source.source_id}={source.root}" for source in missing
+        )
+        raise FileNotFoundError(f"Memory source not found: {unavailable}")
     settings.state_dir.mkdir(parents=True, exist_ok=True)
     with _index_lock(settings.state_dir):
         current = current_index_path(settings)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         snapshot = settings.state_dir / f"index-{stamp}-{os.getpid()}.sqlite"
-        if current and not force:
+        if current and not force and _schema_matches(current):
             # SQLite backup produces a consistent new snapshot while preserving
             # every previously published snapshot for recovery and comparison.
             with _connect(current, read_only=True) as source, _connect(snapshot) as target:
@@ -221,38 +250,63 @@ def build_index(settings: Settings, *, force: bool = False) -> dict[str, object]
             seen: set[str] = set()
             added = changed = unchanged = removed = 0
             parse_errors: list[dict[str, str]] = []
-            for path in _eligible_markdown(settings.memory_root):
-                relative = path.relative_to(settings.memory_root).as_posix()
-                seen.add(relative)
-                try:
-                    document = parse_document(path, settings.memory_root)
-                except (OSError, UnicodeError, ValueError) as exc:
-                    parse_errors.append({"path": relative, "error": str(exc)})
-                    continue
-                old = existing.get(relative)
-                if old and old[1] == document.content_hash and not force:
-                    unchanged += 1
-                    continue
-                if old:
-                    _remove_document(connection, old[0])
-                    changed += 1
-                else:
-                    # A memory_id can move paths; replace the old derived row
-                    # rather than letting the unique identity split in two.
+            for source in sources:
+                for path in _eligible_markdown(source.root):
+                    relative = path.relative_to(source.root).as_posix()
+                    source_path = f"{source.source_id}/{relative}"
+                    seen.add(source_path)
+                    try:
+                        document = parse_document(
+                            path,
+                            source.root,
+                            source.source_id,
+                        )
+                    except (OSError, UnicodeError, ValueError) as exc:
+                        parse_errors.append(
+                            {
+                                "source_id": source.source_id,
+                                "path": relative,
+                                "error": str(exc),
+                            }
+                        )
+                        continue
+                    old = existing.get(source_path)
+                    if old and old[1] == document.content_hash and not force:
+                        unchanged += 1
+                        continue
+                    # Check the new ID before removing the previous record. This
+                    # preserves the last valid indexed version after a collision.
                     row = connection.execute(
-                        "SELECT memory_id FROM documents WHERE memory_id = ?",
-                        (document.memory_id,),
+                        "SELECT source_id, path FROM documents "
+                        "WHERE memory_id = ? AND path <> ?",
+                        (document.memory_id, source_path),
                     ).fetchone()
                     if row:
-                        _remove_document(connection, row["memory_id"])
+                        parse_errors.append(
+                            {
+                                "source_id": source.source_id,
+                                "path": relative,
+                                "error": (
+                                    f"memory_id '{document.memory_id}' "
+                                    f"already exists in source "
+                                    f"'{row['source_id']}' at {row['path']}"
+                                ),
+                            }
+                        )
+                        continue
+                    if old:
+                        _remove_document(connection, old[0])
                         changed += 1
                     else:
                         added += 1
-                _insert_document(
-                    connection,
-                    document,
-                    chunk_document(document, settings.semantic_dimensions),
-                )
+                    _insert_document(
+                        connection,
+                        document,
+                        chunk_document(
+                            document,
+                            settings.semantic_dimensions,
+                        ),
+                    )
             for path, (memory_id, _) in existing.items():
                 if path not in seen:
                     _remove_document(connection, memory_id)
@@ -268,6 +322,10 @@ def build_index(settings: Settings, *, force: bool = False) -> dict[str, object]
                 "schema_version": str(SCHEMA_VERSION),
                 "built_at": _utc_now(),
                 "memory_root": str(settings.memory_root.resolve()),
+                "memory_sources": json.dumps(
+                    [source.source_id for source in sources],
+                    separators=(",", ":"),
+                ),
                 "semantic_dimensions": str(settings.semantic_dimensions),
                 "documents": str(counts["documents"]),
                 "chunks": str(counts["chunks"]),
@@ -419,6 +477,7 @@ class MemoryIndex:
         self, scope: ScopeFilter
     ) -> list[tuple[sqlite3.Row, dict[int, float]]]:
         cache_key = (
+            scope.source_id,
             scope.root_scope,
             scope.repository,
             scope.project,
@@ -489,6 +548,9 @@ def decode_document(row: sqlite3.Row) -> dict[str, object]:
 def scope_sql(scope: ScopeFilter) -> tuple[str, list[str]]:
     clauses: list[str] = []
     parameters: list[str] = []
+    if scope.source_id:
+        clauses.append("d.source_id = ?")
+        parameters.append(scope.source_id)
     if scope.root_scope:
         clauses.append("d.root_scope = ?")
         parameters.append(scope.root_scope)

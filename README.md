@@ -3,7 +3,8 @@
 AI Memory MCP gives agents one stable interface for durable memory.
 The server combines exact, lexical, semantic, and graph search results.
 
-Markdown files are the source of truth.
+The primary Markdown vault is the only write authority.
+Additional Markdown vaults are retrieval-only sources.
 The system derives SQLite indexes and Graphify graphs from Markdown.
 
 ## Architecture decision
@@ -11,7 +12,7 @@ The system derives SQLite indexes and Graphify graphs from Markdown.
 The system is built around Graphify.
 Graphify remains a replaceable provider behind the stable AI Memory MCP interface.
 
-The MCP facade owns scope, ranking, evidence, health, feedback, and refresh control.
+The MCP facade owns scope, ranking, evidence, health, and refresh control.
 Clients do not depend on Graphify commands, files, or response formats.
 
 This boundary permits a future graph-provider change without a client configuration change.
@@ -30,7 +31,7 @@ flowchart LR
     end
 
     subgraph Repository["AI Memory MCP repository"]
-        MCP["MCP facade<br/>Eight public tools"]
+        MCP["MCP facade<br/>Three public tools"]
         Service["MemoryService<br/>Policy and orchestration"]
         Retrieval["RetrievalEngine<br/>Scope, fusion, and reranking"]
         Indexer["Memory indexer<br/>Validation and snapshots"]
@@ -38,8 +39,9 @@ flowchart LR
         Skill["Canonical ai-memory skill"]
     end
 
-    subgraph Authority["Canonical authority"]
-        Markdown["Markdown memory<br/>Durable source of truth"]
+    subgraph Authority["Markdown sources"]
+        Primary["Primary vault<br/>Only write authority"]
+        Additional["Additional vaults<br/>Retrieval-only"]
     end
 
     subgraph Derived["Derived state"]
@@ -53,9 +55,11 @@ flowchart LR
     Retrieval --> SQLite
     Retrieval --> Adapter
     Adapter --> Graph
-    Markdown --> Indexer
+    Primary --> Indexer
+    Additional --> Indexer
     Indexer --> SQLite
-    Markdown --> Graph
+    Primary --> Graph
+    Additional --> Graph
     Skill -. guides .-> Clients
 ```
 
@@ -63,7 +67,8 @@ flowchart LR
 
 | Component | Responsibility |
 |---|---|
-| Markdown memory | Stores canonical durable records. |
+| Primary Markdown vault | Stores all new durable records. |
+| Retrieval-only vaults | Supply additional records without receiving writes. |
 | Memory indexer | Validates records and publishes versioned SQLite snapshots. |
 | SQLite FTS5 | Supplies exact and lexical candidates. |
 | Local semantic index | Supplies paraphrase candidates without an external API. |
@@ -148,6 +153,7 @@ A failed rebuild does not change the Markdown authority.
 - Versioned snapshots preserve the last satisfactory index.
 - Full graph refreshes validate staged data before publication.
 - Evidence packets include canonical source paths.
+- Source IDs keep identical vault paths separate.
 
 ## Quick start
 
@@ -184,6 +190,7 @@ For more setup information, read the [installation guide](docs/installation.md).
 | `src/ai_memory_mcp/` | MCP server, retrieval engine, indexer, and adapters |
 | `scripts/` | Setup, client installation, and Graphify operations |
 | `skill/ai-memory/` | Canonical AI Memory skill |
+| `graphify-codebase/` | Independent codebase-indexing skill and wrapper |
 | `tests/` | Automated behavior and portability tests |
 | `benchmarks/` | Frozen retrieval contract and fixtures |
 | `docs/` | Architecture, setup, operations, and validation guides |
@@ -199,6 +206,32 @@ The [documentation index](docs/README.md) gives links to all project guides.
 - [Development](docs/development.md)
 - [Validation](docs/validation-report.md)
 - [Writing standard](docs/writing-standard.md)
+
+## Skill discovery stubs
+
+This repository contains two canonical skills:
+
+- `skill/ai-memory/SKILL.md`
+- `graphify-codebase/skill/graphify/SKILL.md`
+
+AI harnesses must contain discovery stubs instead of canonical skill copies.
+The stubs keep one source of truth and support repository moves.
+
+Use this stub pattern:
+
+```markdown
+---
+name: <canonical-name>
+description: <copy the exact canonical description>
+---
+
+Before following this stub, read the canonical `SKILL.md` in full from `<canonical-path>`.
+```
+
+Run `.\scripts\install-clients.ps1` after a clone or repository move.
+The installer writes the correct canonical path into each stub.
+
+Read the [Graphify Codebase guide](graphify-codebase/README.md) for its independent boundary.
 
 ## Source boundary
 

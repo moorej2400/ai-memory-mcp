@@ -65,6 +65,7 @@ def _intent_expansions(tokens: set[str]) -> set[str]:
 def _row_hit(row: sqlite3.Row, score: float, source: str, rank: int) -> SearchHit:
     return SearchHit(
         memory_id=row["memory_id"],
+        source_id=row["source_id"],
         path=row["path"],
         title=row["title"],
         heading=row["heading"],
@@ -79,7 +80,13 @@ class RetrievalEngine:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.index = MemoryIndex(settings)
-        self.graph = GraphifyAdapter(settings.graph_path)
+        self.graph = GraphifyAdapter(
+            settings.graph_path,
+            primary_source_id=settings.primary_source_id,
+            source_ids=tuple(
+                source.source_id for source in settings.retrieval_sources
+            ),
+        )
 
     def _plan(self, query: str, supplied: ScopeFilter | None) -> ScopeFilter:
         scope = supplied or ScopeFilter()
@@ -179,6 +186,7 @@ class RetrievalEngine:
                 if fused is None:
                     fused = SearchHit(
                         memory_id=hit.memory_id,
+                        source_id=hit.source_id,
                         path=hit.path,
                         title=hit.title,
                         heading=hit.heading,

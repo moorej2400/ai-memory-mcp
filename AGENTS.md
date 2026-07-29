@@ -1,6 +1,7 @@
 # Repository Instructions
 
 These instructions apply to all files in this repository.
+They also apply to `graphify-codebase/` and all future subdirectories.
 
 ## Safety
 
@@ -24,6 +25,7 @@ This repository is public.
 - Use neutral synthetic values in documentation, tests, and fixtures.
 - Keep all local configuration in the ignored `.env` file.
 - Apply these rules to files, paths, branches, tags, commit messages, commit metadata, and all reachable Git history.
+- Apply these rules to every skill, script, example, fixture, and generated stub.
 - Run the privacy tests and inspect the staged diff before each commit.
 - Inspect the complete reachable Git history before each public push.
 - Stop the push if the privacy status is uncertain.
@@ -67,6 +69,10 @@ Read [docs/writing-standard.md](docs/writing-standard.md) before you change tech
 - Link the root `README.md` to the applicable guide.
 - Keep private historical documents in the ignored `docs/archive/` directory.
 - Keep the canonical skill in `skill/ai-memory/`.
+- Keep the canonical Graphify skill in `graphify-codebase/skill/graphify/`.
+- Keep harness-local skill files as discovery stubs.
+- Keep Graphify Codebase independent from AI Memory.
+- Do not add memory storage, recall, feedback, or learning behavior to the Graphify skill.
 
 ## Verification
 

@@ -10,7 +10,9 @@ The MCP server owns scope, ranking, freshness, evidence, health, and refresh con
 
 ## Source authority
 
-Markdown files are the source of truth.
+Markdown files in all configured vaults are source data.
+The primary vault is the only write authority.
+Additional vaults are retrieval-only sources.
 The system can rebuild all indexes from the Markdown files.
 
 The system derives the SQLite index and Graphify graph from Markdown.
@@ -20,7 +22,8 @@ A failed refresh does not change the Markdown authority.
 
 ```mermaid
 flowchart LR
-    M[Markdown memory] --> I[Memory indexer]
+    P[Primary writable vault] --> I[Memory indexer]
+    A[Retrieval-only vaults] --> I
     I --> L[Exact and lexical index]
     I --> V[Semantic index]
     I --> G[Graphify graph]
@@ -39,15 +42,18 @@ flowchart LR
 
 ### Markdown memory
 
-The configured memory directory contains the canonical records.
+The configured primary vault receives all new records.
+Named additional vaults supply retrieval-only records.
 Each durable record has an identity, scope, status, dates, and provenance.
 
 ### Memory indexer
 
-The indexer reads changed Markdown files.
+The indexer reads changed Markdown files from all configured vaults.
 It validates identity and metadata.
 It skips unchanged content.
 It publishes a versioned SQLite snapshot.
+It prefixes each indexed path with its source ID.
+It does not modify a configured vault.
 
 ### Exact and lexical retrieval
 
@@ -75,7 +81,7 @@ The facade returns source paths and retrieval evidence.
 
 ## Query procedure
 
-1. Resolve the work or personal scope.
+1. Resolve the optional source and domain scope.
 2. Apply repository, project, ticket, status, and path filters.
 3. Select the required retrieval providers.
 4. Run the selected providers.
@@ -90,7 +96,7 @@ Graph traversal is not the only retrieval method.
 
 ## Refresh procedure
 
-1. Validate the canonical memory root.
+1. Validate all configured memory sources.
 2. Detect changed Markdown files.
 3. Build derived data in a staging location.
 4. Validate the staged data.
@@ -100,7 +106,8 @@ Graph traversal is not the only retrieval method.
 
 The update keeps the last satisfactory data after a failure.
 An ordinary Markdown change uses `memory_sync`.
-The maintenance script updates the Graphify graph.
+The maintenance script builds one Graphify graph for each memory source.
+The script merges those graphs with stable source prefixes.
 
 ## Provider boundary
 

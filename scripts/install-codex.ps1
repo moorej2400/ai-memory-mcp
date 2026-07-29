@@ -16,11 +16,15 @@ if ([string]::IsNullOrWhiteSpace($CodexHome)) {
 
 $python = Join-Path $RepositoryRoot '.venv\Scripts\python.exe'
 $canonicalSkill = Join-Path $RepositoryRoot 'skill\ai-memory\SKILL.md'
+$canonicalGraphifySkill = Join-Path $RepositoryRoot 'graphify-codebase\skill\graphify\SKILL.md'
 if (!(Test-Path -LiteralPath $python)) {
   throw "Application environment is missing: $python"
 }
 if (!(Test-Path -LiteralPath $canonicalSkill)) {
   throw "Canonical AI Memory skill is missing: $canonicalSkill"
+}
+if (!(Test-Path -LiteralPath $canonicalGraphifySkill)) {
+  throw "Canonical Graphify skill is missing: $canonicalGraphifySkill"
 }
 
 New-Item -ItemType Directory -Force -Path $CodexHome | Out-Null
@@ -73,14 +77,37 @@ if ($updatedConfig -ne $config) {
   Write-Host "Registered the repository-owned MCP in $configPath" -ForegroundColor Green
 }
 
-$skillDirectory = Join-Path $CodexHome 'skills\ai-memory'
-New-Item -ItemType Directory -Force -Path $skillDirectory | Out-Null
-$stubPath = Join-Path $skillDirectory 'SKILL.md'
-$skillPath = $canonicalSkill.Replace('\', '/')
-$stub = @"
+$skillSpecs = @(
+  [pscustomobject]@{
+    Name = 'ai-memory'
+    Source = $canonicalSkill
+  },
+  [pscustomobject]@{
+    Name = 'graphify'
+    Source = $canonicalGraphifySkill
+  }
+)
+
+foreach ($skillSpec in $skillSpecs) {
+  $canonicalText = Get-Content -LiteralPath $skillSpec.Source -Raw
+  if ($canonicalText -notmatch '(?s)^---\s*\r?\n(?<header>.*?)\r?\n---\s*\r?\n') {
+    throw "Canonical skill has no valid YAML header: $($skillSpec.Source)"
+  }
+  $header = $Matches.header
+  $nameMatch = [regex]::Match($header, '(?m)^name:\s*(?<value>.+?)\s*$')
+  $descriptionMatch = [regex]::Match($header, '(?m)^description:\s*(?<value>.+?)\s*$')
+  if (!$nameMatch.Success -or $nameMatch.Groups['value'].Value -ne $skillSpec.Name -or !$descriptionMatch.Success) {
+    throw "Canonical skill metadata is invalid: $($skillSpec.Source)"
+  }
+  $description = $descriptionMatch.Groups['value'].Value
+  $skillDirectory = Join-Path $CodexHome "skills\$($skillSpec.Name)"
+  New-Item -ItemType Directory -Force -Path $skillDirectory | Out-Null
+  $stubPath = Join-Path $skillDirectory 'SKILL.md'
+  $skillPath = $skillSpec.Source.Replace('\', '/')
+  $stub = @"
 ---
-name: ai-memory
-description: Use when meaningful work produces durable knowledge that future agents should retain, when the user asks to remember or recall something, or when Graphify-backed Markdown memory needs retrieval, organization, consolidation, conflict handling, session or handoff capture, or refresh. Invoke automatically during substantive work and before completion; do not wait for the user to ask.
+name: $($skillSpec.Name)
+description: $description
 ---
 
 Before following any instruction in this stub, first check the canonical skill header in '$skillPath'. If the source skill metadata has changed and this stub is out of date, update this stub to match the current source skill metadata before proceeding.
@@ -88,20 +115,21 @@ Before following any instruction in this stub, first check the canonical skill h
 Then read the SKILL.md in full from '$skillPath'
 "@
 
-$existingStub = if (Test-Path -LiteralPath $stubPath) {
-  Get-Content -LiteralPath $stubPath -Raw
-}
-else {
-  ''
-}
-if ($existingStub -ne $stub) {
-  if (Test-Path -LiteralPath $stubPath) {
-    $stubBackup = Join-Path $skillDirectory "SKILL.md.backup-$timestamp"
-    Copy-Item -LiteralPath $stubPath -Destination $stubBackup
-    Write-Host "Preserved skill stub backup: $stubBackup"
+  $existingStub = if (Test-Path -LiteralPath $stubPath) {
+    Get-Content -LiteralPath $stubPath -Raw
   }
-  [System.IO.File]::WriteAllText($stubPath, $stub, [System.Text.UTF8Encoding]::new($false))
-  Write-Host "Installed the AI Memory discovery stub at $stubPath" -ForegroundColor Green
+  else {
+    ''
+  }
+  if ($existingStub -ne $stub) {
+    if (Test-Path -LiteralPath $stubPath) {
+      $stubBackup = Join-Path $skillDirectory "SKILL.md.backup-$timestamp"
+      Copy-Item -LiteralPath $stubPath -Destination $stubBackup
+      Write-Host "Preserved skill stub backup: $stubBackup"
+    }
+    [System.IO.File]::WriteAllText($stubPath, $stub, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "Installed the $($skillSpec.Name) discovery stub at $stubPath" -ForegroundColor Green
+  }
 }
 
-Write-Host 'Restart Codex to load the updated MCP command and skill source.' -ForegroundColor Yellow
+Write-Host 'Restart Codex to load the updated MCP command and skill sources.' -ForegroundColor Yellow

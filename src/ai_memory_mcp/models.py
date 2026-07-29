@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 @dataclass(slots=True)
 class MemoryDocument:
     memory_id: str
+    source_id: str
     path: str
     title: str
     body: str
@@ -31,6 +32,7 @@ class MemoryDocument:
 class MemoryChunk:
     chunk_id: str
     memory_id: str
+    source_id: str
     path: str
     title: str
     heading: str
@@ -41,6 +43,7 @@ class MemoryChunk:
 
 @dataclass(slots=True)
 class ScopeFilter:
+    source_id: str | None = None
     root_scope: str | None = None
     repository: str | None = None
     project: str | None = None
@@ -52,6 +55,7 @@ class ScopeFilter:
 @dataclass(slots=True)
 class SearchHit:
     memory_id: str
+    source_id: str
     path: str
     title: str
     heading: str
@@ -90,6 +94,7 @@ class StrictOutput(BaseModel):
 
 class RecallEvidence(StrictOutput):
     memory_id: str
+    source_id: str
     heading: str
     text: str
     score: float = Field(ge=0.0)
@@ -98,6 +103,7 @@ class RecallEvidence(StrictOutput):
 
 class RecallCitation(StrictOutput):
     memory_id: str
+    source_id: str
     path: str
     title: str
 
@@ -125,6 +131,7 @@ class RecallResponse(StrictOutput):
 
 
 class IndexParseError(StrictOutput):
+    source_id: str
     path: str
     error: str
 
@@ -147,8 +154,10 @@ class SyncResponse(StrictOutput):
 
 
 class CanonicalMemoryStatus(StrictOutput):
+    source_id: str
     path: str
     available: bool
+    writable: bool
     authority: Literal["canonical-markdown"]
 
 
@@ -158,6 +167,7 @@ class IndexStatus(StrictOutput):
     schema_version: int | None = None
     built_at: str | None = None
     memory_root: str | None = None
+    memory_sources: list[str] = Field(default_factory=list)
     semantic_dimensions: int | None = None
     documents: int | None = Field(default=None, ge=0)
     chunks: int | None = Field(default=None, ge=0)
@@ -168,8 +178,6 @@ class GraphifyRuntimeStatus(StrictOutput):
     expected: str
     package: str | None = None
     cli: str | None = None
-    skill: str | None = None
-    skill_matches_runtime: bool
     python: str
     mcp_executable: str
     scripts_dir: str
@@ -196,6 +204,7 @@ class RuntimeStatus(StrictOutput):
 class StatusResponse(StrictOutput):
     ok: bool
     canonical_memory_root: CanonicalMemoryStatus
+    retrieval_sources: list[CanonicalMemoryStatus] = Field(default_factory=list)
     index: IndexStatus
     graphify: GraphifyStatus
     runtime: RuntimeStatus

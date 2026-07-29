@@ -62,10 +62,11 @@ def _frontmatter(raw: str) -> tuple[dict[str, Any], str]:
     return metadata if isinstance(metadata, dict) else {}, parts[2].lstrip()
 
 
-def parse_document(path: Path, root: Path) -> MemoryDocument:
+def parse_document(path: Path, root: Path, source_id: str = "core") -> MemoryDocument:
     raw = path.read_text(encoding="utf-8-sig")
     metadata, body = _frontmatter(raw)
     relative = path.relative_to(root).as_posix()
+    source_path = f"{source_id}/{relative}"
     h1 = re.search(r"^#\s+(.+?)\s*$", body, re.MULTILINE)
     title = str(metadata.get("title") or (h1.group(1) if h1 else path.stem))
     primary = metadata.get("primary_scope") or {}
@@ -79,8 +80,9 @@ def parse_document(path: Path, root: Path) -> MemoryDocument:
         else []
     )
     return MemoryDocument(
-        memory_id=str(metadata.get("memory_id") or f"path:{relative.casefold()}"),
-        path=relative,
+        memory_id=str(metadata.get("memory_id") or f"path:{source_path.casefold()}"),
+        source_id=source_id,
+        path=source_path,
         title=title,
         body=body,
         status=str(metadata.get("status") or "active"),
@@ -145,6 +147,7 @@ def chunk_document(document: MemoryDocument, dimensions: int) -> list[MemoryChun
             MemoryChunk(
                 chunk_id=f"{document.memory_id}:{ordinal}",
                 memory_id=document.memory_id,
+                source_id=document.source_id,
                 path=document.path,
                 title=document.title,
                 heading=heading,
@@ -167,4 +170,3 @@ def wikilink_targets(values: Iterable[str]) -> list[str]:
     for value in values:
         targets.extend(match.group(1) for match in WIKILINK_RE.finditer(value))
     return targets
-

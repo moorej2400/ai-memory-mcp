@@ -19,4 +19,5 @@ Return to the [project overview](../README.md) for the quick-start procedure.
 ## Agent integration
 
 - [AI Memory skill](../skill/ai-memory/SKILL.md) contains the agent workflow.
+- [Graphify Codebase](../graphify-codebase/README.md) contains the independent codebase workflow.
 - [Repository instructions](../AGENTS.md) contain the repository requirements.

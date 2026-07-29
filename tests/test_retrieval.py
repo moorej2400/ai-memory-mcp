@@ -34,7 +34,7 @@ def test_all_frozen_cases_pass(
         assert not (returned & set(case.get("forbidden", []))), case["id"]
         if expected_path := case.get("expected_path"):
             assert any(
-                citation.path == expected_path
+                citation.path.endswith(expected_path)
                 for citation in packet.citations
             ), case["id"]
 
@@ -80,7 +80,7 @@ def test_recall_routes_exact_neighbors_and_relationship_path(
     exact = service.recall("mem-demo-777")
     assert exact.intent == "exact"
     assert any(
-        item.target_path == "Workflows/Graph Refresh.md"
+        item.target_path == "core/Workflows/Graph Refresh.md"
         for item in exact.relationships
     )
     relationship = service.recall(

@@ -9,13 +9,26 @@ Copy `.env.example` when you create the configuration manually.
 
 | Variable | Function |
 |---|---|
-| `AI_MEMORY_WORK_DIR` | Sets the canonical work memory directory. |
-| `AI_MEMORY_PERSONAL_DIR` | Sets the optional personal memory directory. |
+| `AI_MEMORY_WORK_DIR` | Sets the only writable memory vault. |
+| `AI_MEMORY_PRIMARY_SOURCE_ID` | Sets the primary source ID. The default is `core`. |
+| `AI_MEMORY_RETRIEVAL_SOURCES` | Maps retrieval-only source IDs to vault directories. |
+| `AI_MEMORY_PERSONAL_DIR` | Sets the optional `personal` retrieval-only source. |
 | `AI_MEMORY_MCP_STATE_DIR` | Sets the derived AI Memory index directory. |
 | `AI_MEMORY_GRAPH_PATH` | Sets the AI Memory Graphify graph file. |
 | `AI_MEMORY_GRAPHIFY_STATE_DIR` | Sets the Graphify state directory. |
 
-Do not use the work directory as a personal memory fallback.
+Use a JSON object for `AI_MEMORY_RETRIEVAL_SOURCES`:
+
+```dotenv
+AI_MEMORY_RETRIEVAL_SOURCES='{"archive":"C:/memory/archive","reference":"D:/memory/reference"}'
+```
+
+Source IDs must start with a letter.
+Use only lowercase letters, numbers, and hyphens.
+
+The server writes no Markdown files.
+The AI Memory skill writes new records only under `AI_MEMORY_WORK_DIR`.
+The indexer reads all configured sources without changing them.
 
 ## Graphify
 
@@ -64,18 +77,19 @@ Keep organization names, private domains, ticket prefixes, and user-specific pat
 The client installer registers one local stdio server named `ai-memory`.
 Each registration runs the repository-owned Python environment.
 
-| Client | Configuration file | Skill location |
+| Client | Configuration file | Skill locations |
 |---|---|---|
-| Codex | `~/.codex/config.toml` | `~/.codex/skills/ai-memory/` |
-| Claude Code | `~/.claude.json` | `~/.claude/skills/ai-memory/` |
-| Claude Desktop | `%APPDATA%/Claude/claude_desktop_config.json` | Uses the Claude personal skill |
-| Copilot CLI | `~/.copilot/mcp-config.json` | `~/.copilot/skills/ai-memory/` |
-| OpenCode | `~/.config/opencode/opencode.jsonc` | `~/.config/opencode/skills/ai-memory/` |
-| VS Code | `%APPDATA%/Code/User/mcp.json` | Uses the Copilot personal skill |
-| Shared agents | Not applicable | `~/.agents/skills/ai-memory/` |
+| Codex | `~/.codex/config.toml` | `~/.codex/skills/ai-memory/` and `~/.codex/skills/graphify/` |
+| Claude Code | `~/.claude.json` | `~/.claude/skills/ai-memory/` and `~/.claude/skills/graphify/` |
+| Claude Desktop | `%APPDATA%/Claude/claude_desktop_config.json` | Uses Claude Code skills |
+| Copilot CLI | `~/.copilot/mcp-config.json` | `~/.copilot/skills/ai-memory/` and `~/.copilot/skills/graphify/` |
+| OpenCode | `~/.config/opencode/opencode.jsonc` | `~/.config/opencode/skills/ai-memory/` and `~/.config/opencode/skills/graphify/` |
+| VS Code | `%APPDATA%/Code/User/mcp.json` | Uses Copilot personal skills |
+| Shared agents | Not applicable | `~/.agents/skills/ai-memory/` and `~/.agents/skills/graphify/` |
 
-The installer keeps the canonical skill in this repository.
-Each installed skill file points to that canonical source.
+The installer keeps both canonical skills in this repository.
+Each installed skill file is a discovery stub.
+Each stub points to its canonical source.
 The installer enables the VS Code Agent Skills feature.
 
 The installer supports the OpenCode version 1 and version 2 MCP structures.

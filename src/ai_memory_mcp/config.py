@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,12 +45,70 @@ def _configured_path(name: str, default: Path) -> Path:
     return Path(os.path.expandvars(value)).expanduser()
 
 
+SOURCE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
+
+
+@dataclass(frozen=True, slots=True)
+class MemorySource:
+    source_id: str
+    root: Path
+    writable: bool = False
+
+
+def _source_id(value: str) -> str:
+    normalized = value.strip().casefold()
+    if not SOURCE_ID_PATTERN.fullmatch(normalized):
+        raise ValueError(
+            "Memory source IDs must start with a letter and contain only "
+            "lowercase letters, numbers, or hyphens."
+        )
+    return normalized
+
+
+def _retrieval_sources() -> tuple[MemorySource, ...]:
+    raw = os.getenv("AI_MEMORY_RETRIEVAL_SOURCES", "").strip()
+    configured: dict[str, str] = {}
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "AI_MEMORY_RETRIEVAL_SOURCES must be a JSON object."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "AI_MEMORY_RETRIEVAL_SOURCES must map source IDs to directories."
+            )
+        configured = {str(key): str(value) for key, value in payload.items()}
+
+    personal = os.getenv("AI_MEMORY_PERSONAL_DIR", "").strip()
+    if personal:
+        configured.setdefault("personal", personal)
+
+    sources: list[MemorySource] = []
+    for name, value in configured.items():
+        source_id = _source_id(name)
+        if not value.strip():
+            raise ValueError(
+                f"Memory retrieval source '{source_id}' has no directory."
+            )
+        sources.append(
+            MemorySource(
+                source_id=source_id,
+                root=Path(os.path.expandvars(value)).expanduser(),
+            )
+        )
+    return tuple(sorted(sources, key=lambda source: source.source_id))
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     memory_root: Path
     state_dir: Path
     graph_path: Path
     graphify_mcp_url: str
+    primary_source_id: str = "core"
+    retrieval_sources: tuple[MemorySource, ...] = ()
     host: str = "127.0.0.1"
     port: int = 4334
     result_limit: int = 8
@@ -80,6 +140,10 @@ class Settings:
             graphify_mcp_url=os.getenv(
                 "GRAPHIFY_GLOBAL_MCP_URL", "http://127.0.0.1:4324/mcp"
             ),
+            primary_source_id=_source_id(
+                os.getenv("AI_MEMORY_PRIMARY_SOURCE_ID", "core")
+            ),
+            retrieval_sources=_retrieval_sources(),
             host=os.getenv("AI_MEMORY_MCP_HOST", "127.0.0.1"),
             port=int(os.getenv("AI_MEMORY_MCP_PORT", "4334")),
             result_limit=int(os.getenv("AI_MEMORY_MCP_RESULT_LIMIT", "8")),
@@ -93,3 +157,27 @@ class Settings:
     @property
     def pointer_path(self) -> Path:
         return self.state_dir / "current-index.json"
+
+    @property
+    def memory_sources(self) -> tuple[MemorySource, ...]:
+        primary = MemorySource(
+            source_id=self.primary_source_id,
+            root=self.memory_root,
+            writable=True,
+        )
+        sources = (primary, *self.retrieval_sources)
+        seen_ids: set[str] = set()
+        seen_roots: set[str] = set()
+        for source in sources:
+            resolved = str(source.root.resolve()).casefold()
+            if source.source_id in seen_ids:
+                raise ValueError(
+                    f"Duplicate memory source ID: {source.source_id}"
+                )
+            if resolved in seen_roots:
+                raise ValueError(
+                    f"Duplicate memory source directory: {source.root}"
+                )
+            seen_ids.add(source.source_id)
+            seen_roots.add(resolved)
+        return sources

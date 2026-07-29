@@ -71,6 +71,8 @@ if (!(Test-Path -LiteralPath $envPath)) {
   $memoryPath = $resolvedMemoryRoot.Replace('\', '/')
   $configuration = @"
 AI_MEMORY_WORK_DIR="$memoryPath"
+AI_MEMORY_PRIMARY_SOURCE_ID="core"
+AI_MEMORY_RETRIEVAL_SOURCES="{}"
 AI_MEMORY_MCP_STATE_DIR="$homePath/.ai-memory-mcp"
 AI_MEMORY_GRAPHIFY_STATE_DIR="$homePath/.graphify"
 AI_MEMORY_GRAPH_PATH="$homePath/.graphify/corpora/ai-memory/graphify-out/graph.json"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import platform
 import time
 from datetime import datetime, timezone
@@ -55,6 +56,7 @@ class MemoryService:
         self,
         query: str,
         *,
+        source_id: str | None = None,
         root_scope: str | None = None,
         repository: str | None = None,
         project: str | None = None,
@@ -67,6 +69,7 @@ class MemoryService:
         if not query:
             raise ValueError("Query must not be empty.")
         scope = ScopeFilter(
+            source_id=source_id,
             root_scope=root_scope,
             repository=repository,
             project=project,
@@ -99,6 +102,7 @@ class MemoryService:
         evidence = [
             RecallEvidence(
                 memory_id=hit.memory_id,
+                source_id=hit.source_id,
                 heading=hit.heading,
                 text=hit.text,
                 score=max(0.0, hit.score),
@@ -109,6 +113,7 @@ class MemoryService:
         citations = [
             RecallCitation(
                 memory_id=hit.memory_id,
+                source_id=hit.source_id,
                 path=hit.path,
                 title=hit.title,
             )
@@ -146,11 +151,21 @@ class MemoryService:
                 schema_version=metadata.get("schema_version"),
                 built_at=metadata.get("built_at"),
                 memory_root=metadata.get("memory_root"),
+                memory_sources=json.loads(
+                    metadata.get("memory_sources", "[]")
+                ),
                 semantic_dimensions=metadata.get("semantic_dimensions"),
                 documents=metadata.get("documents"),
                 chunks=metadata.get("chunks"),
             )
-        graph_health = GraphifyAdapter(self.settings.graph_path).health()
+        graph_health = GraphifyAdapter(
+            self.settings.graph_path,
+            primary_source_id=self.settings.primary_source_id,
+            source_ids=tuple(
+                source.source_id
+                for source in self.settings.retrieval_sources
+            ),
+        ).health()
         graph_age_seconds = (
             max(0.0, time.time() - self.settings.graph_path.stat().st_mtime)
             if self.settings.graph_path.exists()
@@ -160,10 +175,22 @@ class MemoryService:
         return StatusResponse(
             ok=index_status.available,
             canonical_memory_root=CanonicalMemoryStatus(
+                source_id=self.settings.primary_source_id,
                 path=str(self.settings.memory_root),
                 available=self.settings.memory_root.is_dir(),
+                writable=True,
                 authority="canonical-markdown",
             ),
+            retrieval_sources=[
+                CanonicalMemoryStatus(
+                    source_id=source.source_id,
+                    path=str(source.root),
+                    available=source.root.is_dir(),
+                    writable=False,
+                    authority="canonical-markdown",
+                )
+                for source in self.settings.retrieval_sources
+            ],
             index=index_status,
             graphify=GraphifyStatus(
                 available=bool(graph_health["available"]),
@@ -229,6 +256,7 @@ class MemoryService:
             evidence=[
                 RecallEvidence(
                     memory_id=memory_id,
+                    source_id=str(document["source_id"]),
                     heading="",
                     text=str(document["body"]),
                     score=1.0,
@@ -236,7 +264,12 @@ class MemoryService:
                 )
             ],
             citations=[
-                RecallCitation(memory_id=memory_id, path=path, title=title)
+                RecallCitation(
+                    memory_id=memory_id,
+                    source_id=str(document["source_id"]),
+                    path=path,
+                    title=title,
+                )
             ],
             relationships=self._neighbor_relationships(
                 document,
@@ -283,6 +316,7 @@ class MemoryService:
             evidence=[
                 RecallEvidence(
                     memory_id=str(document["memory_id"]),
+                    source_id=str(document["source_id"]),
                     heading="",
                     text=str(document["body"])[:2000],
                     score=1.0,
@@ -293,6 +327,7 @@ class MemoryService:
             citations=[
                 RecallCitation(
                     memory_id=str(document["memory_id"]),
+                    source_id=str(document["source_id"]),
                     path=str(document["path"]),
                     title=str(document["title"]),
                 )
@@ -423,14 +458,6 @@ class MemoryService:
             errors.append("pinned Graphify CLI is missing")
         if not mcp_executable.exists():
             errors.append("pinned Graphify MCP executable is missing")
-        skill_version_path = (
-            Path.home() / ".codex" / "skills" / "graphify" / ".graphify_version"
-        )
-        skill_version = (
-            skill_version_path.read_text(encoding="utf-8").strip()
-            if skill_version_path.exists()
-            else None
-        )
         consistent = (
             package_version == expected
             and cli_version == expected
@@ -442,8 +469,6 @@ class MemoryService:
             expected=expected,
             package=package_version,
             cli=cli_version,
-            skill=skill_version,
-            skill_matches_runtime=skill_version == expected,
             python=str(python),
             mcp_executable=str(mcp_executable),
             scripts_dir=str(scripts),

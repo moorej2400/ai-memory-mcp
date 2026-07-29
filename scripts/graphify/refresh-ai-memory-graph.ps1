@@ -23,6 +23,7 @@ $globalGraphBackup = Join-Path $backupRoot 'global-graph.json'
 $globalManifestBackup = Join-Path $backupRoot 'global-manifest.json'
 $stageCorpusRoot = Join-Path $stageRoot 'corpus'
 $stageCorpusOut = Join-Path $stageCorpusRoot 'graphify-out'
+$stageSourcesRoot = Join-Path $stageCorpusOut 'sources'
 $stageGlobalRoot = Join-Path $stageRoot 'global'
 $toolPython = Get-AiMemoryGraphifyPython -RepositoryRoot $repositoryRoot
 if (!(Test-Path -LiteralPath $toolPython)) {
@@ -86,7 +87,7 @@ try {
     throw 'An AI-Memory Graphify refresh is already running.'
   }
 
-  New-Item -ItemType Directory -Force -Path $stageCorpusRoot, $stageGlobalRoot, $backupRoot, $logRoot | Out-Null
+  New-Item -ItemType Directory -Force -Path $stageSourcesRoot, $stageGlobalRoot, $backupRoot, $logRoot | Out-Null
   $logPath = Join-Path $logRoot "ai-memory-refresh-$runId.log"
   Start-Transcript -LiteralPath $logPath | Out-Null
   $transcribing = $true
@@ -121,14 +122,55 @@ try {
       }
     }
   }
-  if (Test-Path -LiteralPath $corpusSeed) {
-    # Copy the existing manifest/cache into staging so Graphify can perform a true incremental scan.
-    Copy-Item -LiteralPath $corpusSeed -Destination $stageCorpusOut -Recurse
+  $sources = @(Get-AiMemorySources)
+  $seedSources = Join-Path $corpusSeed 'sources'
+  if (Test-Path -LiteralPath $seedSources) {
+    foreach ($source in $sources) {
+      $seed = Join-Path $seedSources "$($source.SourceId)\graphify-out"
+      if (Test-Path -LiteralPath $seed) {
+        $destination = Join-Path $stageSourcesRoot "$($source.SourceId)\graphify-out"
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+        Copy-Item -LiteralPath $seed -Destination $destination -Recurse
+      }
+    }
+  } elseif ($sources.Count -eq 1 -and (Test-Path -LiteralPath $corpusSeed)) {
+    # A one-source legacy corpus can seed the first named-source refresh.
+    $destination = Join-Path $stageSourcesRoot "$($sources[0].SourceId)\graphify-out"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+    Copy-Item -LiteralPath $corpusSeed -Destination $destination -Recurse
   }
 
-  & (Join-Path $servicesRoot 'extract-ai-memory.ps1') -OutRoot $stageCorpusRoot -SkipGlobal
+  $sourceGraphs = @()
+  foreach ($source in $sources) {
+    $sourceRoot = Join-Path $stageSourcesRoot $source.SourceId
+    & (Join-Path $servicesRoot 'extract-ai-memory.ps1') `
+      -OutRoot $sourceRoot `
+      -MemoryRoot $source.Root `
+      -SourceId $source.SourceId `
+      -SkipGlobal
+    if ($LASTEXITCODE -ne 0) {
+      throw "AI-Memory extraction failed for source '$($source.SourceId)'."
+    }
+    $sourceGraphs += [pscustomobject]@{
+      SourceId = $source.SourceId
+      Graph = Join-Path $sourceRoot 'graphify-out\graph.json'
+    }
+  }
+
+  $mergeArguments = @(
+    (Join-Path $servicesRoot 'merge-memory-source-graphs.py'),
+    '--output-dir',
+    $stageCorpusOut
+  )
+  foreach ($sourceGraph in $sourceGraphs) {
+    $mergeArguments += @(
+      '--source',
+      "$($sourceGraph.SourceId)=$($sourceGraph.Graph)"
+    )
+  }
+  & $toolPython @mergeArguments
   if ($LASTEXITCODE -ne 0) {
-    throw 'AI-Memory extraction failed in staging.'
+    throw 'AI-Memory source graph merge failed.'
   }
 
   & $toolPython (Join-Path $servicesRoot 'validate-ai-memory-graph.py') `

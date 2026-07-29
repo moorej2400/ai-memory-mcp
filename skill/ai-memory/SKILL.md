@@ -5,7 +5,7 @@ description: Use when meaningful work produces durable knowledge that future age
 
 # AI Memory
 
-Use this as the single canonical workflow for durable AI memory. Treat Markdown in the configured Obsidian memory root as the source of truth. Use the AI Memory MCP facade for retrieval; it combines lexical, semantic, and Graphify relationship signals without making Graphify the public contract.
+Use this as the single canonical workflow for durable AI memory. Treat Markdown in the configured primary vault as the write authority. Treat additional configured vaults as retrieval-only sources. Use the AI Memory MCP facade for retrieval across all configured sources.
 
 Read [architecture.md](../../docs/architecture.md) when changing the retrieval system, index, provider boundary, refresh pipeline, or benchmark.
 
@@ -24,16 +24,18 @@ Read [architecture.md](../../docs/architecture.md) when changing the retrieval s
 Read `.env` at the repository root (two directories above this `SKILL.md`) when
 shell access is available. Resolve configuration in this order:
 
-1. Use `AI_MEMORY_WORK_DIR` for work or shared durable memory.
-2. Use `AI_MEMORY_PERSONAL_DIR` for personal durable memory.
-3. Use legacy `AI_MEMORY_DIR` only as a work-memory fallback.
-4. Use `AI_CUSTOM_SKILLS_DIR` for canonical executable custom skills.
-5. Use `GRAPHIFY_MEMORY_REFRESH_SCRIPT` for the routine narrow refresh.
-6. Use `GRAPHIFY_MEMORY_EXTRACT_SCRIPT` only for an explicitly chosen extraction-only maintenance action.
-7. Use `GRAPHIFY_GLOBAL_MCP_URL` to verify Graphify availability after refresh.
-8. Use `GRAPHIFY_OPENAI_BASE_URL`, `GRAPHIFY_OPENAI_API_KEY`, `GRAPHIFY_OPENAI_MODEL`, and `GRAPHIFY_OPENAI_TOKEN_BUDGET` for semantic extraction through the configured OpenAI-compatible backend.
+1. Use `AI_MEMORY_WORK_DIR` as the only writable memory vault.
+2. Use `AI_MEMORY_PRIMARY_SOURCE_ID` as the primary vault identifier.
+3. Use `AI_MEMORY_RETRIEVAL_SOURCES` for named retrieval-only vaults.
+4. Use `AI_MEMORY_PERSONAL_DIR` as the optional `personal` retrieval-only source.
+5. Use legacy `AI_MEMORY_DIR` only as a primary-vault fallback.
+6. Use `AI_CUSTOM_SKILLS_DIR` for canonical executable custom skills.
+7. Use `GRAPHIFY_MEMORY_REFRESH_SCRIPT` for the routine narrow refresh.
+8. Use `GRAPHIFY_MEMORY_EXTRACT_SCRIPT` only for an explicitly chosen extraction-only maintenance action.
+9. Use `GRAPHIFY_GLOBAL_MCP_URL` to verify Graphify availability after refresh.
+10. Use the configured Graphify backend values only for full extraction.
 
-Do not infer that a personal record belongs in the work root. If personal memory is relevant and `AI_MEMORY_PERSONAL_DIR` is unset, continue the user's main task, skip the unsafe memory write, and ask for or report the missing safe target.
+Write new memories only under `AI_MEMORY_WORK_DIR`. Never write to an additional retrieval source.
 
 Before writing, verify that the selected root exists or that creating the narrow required folder is within the user's authorized scope. Do not create an empty taxonomy.
 
@@ -42,10 +44,10 @@ Before writing, verify that the selected root exists or that creating the narrow
 Run this workflow at meaningful checkpoints and before the final response of substantive work:
 
 1. **Classify the outcome.** Choose retrieval, durable memory, optional session or handoff, skill candidate, session-only context, or no write.
-2. **Choose the domain.** Select `work` or `personal` before selecting a path.
+2. **Choose the domain.** Select `work` or `personal` metadata before selecting a path.
 3. **Choose one primary scope.** Use repository, ticket, project, area, tool, person, decision, reference, or session-only.
-4. **Recall memory.** Use `memory_recall` with the narrowest safe scope. The tool selects exact, search, neighbor, or relationship behavior internally. Treat legacy-corpus results as candidates, not write authority.
-5. **Inspect canonical Markdown.** Search the selected root with `rg` and read the exact candidate notes before deciding where to write.
+4. **Recall memory.** Use `memory_recall` across all configured sources with the narrowest safe scope.
+5. **Inspect canonical Markdown.** Read candidates from their reported source before choosing a write action.
 6. **Choose one action.** Update, create, merge, mark `needs-review`, supersede, route to `custom-skills-master`, retain session-only, or skip with a reason.
 7. **Write a small verified batch.** Apply concise Markdown changes and preserve identity, provenance, links, and predecessor state.
 8. **Update navigation surfaces.** Touch only the relevant anchor, map, review queue, conflict, or stale-memory index.
@@ -86,7 +88,7 @@ Use these routing rules:
 - Repository knowledge -> `Repos/<repo-key>/`
 - Ticket knowledge -> `Repos/<repo-key>/Tickets/<ticket-id>/`
 - Cross-repository or non-code project -> `Projects/<project-key>/`
-- Ongoing personal responsibility -> `Areas/<area>/` in the personal root
+- Ongoing responsibility -> `Areas/<area>/` in the primary root when its privacy policy permits the write
 - Tool behavior -> `Tools/`
 - Cross-cutting decision -> `Decisions/`; otherwise keep the decision with its primary scope
 - Repeatable procedure -> `custom-skills-master`
@@ -98,8 +100,8 @@ Create repository, ticket, and project folders only when there is a durable reco
 For recall requests:
 
 1. Determine work or personal scope and the likely repository, ticket, project, area, person, tool, or decision.
-2. Call `memory_recall` first with work/personal, repository, ticket/project, status, or path scope when known.
-3. Inspect the returned Markdown source path, corpus, status, freshness, and provenance.
+2. Call `memory_recall` first with source, domain, repository, ticket, project, status, or path scope when known.
+3. Inspect the returned source ID, Markdown path, status, freshness, and provenance.
 4. Prefer an active canonical memory note over legacy session or vault results.
 5. Search canonical Markdown directly when the facade is unavailable, stale, ambiguous, or missing expected results.
 6. State when an answer came only from legacy, stale, or unverified memory.
@@ -129,8 +131,8 @@ Treat sessions and handoffs as optional scoped context, not the default destinat
 
 - Search configured legacy session roots before creating a new session record.
 - Do not move or rewrite legacy sessions until their work/personal boundaries and conflict artifacts have been audited.
-- Store a new work session or handoff under the relevant repository, ticket, or project in `AI_MEMORY_WORK_DIR`.
-- Store a new personal session or handoff only in `AI_MEMORY_PERSONAL_DIR`.
+- Store each new session or handoff under its relevant scope in `AI_MEMORY_WORK_DIR`.
+- Use `root_scope` metadata to distinguish work and personal records.
 - Keep handoffs concise: task, current state, important artifacts, decisions, blockers, and next action.
 - Preserve `session_id:entry_id` when promoting a session entry into durable memory.
 
@@ -153,18 +155,19 @@ Do not duplicate skill-authoring instructions inside ordinary memory notes.
 After one or more material memory writes:
 
 1. Call `memory_sync` after an ordinary Markdown batch.
-2. Run the Graphify maintenance script only when the Graphify graph must be rebuilt.
-3. Do not run the global or all-corpora extractor for routine memory writes.
-4. Verify the configured Graphify endpoint or query path after the refresh finishes.
-5. Confirm that the canonical corpus is registered and the changed note can be retrieved when practical.
-6. If the note write succeeded but refresh or retrieval failed, report `saved, not indexed` and keep the canonical Markdown unchanged.
+2. Confirm that synchronization reads all configured sources without writing to them.
+3. Run the Graphify maintenance script only when the Graphify graph must be rebuilt.
+4. Do not run the global or all-corpora extractor for routine memory writes.
+5. Verify the configured Graphify endpoint or query path after the refresh finishes.
+6. Confirm that each configured memory source is registered.
+7. If refresh fails, report `saved, not indexed` and keep all Markdown unchanged.
 
 Pure retrievals, no-op deduplication, and non-material timestamp-only changes do not require refresh.
 
 ## Guardrails
 
-- Do not write personal information to a work or corporate-synced root.
 - Do not silently create a second memory root.
+- Do not write to a retrieval-only source.
 - Do not automatically migrate legacy notes, sessions, or skills.
 - Do not write into a vault that has unresolved conflict artifacts without an explicitly approved recovery plan.
 - Do not use bare `[[_repo]]`, `[[_ticket]]`, or `[[_project]]` links.
@@ -181,7 +184,8 @@ Before considering a memory operation complete, check the relevant cases:
 - **Explicit capture:** A direct save request follows the same classification and deduplication path.
 - **Identity:** Repository forks, worktrees, same-basename repositories, and local-only repositories do not collide.
 - **Idempotence:** Repeating the same source and routing does not duplicate memory.
-- **Domain safety:** Missing personal configuration never falls back to work storage.
+- **Write authority:** All new records go to the primary writable vault.
+- **Source safety:** Synchronization does not modify retrieval-only vaults.
 - **Conflict:** Contradictory facts remain linked and reviewable until resolved.
 - **Skill boundary:** Repeatable procedures route to `custom-skills-master`.
 - **Indexing:** Refresh failure is reported as `saved, not indexed`.

@@ -1,4 +1,4 @@
-"""Install the repository-owned MCP server and skill into supported clients."""
+"""Install the repository-owned MCP server and skills into supported clients."""
 
 from __future__ import annotations
 
@@ -23,14 +23,10 @@ SUPPORTED_CLIENTS = (
     "agent-skills",
 )
 
-SKILL_DESCRIPTION = (
-    "Use when meaningful work produces durable knowledge that future agents "
-    "should retain, when the user asks to remember or recall something, or "
-    "when Graphify-backed Markdown memory needs retrieval, organization, "
-    "consolidation, conflict handling, session or handoff capture, or refresh. "
-    "Invoke automatically during substantive work and before completion; do "
-    "not wait for the user to ask."
-)
+SKILLS = {
+    "ai-memory": Path("skill") / "ai-memory" / "SKILL.md",
+    "graphify": Path("graphify-codebase") / "skill" / "graphify" / "SKILL.md",
+}
 
 
 def _timestamp() -> str:
@@ -188,25 +184,64 @@ def _stdio_parts(repository_root: Path) -> tuple[str, list[str]]:
     return str(python), args
 
 
-def _skill_stub(repository_root: Path) -> str:
-    source = (
-        repository_root / "skill" / "ai-memory" / "SKILL.md"
-    ).as_posix()
+def _skill_stub(repository_root: Path, skill_name: str) -> str:
+    relative = SKILLS[skill_name]
+    canonical_text = (repository_root / relative).read_text(encoding="utf-8")
+    match = re.match(r"^---\s*\n(.*?)\n---\s*\n", canonical_text, re.DOTALL)
+    if match is None:
+        raise ValueError(f"Canonical skill has no valid YAML header: {relative}")
+    metadata = dict(
+        line.split(":", 1)
+        for line in match.group(1).splitlines()
+        if ":" in line
+    )
+    canonical_name = metadata.get("name", "").strip()
+    description = metadata.get("description", "").strip()
+    if canonical_name != skill_name or not description:
+        raise ValueError(f"Canonical skill metadata is invalid: {relative}")
+    source = (repository_root / relative).as_posix()
     return (
         "---\n"
-        "name: ai-memory\n"
-        f"description: {SKILL_DESCRIPTION}\n"
+        f"name: {skill_name}\n"
+        f"description: {description}\n"
         "---\n\n"
-        "Before following this stub, read the canonical `SKILL.md` in full from "
-        f"`{source}`.\n"
+        "Before following this stub, read the canonical `SKILL.md` in full "
+        f"from `{source}`.\n"
     )
 
 
-def _install_skill(repository_root: Path, destination: Path) -> Path | None:
-    source = repository_root / "skill" / "ai-memory" / "SKILL.md"
+def _install_skill(
+    repository_root: Path,
+    destination_root: Path,
+    skill_name: str,
+) -> Path | None:
+    relative = SKILLS[skill_name]
+    source = repository_root / relative
     if not source.is_file():
-        raise FileNotFoundError(f"Canonical AI Memory skill is missing: {source}")
-    return _write_text(destination, _skill_stub(repository_root))
+        raise FileNotFoundError(f"Canonical skill is missing: {source}")
+    destination = destination_root / skill_name / "SKILL.md"
+    return _write_text(
+        destination,
+        _skill_stub(repository_root, skill_name),
+    )
+
+
+def _install_skills(
+    repository_root: Path,
+    destination_root: Path,
+) -> list[Path]:
+    return [
+        changed
+        for skill_name in SKILLS
+        if (
+            changed := _install_skill(
+                repository_root,
+                destination_root,
+                skill_name,
+            )
+        )
+        is not None
+    ]
 
 
 def _opencode_major() -> int | None:
@@ -267,9 +302,9 @@ def install_client(
     changed: list[Path] = []
 
     if client == "agent-skills":
-        skill = home / ".agents" / "skills" / "ai-memory" / "SKILL.md"
-        if _install_skill(repository_root, skill) is not None:
-            changed.append(skill)
+        changed.extend(
+            _install_skills(repository_root, home / ".agents" / "skills")
+        )
         return changed
 
     path = paths[client]
@@ -314,18 +349,16 @@ def install_client(
             _write_json(settings_path, settings)
             changed.append(settings_path)
 
-    skill_paths = {
-        "claude-code": home / ".claude" / "skills" / "ai-memory" / "SKILL.md",
-        "copilot": home / ".copilot" / "skills" / "ai-memory" / "SKILL.md",
-        "opencode": (
-            home / ".config" / "opencode" / "skills" / "ai-memory" / "SKILL.md"
-        ),
+    skill_roots = {
+        "claude-code": home / ".claude" / "skills",
+        "copilot": home / ".copilot" / "skills",
+        "opencode": home / ".config" / "opencode" / "skills",
         # VS Code discovers personal skills from the Copilot and Agents locations.
-        "vscode": home / ".copilot" / "skills" / "ai-memory" / "SKILL.md",
+        "vscode": home / ".copilot" / "skills",
     }
-    skill = skill_paths.get(client)
-    if skill and _install_skill(repository_root, skill) is not None:
-        changed.append(skill)
+    skill_root = skill_roots.get(client)
+    if skill_root:
+        changed.extend(_install_skills(repository_root, skill_root))
     return changed
 
 

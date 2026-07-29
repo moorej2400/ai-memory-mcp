@@ -1,5 +1,7 @@
 param(
   [string]$OutRoot = '',
+  [string]$MemoryRoot = '',
+  [string]$SourceId = '',
   [switch]$SkipGlobal
 )
 
@@ -17,15 +19,19 @@ if (!(Test-Path -LiteralPath $graphifyExecutable)) {
   throw "Pinned Graphify executable was not found at $graphifyExecutable. Run scripts\setup.ps1."
 }
 
-$MemoryRootCandidate = $env:AI_MEMORY_WORK_DIR
-if ([string]::IsNullOrWhiteSpace($MemoryRootCandidate)) {
-  $MemoryRootCandidate = $env:AI_MEMORY_DIR
+$sources = @(Get-AiMemorySources)
+if ([string]::IsNullOrWhiteSpace($SourceId)) {
+  $source = $sources | Where-Object Writable | Select-Object -First 1
+  $SourceId = $source.SourceId
 }
-if ([string]::IsNullOrWhiteSpace($MemoryRootCandidate)) {
-  throw 'AI_MEMORY_WORK_DIR and legacy AI_MEMORY_DIR are both unset.'
+if ([string]::IsNullOrWhiteSpace($MemoryRoot)) {
+  $source = $sources | Where-Object SourceId -EQ $SourceId | Select-Object -First 1
+  if ($null -eq $source) {
+    throw "Unknown memory source ID: $SourceId"
+  }
+  $MemoryRoot = $source.Root
 }
-
-$MemoryRoot = (Resolve-Path -LiteralPath $MemoryRootCandidate).Path
+$MemoryRoot = (Resolve-Path -LiteralPath $MemoryRoot).Path
 $requiredExtractionSettings = @(
   'GRAPHIFY_OPENAI_BASE_URL',
   'GRAPHIFY_OPENAI_API_KEY',
@@ -62,7 +68,7 @@ $tokenBudget = Resolve-PositiveInteger $env:GRAPHIFY_OPENAI_TOKEN_BUDGET 16000 '
 $maxConcurrency = Resolve-PositiveInteger $env:GRAPHIFY_OPENAI_MAX_CONCURRENCY 2 'GRAPHIFY_OPENAI_MAX_CONCURRENCY'
 $apiTimeoutSeconds = Resolve-PositiveInteger $env:GRAPHIFY_OPENAI_API_TIMEOUT 300 'GRAPHIFY_OPENAI_API_TIMEOUT'
 
-$tag = 'ai-memory'
+$tag = "ai-memory-$SourceId"
 if ([string]::IsNullOrWhiteSpace($OutRoot)) {
   $OutRoot = Join-Path $CorporaRoot $tag
 }
@@ -85,7 +91,9 @@ $graphifyArgs = @(
   '--exclude', '*.html',
   '--exclude', '*.json',
   '--exclude', '.obsidian/**',
-  # Restricted originals are retained for recovery but must never enter the shared graph.
+  # Match the MCP index exclusions for every configured source.
+  '--exclude', '**/Restricted/**',
+  '--exclude', '**/.trash/**',
   '--exclude', 'References/Restricted/**',
   '--exclude', '*.zip'
 )
