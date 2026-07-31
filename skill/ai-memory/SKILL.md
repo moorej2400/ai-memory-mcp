@@ -1,6 +1,6 @@
 ---
 name: ai-memory
-description: Use when meaningful work produces durable knowledge that future agents should retain, when the user asks to remember or recall something, or when Graphify-backed Markdown memory needs retrieval, organization, consolidation, conflict handling, session or handoff capture, or refresh. Invoke automatically during substantive work and before completion; do not wait for the user to ask.
+description: Use proactively when prior knowledge could improve the current work, and when new knowledge could help future sessions. Search memory and save useful memories automatically without waiting for the user. Also use for explicit memory requests, reconciliation, organization, conflict handling, and refresh.
 ---
 
 # AI Memory
@@ -11,10 +11,12 @@ Read [architecture.md](../../docs/architecture.md) when changing the retrieval s
 
 ## Core Contract
 
-- Evaluate memory automatically when meaningful reusable knowledge appears and again before completing substantive work.
+- Automatically save memories that will be useful in future sessions.
+- Treat automatic capture as an action, not a recommendation or optional follow-up.
+- Do not require a user request, reminder, or per-write confirmation for a safe automatic write.
+- Treat an explicit save request as a fallback or additional trigger, not a prerequisite.
 - Also run the same workflow immediately when the user explicitly asks to remember, save, retrieve, consolidate, correct, or forget through supersession.
-- Save durable facts, decisions, constraints, corrections, relationships, and verified workarounds without requiring per-write confirmation when the appropriate root is configured and safe.
-- Keep transient progress, raw transcripts, command logs, obvious code facts, and easily rediscovered details out of durable memory.
+- Use judgment to determine future value. Do not limit memory capture to predefined categories or examples.
 - Search before creating. Prefer updating, merging, or superseding a precise existing note over creating a parallel note.
 - Never permanently delete memory or skill content. Preserve prior truth through `superseded`, `archived`, or recoverable trash only when the user explicitly requests removal.
 - Keep memory writes and Graphify indexing as separate verified outcomes.
@@ -39,6 +41,18 @@ Write new memories only under `AI_MEMORY_WORK_DIR`. Never write to an additional
 
 Before writing, verify that the selected root exists or that creating the narrow required folder is within the user's authorized scope. Do not create an empty taxonomy.
 
+## Proactive Recall
+
+Use memory as a normal source of context, not only after an explicit memory request.
+
+- Before substantive work, determine whether prior knowledge could improve the result.
+- When prior knowledge could help, search memory early with the narrowest useful scope.
+- Use relevant memory to guide discovery, decisions, and task execution.
+- Verify retrieved information when it could have changed.
+- If memory is incomplete, continue through the best available sources.
+- Automatically save or reconcile useful knowledge produced by the work.
+- Do not require the user to initiate memory retrieval or capture.
+
 ## Automatic Capture Workflow
 
 Run this workflow at meaningful checkpoints and before the final response of substantive work:
@@ -56,28 +70,24 @@ Run this workflow at meaningful checkpoints and before the final response of sub
 
 An explicit user request to save memory enters at step 1; it does not bypass search, scope, safety, deduplication, or verification.
 
+Do not finish substantive work with an unsaved qualifying candidate when the configured write target is safe.
+
 ## Decide What Is Durable
 
-Promote information when it is likely to save future agents meaningful rediscovery or prevent repeated mistakes:
+Save information when it will be useful to know in future sessions. Use judgment from the task context and available evidence.
 
-- stable repository architecture, identity, or conventions
-- durable ticket or project decisions and rationale
-- user corrections and stable operating boundaries
-- non-obvious tool or environment behavior
-- verified failure modes and workarounds
-- cross-repository, system, person, or document relationships
-- external context that is not derivable from the current codebase
+Do not restrict this decision to a fixed list of information types. Create no memory only to prove that automatic capture ran.
 
-Skip or keep session-only:
+## Refresh Existing Facts
 
-- ordinary task progress and temporary plans
-- commit hashes, PR numbers, or ticket numbers without durable context
-- raw command output or transcript excerpts
-- speculative conclusions not supported by evidence
-- details obvious from the currently inspected source
-- duplicate facts already represented precisely
+Use the primary scope, entity, and property as the claim identity.
 
-Create no memory merely to prove that automatic capture ran.
+- If a verified value is unchanged, update only material freshness or provenance data.
+- If an authoritative source confirms a changed value, update the matching canonical memory.
+- Do not create a parallel active note for the same claim.
+- Preserve the prior value in provenance or concise change history when it remains useful.
+- If the prior value has a separate record, mark that record `superseded` and link both records.
+- If authoritative sources conflict, preserve both claims and mark them `needs-review`.
 
 ## Route Storage
 
@@ -116,7 +126,7 @@ Do not treat a Graphify node as authority for a write target until the canonical
 - Reprocessing the same `promotion_id` must update or no-op; it must not create a duplicate claim.
 - Keep filename, frontmatter `title`, and H1 aligned for ordinary notes.
 - Keep `_repo.md`, `_ticket.md`, and `_project.md` as structural anchor exceptions.
-- Use `review_after` for paths, URLs, tool availability, provider behavior, policies, and other facts likely to drift.
+- Use `review_after` for information that is likely to change.
 
 When new verified information conflicts with active memory:
 
@@ -180,6 +190,7 @@ Pure retrievals, no-op deduplication, and non-material timestamp-only changes do
 Before considering a memory operation complete, check the relevant cases:
 
 - **Automatic capture:** A substantive task with durable learning creates or updates memory without a prompt.
+- **Fact refresh:** A verified fact change updates the matching memory and preserves the prior value.
 - **Noise boundary:** A task with no durable learning creates nothing.
 - **Explicit capture:** A direct save request follows the same classification and deduplication path.
 - **Identity:** Repository forks, worktrees, same-basename repositories, and local-only repositories do not collide.
