@@ -53,10 +53,18 @@ Build a graph for a repository:
 .\graphify-codebase\scripts\invoke-graphify-codebase.ps1 -Mode Build -Path 'C:\path\to\repository'
 ```
 
+```bash
+./graphify-codebase/scripts/invoke-graphify-codebase.sh --mode build --path /path/to/repository
+```
+
 Query an existing repository graph:
 
 ```powershell
 .\graphify-codebase\scripts\invoke-graphify-codebase.ps1 -Mode Query -Path 'C:\path\to\repository' -Question 'How does authentication work?'
+```
+
+```bash
+./graphify-codebase/scripts/invoke-graphify-codebase.sh --mode query --path /path/to/repository --question 'How does authentication work?'
 ```
 
 The wrapper never changes the indexed repository source files.

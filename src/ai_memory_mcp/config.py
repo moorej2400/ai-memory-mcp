@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from .platform_paths import path_key
+
 
 def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -169,7 +171,9 @@ class Settings:
         seen_ids: set[str] = set()
         seen_roots: set[str] = set()
         for source in sources:
-            resolved = str(source.root.resolve()).casefold()
+            # Case folding is correct on Windows and macOS but would wrongly
+            # merge two distinct directories on case-sensitive filesystems.
+            resolved = path_key(source.root)
             if source.source_id in seen_ids:
                 raise ValueError(
                     f"Duplicate memory source ID: {source.source_id}"

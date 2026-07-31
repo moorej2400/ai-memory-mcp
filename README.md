@@ -157,19 +157,34 @@ A failed rebuild does not change the Markdown authority.
 
 ## Quick start
 
+AI Memory MCP runs on Windows, macOS, and Linux.
+
 Install these items:
 
 - Git
 - Python 3.11 or later
-- PowerShell 5.1 or later
 - A Markdown memory directory
 
-Open PowerShell in the repository root.
-Then, run this command:
+Windows additionally requires PowerShell 5.1 or later if you use the `.ps1`
+entry points.
+
+Open a terminal in the repository root.
+Then, run the command for your platform.
+
+Windows (PowerShell):
 
 ```powershell
 .\scripts\setup.ps1 -MemoryRoot 'C:\path\to\AI-Memory' -InstallClients
 ```
+
+macOS and Linux:
+
+```bash
+./scripts/setup.sh --memory-root ~/AI-Memory --install-clients
+```
+
+Every maintenance script has a `.ps1` wrapper, a `.sh` wrapper, and one shared
+Python implementation, so either shell produces the same result.
 
 Restart each configured client after the setup procedure is complete.
 
@@ -228,7 +243,8 @@ description: <copy the exact canonical description>
 Before following this stub, read the canonical `SKILL.md` in full from `<canonical-path>`.
 ```
 
-Run `.\scripts\install-clients.ps1` after a clone or repository move.
+Run `.\scripts\install-clients.ps1` (or `./scripts/install-clients.sh`) after a
+clone or repository move.
 The installer writes the correct canonical path into each stub.
 
 Read the [Graphify Codebase guide](graphify-codebase/README.md) for its independent boundary.

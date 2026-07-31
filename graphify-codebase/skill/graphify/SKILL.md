@@ -40,6 +40,10 @@ Use the repository wrapper when it is available:
 .\graphify-codebase\scripts\invoke-graphify-codebase.ps1 -Mode Build -Path 'C:\path\to\repository'
 ```
 
+```bash
+./graphify-codebase/scripts/invoke-graphify-codebase.sh --mode build --path /path/to/repository
+```
+
 Otherwise, run:
 
 ```text
@@ -57,12 +61,20 @@ Use this command for changed repository files:
 .\graphify-codebase\scripts\invoke-graphify-codebase.ps1 -Mode Update -Path 'C:\path\to\repository'
 ```
 
+```bash
+./graphify-codebase/scripts/invoke-graphify-codebase.sh --mode update --path /path/to/repository
+```
+
 ## Query
 
 Use this command for an existing graph:
 
 ```powershell
 .\graphify-codebase\scripts\invoke-graphify-codebase.ps1 -Mode Query -Path 'C:\path\to\repository' -Question '<question>'
+```
+
+```bash
+./graphify-codebase/scripts/invoke-graphify-codebase.sh --mode query --path /path/to/repository --question '<question>'
 ```
 
 Answer from graph evidence and the applicable source files.

@@ -267,8 +267,8 @@ def test_graphify_extraction_excludes_restricted_directories(
     project_root: Path,
 ) -> None:
     script = (
-        project_root / "scripts" / "graphify" / "extract-ai-memory.ps1"
+        project_root / "scripts" / "graphify" / "extract_ai_memory.py"
     ).read_text(encoding="utf-8")
 
-    assert "'**/Restricted/**'" in script
-    assert "'**/.trash/**'" in script
+    assert '"**/Restricted/**"' in script
+    assert '"**/.trash/**"' in script

@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 import sqlite3
 import time
-from collections import defaultdict
 from dataclasses import asdict
 from typing import Any
 

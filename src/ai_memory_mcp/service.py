@@ -27,6 +27,12 @@ from .models import (
     SyncIndexResult,
     SyncResponse,
 )
+from .platform_paths import (
+    venv_bin_dir,
+    venv_executable,
+    venv_python,
+    venv_site_packages,
+)
 from .retrieval import RetrievalEngine
 from .text import tokenize
 
@@ -425,21 +431,22 @@ class MemoryService:
 
     def _graphify_runtime(self) -> GraphifyRuntimeStatus:
         project_root = Path(__file__).resolve().parents[2]
-        scripts = project_root / ".graphify-runtime" / "Scripts"
-        python = scripts / "python.exe"
-        executable = scripts / "graphify.exe"
-        mcp_executable = scripts / "graphify-mcp.exe"
+        runtime_root = project_root / ".graphify-runtime"
+        scripts = venv_bin_dir(runtime_root)
+        python = venv_python(runtime_root)
+        executable = venv_executable(runtime_root, "graphify")
+        mcp_executable = venv_executable(runtime_root, "graphify-mcp")
         expected = "0.9.26"
         package_version: str | None = None
         cli_version: str | None = None
         errors: list[str] = []
         if python.exists():
-            site_packages = scripts.parent / "Lib" / "site-packages"
+            site_packages = venv_site_packages(runtime_root)
             package_version = next(
                 (
                     distribution.version
                     for distribution in importlib.metadata.distributions(
-                        path=[str(site_packages)]
+                        path=[str(path) for path in site_packages]
                     )
                     if distribution.metadata.get("Name", "").casefold()
                     == "graphifyy"

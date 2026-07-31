@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -12,6 +11,8 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from .platform_paths import user_app_data_dir, venv_python
 
 
 SUPPORTED_CLIENTS = (
@@ -175,10 +176,10 @@ def _set_nested(
 
 
 def _stdio_parts(repository_root: Path) -> tuple[str, list[str]]:
-    python = repository_root / ".venv" / "Scripts" / "python.exe"
+    python = venv_python(repository_root / ".venv")
     if not python.is_file():
         raise FileNotFoundError(
-            f"Application environment is missing: {python}. Run scripts/setup.ps1."
+            f"Application environment is missing: {python}. Run scripts/setup.py."
         )
     args = ["-m", "ai_memory_mcp.server", "--transport", "stdio"]
     return str(python), args
@@ -299,6 +300,13 @@ def _opencode_container(
 
 
 def _client_paths(home: Path, appdata: Path) -> dict[str, Path]:
+    """Map each client to its configuration file.
+
+    ``appdata`` is the host's per-user application data root (see
+    ``platform_paths.user_app_data_dir``). Claude Desktop and VS Code keep the
+    same relative layout beneath it on Windows, macOS, and Linux, so passing the
+    correct root is all that platform support requires here.
+    """
     opencode_root = home / ".config" / "opencode"
     opencode_config = opencode_root / "opencode.jsonc"
     if not opencode_config.exists():
@@ -399,7 +407,9 @@ def main() -> None:
 
     repository_root = args.repository_root.resolve()
     home = Path.home()
-    appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
+    # Claude Desktop and VS Code use the same relative layout under each
+    # platform's per-user application data root, so only the root varies.
+    appdata = user_app_data_dir()
     clients = args.clients or list(SUPPORTED_CLIENTS)
     opencode_major = _opencode_major() if "opencode" in clients else None
 

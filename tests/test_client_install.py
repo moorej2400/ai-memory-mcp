@@ -10,12 +10,12 @@ from ai_memory_mcp.client_install import (
     _strip_jsonc,
     install_client,
 )
+from ai_memory_mcp.platform_paths import WINDOWS, venv_bin_dir, venv_python
 
 
 @pytest.fixture
 def portable_repository(tmp_path: Path) -> Path:
     repository = tmp_path / "ai-memory-mcp"
-    python = repository / ".venv" / "Scripts" / "python.exe"
     skill = repository / "skill" / "ai-memory" / "SKILL.md"
     graphify_skill = (
         repository
@@ -24,8 +24,13 @@ def portable_repository(tmp_path: Path) -> Path:
         / "graphify"
         / "SKILL.md"
     )
-    python.parent.mkdir(parents=True)
-    python.write_text("", encoding="utf-8")
+    # Mirror the environment layout of the host platform, including the
+    # unsuffixed POSIX alias a real venv creates, so the fixture exercises the
+    # same interpreter path the installer resolves.
+    bin_dir = venv_bin_dir(repository / ".venv")
+    bin_dir.mkdir(parents=True)
+    for name in ("python.exe",) if WINDOWS else ("python", "python3"):
+        (bin_dir / name).write_text("", encoding="utf-8")
     (repository / "requirements-graphify.txt").write_text(
         "graphifyy[openai,mcp]==0.9.26\n",
         encoding="utf-8",
@@ -77,6 +82,11 @@ def test_installs_json_client_and_preserves_existing_servers(
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data[container]["existing"]["command"] == "existing"
     assert data[container]["ai-memory"]["args"][-2:] == ["--transport", "stdio"]
+    # The registered interpreter must be the host platform's venv layout, not a
+    # hard-coded Windows path.
+    assert data[container]["ai-memory"]["command"] == str(
+        venv_python(portable_repository / ".venv")
+    )
     assert path in changed
     assert list(path.parent.glob(f"{path.name}.backup-*-ai-memory"))
     if client == "vscode":

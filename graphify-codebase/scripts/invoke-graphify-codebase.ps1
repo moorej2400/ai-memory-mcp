@@ -1,3 +1,11 @@
+<#
+  .SYNOPSIS
+    Windows entry point for driving Graphify against a code repository.
+
+  .DESCRIPTION
+    Delegates to invoke_graphify_codebase.py, the shared cross-platform
+    implementation.
+#>
 param(
   [ValidateSet('Build', 'Update', 'Query', 'Path', 'Explain')]
   [string]$Mode = 'Build',
@@ -8,49 +16,33 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$graphify = Get-Command graphify -ErrorAction SilentlyContinue
-if ($null -eq $graphify) {
-  throw 'Graphify is not installed or is not available on PATH.'
-}
+$repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..' )).Path
+$repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $repositoryRoot '..')).Path
 
-$repository = (Resolve-Path -LiteralPath $Path).Path
-$insideWorkTree = & git -C $repository rev-parse --is-inside-work-tree 2>$null
-if ($LASTEXITCODE -ne 0 -or $insideWorkTree -ne 'true') {
-  throw "The target is not a Git repository: $repository"
+$candidates = @(
+  (Join-Path $repositoryRoot '.venv/Scripts/python.exe'),
+  (Join-Path $repositoryRoot '.venv/bin/python')
+)
+$python = $null
+foreach ($candidate in $candidates) {
+  if (Test-Path -LiteralPath $candidate) { $python = $candidate; break }
 }
-
-Push-Location $repository
-try {
-  switch ($Mode) {
-    'Build' {
-      & $graphify.Source extract $repository
-    }
-    'Update' {
-      & $graphify.Source update $repository
-    }
-    'Query' {
-      if ([string]::IsNullOrWhiteSpace($Question)) {
-        throw 'Question is required for Query mode.'
-      }
-      & $graphify.Source query $Question
-    }
-    'Path' {
-      if ([string]::IsNullOrWhiteSpace($Question) -or [string]::IsNullOrWhiteSpace($Target)) {
-        throw 'Question and Target are required for Path mode.'
-      }
-      & $graphify.Source path $Question $Target
-    }
-    'Explain' {
-      if ([string]::IsNullOrWhiteSpace($Question)) {
-        throw 'Question is required for Explain mode.'
-      }
-      & $graphify.Source explain $Question
-    }
-  }
-  if ($LASTEXITCODE -ne 0) {
-    throw "Graphify failed in $Mode mode."
+if ($null -eq $python) {
+  foreach ($name in @('py', 'python3', 'python')) {
+    if (Get-Command $name -ErrorAction SilentlyContinue) { $python = $name; break }
   }
 }
-finally {
-  Pop-Location
+if ($null -eq $python) {
+  throw 'Python 3.11 or newer was not found on PATH.'
 }
+
+$arguments = @(
+  (Join-Path $PSScriptRoot 'invoke_graphify_codebase.py'),
+  '--mode', $Mode.ToLowerInvariant(),
+  '--path', $Path
+)
+if (![string]::IsNullOrWhiteSpace($Question)) { $arguments += @('--question', $Question) }
+if (![string]::IsNullOrWhiteSpace($Target)) { $arguments += @('--target', $Target) }
+
+& $python @arguments
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

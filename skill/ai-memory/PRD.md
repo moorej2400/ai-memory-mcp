@@ -335,9 +335,11 @@ The unified skill must use both identity and source provenance:
 
 Routine AI-Memory writes must use the configured narrow AI-Memory refresh path, currently expected to be equivalent to:
 
-```powershell
-scripts/graphify/refresh-ai-memory-graph.ps1
+```text
+scripts/graphify/refresh_graph.py
 ```
+
+The `.ps1` and `.sh` wrappers of that script are equivalent entry points.
 
 The unified skill must explicitly prohibit routine use of the global/all-corpora extractor. That extractor may only be used through a separate, explicit maintenance workflow.
 

@@ -16,6 +16,8 @@ Copy `.env.example` when you create the configuration manually.
 | `AI_MEMORY_MCP_STATE_DIR` | Sets the derived AI Memory index directory. |
 | `AI_MEMORY_GRAPH_PATH` | Sets the AI Memory Graphify graph file. |
 | `AI_MEMORY_GRAPHIFY_STATE_DIR` | Sets the Graphify state directory. |
+| `AI_MEMORY_GRAPHIFY_PYTHON` | Overrides the pinned Graphify interpreter. |
+| `AI_MEMORY_GRAPHIFY_MCP_EXE` | Overrides the pinned Graphify MCP executable. |
 
 Use a JSON object for `AI_MEMORY_RETRIEVAL_SOURCES`:
 
@@ -26,6 +28,11 @@ AI_MEMORY_RETRIEVAL_SOURCES='{"archive":"C:/memory/archive","reference":"D:/memo
 Source IDs must start with a letter.
 Use only lowercase letters, numbers, and hyphens.
 
+The two Graphify override variables are normally unset. The setup script
+provisions `.graphify-runtime` using the layout of the host platform, and the
+project resolves the interpreter and executables from it automatically. Set
+them only to point at a Graphify installed somewhere else.
+
 The server writes no Markdown files.
 The AI Memory skill writes new records only under `AI_MEMORY_WORK_DIR`.
 The indexer reads all configured sources without changing them.
@@ -34,8 +41,8 @@ The indexer reads all configured sources without changing them.
 
 | Variable | Function |
 |---|---|
-| `GRAPHIFY_MEMORY_REFRESH_SCRIPT` | Sets a custom full-refresh script. |
-| `GRAPHIFY_MEMORY_EXTRACT_SCRIPT` | Sets a custom extraction script. |
+| `GRAPHIFY_MEMORY_REFRESH_SCRIPT` | Names the full-refresh script an agent should run. |
+| `GRAPHIFY_MEMORY_EXTRACT_SCRIPT` | Names the extraction script an agent should run. |
 | `GRAPHIFY_GLOBAL_MCP_URL` | Sets the Graphify MCP endpoint. |
 | `GRAPHIFY_OPENAI_BASE_URL` | Sets an optional compatible API endpoint. |
 | `GRAPHIFY_OPENAI_API_KEY` | Sets the optional extraction credential. |
@@ -48,6 +55,12 @@ The indexer reads all configured sources without changing them.
 
 The normal index refresh does not need an extraction API.
 A full Graphify refresh can need the optional API values.
+
+These two script variables are read by the agent that follows the AI Memory
+skill, not by the server. Point them at an entry point the host platform can
+run: the `.ps1` wrapper on Windows, the `.sh` wrapper on macOS and Linux, or
+the `.py` implementation on any platform. Leave them unset to use the
+repository-owned scripts.
 
 ## MCP server
 
