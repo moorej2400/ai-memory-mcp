@@ -6,7 +6,8 @@
     Delegates to refresh_graph.py, the shared cross-platform implementation.
 #>
 param(
-  [string]$SeedCorpusOut = ''
+  [string]$SeedCorpusOut = '',
+  [switch]$SemanticExtraction
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,6 +16,9 @@ $ErrorActionPreference = 'Stop'
 $arguments = @()
 if (![string]::IsNullOrWhiteSpace($SeedCorpusOut)) {
   $arguments += @('--seed-corpus-out', $SeedCorpusOut)
+}
+if ($SemanticExtraction) {
+  $arguments += '--semantic-extraction'
 }
 
 Invoke-AiMemoryPythonScript -Script (Join-Path $PSScriptRoot 'refresh_graph.py') -Arguments $arguments

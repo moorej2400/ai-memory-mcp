@@ -149,23 +149,29 @@ class RetrievalEngine:
             return []
         where, parameters = scope_sql(scope)
         scope_clause = where.replace("WHERE", "AND", 1) if where else ""
-        results: list[SearchHit] = []
+        placeholders = ", ".join("?" for _ in ranked_paths)
         with self.index.connection() as connection:
-            for graph_rank, path in enumerate(ranked_paths, 1):
-                row = connection.execute(
-                    f"""
-                    SELECT c.* FROM chunks c
-                    JOIN documents d USING(memory_id)
-                    WHERE lower(c.path) = lower(?)
-                    {scope_clause}
-                    ORDER BY c.ordinal LIMIT 1
-                    """,
-                    [path, *parameters],
-                ).fetchone()
-                if row:
-                    results.append(
-                        _row_hit(row, 1.0 / graph_rank, "graph", graph_rank)
-                    )
+            rows = connection.execute(
+                f"""
+                SELECT c.* FROM documents d
+                JOIN chunks c USING(memory_id)
+                WHERE d.path IN ({placeholders})
+                AND c.ordinal = 0
+                {scope_clause}
+                """,
+                [*ranked_paths, *parameters],
+            ).fetchall()
+        rows_by_path = {
+            str(row["path"]).casefold(): row
+            for row in rows
+        }
+        results: list[SearchHit] = []
+        for graph_rank, path in enumerate(ranked_paths, 1):
+            row = rows_by_path.get(path.casefold())
+            if row:
+                results.append(
+                    _row_hit(row, 1.0 / graph_rank, "graph", graph_rank)
+                )
         return results
 
     def _fuse(
@@ -300,17 +306,43 @@ class RetrievalEngine:
         requested_limit = max(1, min(limit or self.settings.result_limit, 25))
         planned_scope = self._plan(query, scope)
         candidate_limit = max(requested_limit * 8, 40)
+        provider_latency_ms: dict[str, float] = {}
+        provider_started = time.perf_counter()
         lexical = self._lexical(query, planned_scope, candidate_limit)
+        provider_latency_ms["lexical"] = round(
+            (time.perf_counter() - provider_started) * 1000,
+            3,
+        )
+        provider_started = time.perf_counter()
         semantic = self._semantic(query, planned_scope, candidate_limit)
+        provider_latency_ms["semantic"] = round(
+            (time.perf_counter() - provider_started) * 1000,
+            3,
+        )
+        provider_started = time.perf_counter()
         graph = self._graph(
             query, planned_scope, lexical[:20] + semantic[:20], candidate_limit
         )
+        provider_latency_ms["graphify"] = round(
+            (time.perf_counter() - provider_started) * 1000,
+            3,
+        )
+        provider_started = time.perf_counter()
         hits = self._fuse(
             query,
             {"lexical": lexical, "semantic": semantic, "graph": graph},
             requested_limit,
         )
+        provider_latency_ms["fusion"] = round(
+            (time.perf_counter() - provider_started) * 1000,
+            3,
+        )
+        provider_started = time.perf_counter()
         self._expand_context(hits)
+        provider_latency_ms["context"] = round(
+            (time.perf_counter() - provider_started) * 1000,
+            3,
+        )
         # RRF-only weak matches cluster near 0.016. Require corroboration or a
         # strong exact-match bonus before claiming the corpus answered.
         top_score = hits[0].score if hits else 0.0
@@ -356,6 +388,7 @@ class RetrievalEngine:
                     "semantic": len(semantic),
                     "graph": len(graph),
                 },
+                "provider_latency_ms": provider_latency_ms,
                 "latency_ms": round((time.perf_counter() - started) * 1000, 3),
                 "index_snapshot": self.index.path.name,
                 "graphify": self.graph.health(),

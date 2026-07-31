@@ -18,6 +18,7 @@ Copy `.env.example` when you create the configuration manually.
 | `AI_MEMORY_GRAPHIFY_STATE_DIR` | Sets the Graphify state directory. |
 | `AI_MEMORY_GRAPHIFY_PYTHON` | Overrides the pinned Graphify interpreter. |
 | `AI_MEMORY_GRAPHIFY_MCP_EXE` | Overrides the pinned Graphify MCP executable. |
+| `AI_MEMORY_LOG_DIR` | Sets the local index and retrieval log directory. |
 
 Use a JSON object for `AI_MEMORY_RETRIEVAL_SOURCES`:
 
@@ -72,9 +73,16 @@ repository-owned scripts.
 | `AI_MEMORY_MCP_SEMANTIC_DIMENSIONS` | `1024` | Sets the semantic vector size. |
 | `AI_MEMORY_MCP_RRF_K` | `60` | Sets the RRF constant. |
 | `AI_MEMORY_MCP_GRAPH_DEPTH` | `2` | Sets the graph traversal depth. |
+| `AI_MEMORY_AUDIT_LOGGING` | `true` | Enables local index and retrieval logs. |
+| `AI_MEMORY_AUDIT_LOG_MAX_BYTES` | `25000000` | Sets the active JSONL log size limit. |
+| `AI_MEMORY_AUDIT_LOCK_TIMEOUT_SECONDS` | `10` | Sets the audit log lock timeout. |
+| `AI_MEMORY_INDEX_LOCK_TIMEOUT_SECONDS` | `300` | Sets the index publisher lock timeout. |
 
 The server accepts only a loopback host.
 The HTTP transport does not provide authentication.
+
+The retrieval log contains the query and the returned evidence.
+Keep the log directory outside the repository.
 
 ## Repository privacy
 

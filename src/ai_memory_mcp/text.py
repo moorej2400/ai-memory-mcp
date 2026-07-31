@@ -19,6 +19,8 @@ IDENTIFIER_RE = re.compile(
 )
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
 WIKILINK_RE = re.compile(r"\[\[([^]|]+)(?:\|[^]]+)?]]")
+TARGET_CHUNK_CHARS = 1800
+MAX_CHUNK_CHARS = 5000
 
 
 def normalize_token(value: str) -> str:
@@ -137,9 +139,64 @@ def semantic_vector(text: str, dimensions: int) -> dict[int, float]:
     return {key: value / norm for key, value in features.items()}
 
 
+def _split_long_block(value: str) -> list[str]:
+    parts: list[str] = []
+    remaining = value
+    while len(remaining) > MAX_CHUNK_CHARS:
+        minimum = MAX_CHUNK_CHARS // 2
+        cut = remaining.rfind("\n", minimum, MAX_CHUNK_CHARS)
+        if cut < minimum:
+            cut = remaining.rfind(" ", minimum, MAX_CHUNK_CHARS)
+        if cut < minimum:
+            cut = MAX_CHUNK_CHARS
+        parts.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        parts.append(remaining)
+    return parts
+
+
+def _bounded_sections(body: str) -> list[tuple[str, str]]:
+    # Chat exports can create one heading for each short message. Coalescing
+    # those sections prevents tens of thousands of tiny FTS rows per document.
+    chunks: list[tuple[str, str]] = []
+    blocks: list[str] = []
+    headings: list[str] = []
+    length = 0
+
+    def flush() -> None:
+        nonlocal length
+        if not blocks:
+            return
+        named = [heading for heading in headings if heading]
+        heading = named[0] if named else ""
+        if len(named) > 1 and named[-1] != heading:
+            heading = f"{heading} … {named[-1]}"
+        chunks.append((heading, "\n\n".join(blocks)))
+        blocks.clear()
+        headings.clear()
+        length = 0
+
+    for heading, text in split_sections(body):
+        block = f"## {heading}\n{text}".strip() if heading else text.strip()
+        for piece in _split_long_block(block):
+            added = len(piece) + (2 if blocks else 0)
+            if blocks and length + added > MAX_CHUNK_CHARS:
+                flush()
+            blocks.append(piece)
+            headings.append(heading)
+            length += len(piece) + (2 if len(blocks) > 1 else 0)
+            if length >= TARGET_CHUNK_CHARS:
+                flush()
+    flush()
+    return chunks
+
+
 def chunk_document(document: MemoryDocument, dimensions: int) -> list[MemoryChunk]:
     chunks: list[MemoryChunk] = []
-    for ordinal, (heading, text) in enumerate(split_sections(document.body)):
+    for ordinal, (heading, text) in enumerate(
+        _bounded_sections(document.body)
+    ):
         contextual = "\n".join(
             part for part in (document.title, heading, text) if part
         )

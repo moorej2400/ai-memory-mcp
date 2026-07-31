@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -86,17 +87,26 @@ def exclusive_lock(lock_path: Path):
 
 
 class Refresh:
-    def __init__(self, run_id: str, seed_corpus_out: Path | None) -> None:
+    def __init__(
+        self,
+        run_id: str,
+        seed_corpus_out: Path | None,
+        semantic_extraction: bool,
+    ) -> None:
         self.root = repository_root()
         self.services = Path(__file__).resolve().parent
         self.run_id = run_id
         self.seed_corpus_out = seed_corpus_out
+        self.semantic_extraction = semantic_extraction
 
         state_root = graphify_state_root()
         self.stage_root = state_root / "staging" / "ai-memory" / run_id
         self.backup_root = state_root / "backups" / "ai-memory" / run_id
         self.failed_root = self.backup_root / "failed-publication"
         self.log_root = state_root / "logs" / "ai-memory-refresh"
+        self.event_log_path = (
+            self.log_root / f"ai-memory-refresh-{self.run_id}.jsonl"
+        )
         self.state_path = self.backup_root / "refresh-state.json"
 
         self.live_corpus_out = state_root / "corpora" / "ai-memory" / "graphify-out"
@@ -139,7 +149,19 @@ class Refresh:
             self.log_handle.write(f"{message}\n")
             self.log_handle.flush()
 
-    def _run(self, command: list[str], failure: str) -> None:
+    def event(self, event: str, **data: object) -> None:
+        """Append one structured phase record for automated review."""
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "runId": self.run_id,
+            **data,
+        }
+        self.event_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.event_log_path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _run(self, command: list[str], failure: str) -> str:
         """Run one step, mirroring its output to the console and transcript.
 
         The PowerShell implementation captured a transcript of every refresh,
@@ -155,8 +177,10 @@ class Refresh:
             bufsize=1,
         )
         assert process.stdout is not None
+        output: list[str] = []
         for line in process.stdout:
             stripped = line.rstrip("\n")
+            output.append(line)
             print(stripped, flush=True)
             if self.log_handle is not None:
                 # Flushed per line so a long step, such as extraction, can be
@@ -166,12 +190,16 @@ class Refresh:
                 self.log_handle.flush()
         if process.wait() != 0:
             raise ScriptError(failure)
+        return "".join(output)
 
-    def run_tool(self, arguments: list[str], failure: str) -> None:
-        self._run([str(self.tool_python), *arguments], failure)
+    def run_tool(self, arguments: list[str], failure: str) -> str:
+        return self._run([str(self.tool_python), *arguments], failure)
 
-    def run_script(self, script: str, arguments: list[str], failure: str) -> None:
-        self._run([sys.executable, str(self.services / script), *arguments], failure)
+    def run_script(self, script: str, arguments: list[str], failure: str) -> str:
+        return self._run(
+            [sys.executable, str(self.services / script), *arguments],
+            failure,
+        )
 
     # -- phases ----------------------------------------------------------
 
@@ -206,6 +234,10 @@ class Refresh:
     def extract_sources(self, sources) -> list[tuple[str, Path]]:
         graphs: list[tuple[str, Path]] = []
         for source in sources:
+            started = time.perf_counter()
+            self.state["currentSource"] = source.source_id
+            self.write_state()
+            self.event("source-extraction-started", sourceId=source.source_id)
             source_root = self.stage_sources_root / source.source_id
             self.run_script(
                 "extract_ai_memory.py",
@@ -223,6 +255,16 @@ class Refresh:
             graphs.append(
                 (source.source_id, source_root / "graphify-out" / "graph.json")
             )
+            graph = json.loads(graphs[-1][1].read_text(encoding="utf-8"))
+            self.event(
+                "source-extraction-completed",
+                sourceId=source.source_id,
+                elapsedMs=round((time.perf_counter() - started) * 1000, 3),
+                nodes=len(graph.get("nodes", [])),
+                edges=len(graph.get("links", [])),
+            )
+        self.state.pop("currentSource", None)
+        self.write_state()
         return graphs
 
     def validate(self, arguments: list[str], failure: str) -> None:
@@ -286,6 +328,11 @@ class Refresh:
         self.state = {
             "runId": self.run_id,
             "phase": "staging",
+            "mode": (
+                "semantic-extraction"
+                if self.semantic_extraction
+                else "deterministic-index"
+            ),
             "startedAt": datetime.now(timezone.utc).isoformat(),
             "priorCorpusNodes": prior_corpus_nodes,
             "liveCorpusOut": str(self.live_corpus_out),
@@ -295,22 +342,83 @@ class Refresh:
             "globalGraphBackup": str(self.global_graph_backup),
             "globalManifestBackup": str(self.global_manifest_backup),
             "logPath": str(log_path),
+            "eventLogPath": str(self.event_log_path),
         }
         self.write_state()
+        self.event(
+            "refresh-started",
+            mode=self.state["mode"],
+            priorCorpusNodes=prior_corpus_nodes,
+        )
 
-        sources = memory_sources()
-        self.stage_seed(sources)
-        source_graphs = self.extract_sources(sources)
+        if self.semantic_extraction:
+            sources = memory_sources()
+            self.stage_seed(sources)
+            source_graphs = self.extract_sources(sources)
 
-        merge_arguments = [
-            str(self.services / "merge-memory-source-graphs.py"),
-            "--output-dir",
-            str(self.stage_corpus_out),
-        ]
-        for source_id, graph in source_graphs:
-            merge_arguments.extend(["--source", f"{source_id}={graph}"])
-        self.run_tool(merge_arguments, "AI-Memory source graph merge failed.")
+            merge_arguments = [
+                str(self.services / "merge-memory-source-graphs.py"),
+                "--output-dir",
+                str(self.stage_corpus_out),
+            ]
+            for source_id, graph in source_graphs:
+                merge_arguments.extend(["--source", f"{source_id}={graph}"])
+            self.run_tool(
+                merge_arguments,
+                "AI-Memory source graph merge failed.",
+            )
+        else:
+            if self.seed_corpus_out is not None:
+                raise ScriptError(
+                    "--seed-corpus-out requires --semantic-extraction."
+                )
+            self.state["phase"] = "index-sync"
+            self.write_state()
+            self.event("index-sync-started")
+            index_output = self._run(
+                [sys.executable, "-m", "ai_memory_mcp.cli"],
+                "AI Memory index synchronization failed.",
+            )
+            index_summary = json.loads(index_output)
+            self.event(
+                "index-sync-completed",
+                snapshot=index_summary.get("snapshot"),
+                documents=index_summary.get("documents"),
+                chunks=index_summary.get("chunks"),
+                added=index_summary.get("added"),
+                changed=index_summary.get("changed"),
+                unchanged=index_summary.get("unchanged"),
+                removed=index_summary.get("removed"),
+                parseErrors=len(index_summary.get("parse_errors", [])),
+                elapsedMs=index_summary.get("elapsed_ms"),
+            )
 
+            self.state["phase"] = "provider-graph-build"
+            self.write_state()
+            self.event("provider-graph-build-started")
+            graph_output = self._run(
+                [
+                    sys.executable,
+                    "-m",
+                    "ai_memory_mcp.provider_graph",
+                    "--output-dir",
+                    str(self.stage_corpus_out),
+                ],
+                "AI Memory provider graph build failed.",
+            )
+            graph_summary = json.loads(graph_output)
+            self.event(
+                "provider-graph-build-completed",
+                indexSnapshot=graph_summary.get("index_snapshot"),
+                documents=graph_summary.get("documents"),
+                nodes=graph_summary.get("nodes"),
+                edges=graph_summary.get("edges"),
+                scopes=graph_summary.get("scopes"),
+                unresolvedRelated=graph_summary.get("unresolved_related"),
+            )
+
+        self.state["phase"] = "validating-corpus"
+        self.write_state()
         self.validate(
             [
                 "--corpus",
@@ -322,9 +430,11 @@ class Refresh:
             ],
             "Staged corpus validation failed.",
         )
+        self.event("corpus-validation-completed")
 
         self.state["phase"] = "publishing-corpus"
         self.write_state()
+        self.event("corpus-publication-started")
         self.move_recoverably(self.live_corpus_out, self.corpus_backup)
         self.move_recoverably(self.stage_corpus_out, self.live_corpus_out)
 
@@ -365,6 +475,7 @@ class Refresh:
 
         self.state["phase"] = "publishing-global"
         self.write_state()
+        self.event("global-publication-started")
         self.move_recoverably(self.live_global_graph, self.global_graph_backup)
         self.move_recoverably(self.live_global_manifest, self.global_manifest_backup)
         self.move_recoverably(
@@ -376,6 +487,7 @@ class Refresh:
 
         self.state["phase"] = "health-check"
         self.write_state()
+        self.event("health-check-started")
         self.run_script(
             "start_global_mcp.py",
             [],
@@ -410,6 +522,7 @@ class Refresh:
         self.state["completedAt"] = datetime.now(timezone.utc).isoformat()
         self.state["healthPath"] = str(health_path)
         self.write_state()
+        self.event("refresh-completed", recoverySnapshot=str(self.backup_root))
         self.log(
             "AI-Memory graph refresh complete. "
             f"Recovery snapshot: {self.backup_root}"
@@ -421,11 +534,12 @@ def main() -> None:
         description="Refresh the AI Memory Graphify corpus and global graph."
     )
     parser.add_argument("--seed-corpus-out", type=Path, default=None)
+    parser.add_argument("--semantic-extraction", action="store_true")
     args = parser.parse_args()
 
     load_environment(repository_root())
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
-    refresh = Refresh(run_id, args.seed_corpus_out)
+    refresh = Refresh(run_id, args.seed_corpus_out, args.semantic_extraction)
 
     with exclusive_lock(graphify_state_root() / "ai-memory-refresh.lock"):
         try:
@@ -435,6 +549,12 @@ def main() -> None:
             # any state exists — a missing runtime, for example — still reaches
             # the transcript instead of leaving only a "started" line.
             refresh.log(f"FAILED: {failure}")
+            refresh.event(
+                "refresh-failed",
+                phase=refresh.state.get("phase", "initialization"),
+                errorType=type(failure).__name__,
+                error=str(failure),
+            )
             if refresh.state:
                 refresh.state["failure"] = str(failure)
                 refresh.state["failedAt"] = datetime.now(timezone.utc).isoformat()

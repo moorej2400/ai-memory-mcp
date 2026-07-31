@@ -70,6 +70,15 @@ The semantic index stays local and does not need an external API.
 Graphify supplies graph nodes, edges, neighbors, and paths.
 The repository pins Graphify 0.9.26 in an isolated environment.
 
+The routine refresh builds a Graphify-compatible graph from the current SQLite index.
+This build covers all configured memory sources without an extraction API.
+
+The graph contains one node for each indexed document.
+The graph also contains declared relationships and shared-scope relationships.
+
+Semantic Graphify extraction remains an optional maintenance operation.
+It does not control routine memory availability.
+
 The provider adapter hides Graphify file formats from MCP clients.
 The adapter keeps Graphify replaceable.
 
@@ -97,17 +106,16 @@ Graph traversal is not the only retrieval method.
 ## Refresh procedure
 
 1. Validate all configured memory sources.
-2. Detect changed Markdown files.
-3. Build derived data in a staging location.
-4. Validate the staged data.
-5. Publish the staged data atomically.
-6. Reload the applicable service.
+2. Update the SQLite index.
+3. Build the Graphify provider graph from the index.
+4. Validate the staged graph.
+5. Publish the staged graph atomically.
+6. Reload the Graphify service.
 7. Run a retrieval health check.
 
 The update keeps the last satisfactory data after a failure.
 An ordinary Markdown change uses `memory_sync`.
-The maintenance script builds one Graphify graph for each memory source.
-The script merges those graphs with stable source prefixes.
+The maintenance script records each phase in a local JSONL log.
 
 ## Provider boundary
 
@@ -127,6 +135,10 @@ Examples include unsafe updates, unstable serialization, or insufficient provena
 - Keep normal recall responses compact.
 - Process only changed Markdown files during normal refreshes.
 - Keep full graph clustering as a maintenance task.
+- Skip snapshot publication when no Markdown file changed.
+- Store semantic vectors in a compact binary form.
+- Combine adjacent short sections before indexing chat exports.
+- Load Graphify candidate documents in one index query.
 
 ## Reliability rules
 

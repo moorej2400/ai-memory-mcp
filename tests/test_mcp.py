@@ -82,7 +82,9 @@ def test_read_tools_do_not_build_a_missing_index(
     assert recall.warnings == [
         "Memory index is not available. Call memory_sync."
     ]
-    assert not state_dir.exists()
+    assert not list(state_dir.glob("index-*.sqlite"))
+    assert not (state_dir / "current-index.json").exists()
+    assert (state_dir / "logs" / "retrieval.jsonl").is_file()
 
 
 def test_server_rejects_non_loopback_host(

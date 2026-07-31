@@ -3,18 +3,20 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import struct
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
 
+from .audit import append_event, file_lock
 from .config import Settings
 from .models import MemoryChunk, MemoryDocument, ScopeFilter
 from .text import chunk_document, parse_document
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
+_VECTOR_ITEM = struct.Struct("<He")
 
 
 def _utc_now() -> str:
@@ -68,7 +70,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             heading TEXT NOT NULL,
             ordinal INTEGER NOT NULL,
             text TEXT NOT NULL,
-            vector_json TEXT NOT NULL
+            vector_blob BLOB NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_chunks_memory ON chunks(memory_id, ordinal);
         CREATE INDEX IF NOT EXISTS idx_documents_scope
@@ -83,40 +85,6 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         );
         """
     )
-
-
-@contextmanager
-def _index_lock(state_dir: Path) -> Iterator[None]:
-    """Serialize index publication while keeping the lock file recoverable."""
-    state_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = state_dir / "index.lock"
-    handle = lock_path.open("a+b")
-    locked = False
-    try:
-        if os.name == "nt":
-            import msvcrt
-
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"0")
-                handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            locked = True
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            locked = True
-        yield
-    finally:
-        if locked:
-            if os.name == "nt":
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
 
 
 def _eligible_markdown(root: Path) -> list[Path]:
@@ -169,7 +137,7 @@ def _insert_document(
                 chunk.heading,
                 chunk.ordinal,
                 chunk.text,
-                json.dumps(chunk.vector, separators=(",", ":")),
+                _encode_vector(chunk.vector),
             ),
         )
         connection.execute(
@@ -182,6 +150,22 @@ def _insert_document(
                 identifiers,
             ),
         )
+
+
+def _encode_vector(vector: dict[int, float]) -> bytes:
+    return b"".join(
+        _VECTOR_ITEM.pack(index, value)
+        for index, value in sorted(vector.items())
+    )
+
+
+def _decode_vector(payload: bytes) -> dict[int, float]:
+    if len(payload) % _VECTOR_ITEM.size:
+        raise ValueError("Stored semantic vector has an invalid byte length.")
+    return {
+        index: value
+        for index, value in _VECTOR_ITEM.iter_unpack(payload)
+    }
 
 
 def _remove_document(connection: sqlite3.Connection, memory_id: str) -> None:
@@ -220,7 +204,7 @@ def _schema_matches(path: Path) -> bool:
         return False
 
 
-def build_index(settings: Settings, *, force: bool = False) -> dict[str, object]:
+def _build_index(settings: Settings, *, force: bool = False) -> dict[str, object]:
     started = time.perf_counter()
     sources = settings.memory_sources
     missing = [source for source in sources if not source.root.is_dir()]
@@ -230,8 +214,67 @@ def build_index(settings: Settings, *, force: bool = False) -> dict[str, object]
         )
         raise FileNotFoundError(f"Memory source not found: {unavailable}")
     settings.state_dir.mkdir(parents=True, exist_ok=True)
-    with _index_lock(settings.state_dir):
+    with file_lock(
+        settings.state_dir / "index.lock",
+        settings.index_lock_timeout_seconds,
+    ) as lock_wait_ms:
         current = current_index_path(settings)
+        eligible_by_source = {
+            source.source_id: _eligible_markdown(source.root)
+            for source in sources
+        }
+        if current and not force:
+            with _connect(current, read_only=True) as connection:
+                existing_mtimes = {
+                    row["path"]: int(row["mtime_ns"])
+                    for row in connection.execute(
+                        "SELECT path, mtime_ns FROM documents"
+                    )
+                }
+                counts = connection.execute(
+                    """
+                    SELECT
+                        (SELECT COUNT(*) FROM documents) AS documents,
+                        (SELECT COUNT(*) FROM chunks) AS chunks
+                    """
+                ).fetchone()
+            current_mtimes = {
+                f"{source.source_id}/{path.relative_to(source.root).as_posix()}":
+                    path.stat().st_mtime_ns
+                for source in sources
+                for path in eligible_by_source[source.source_id]
+            }
+            if current_mtimes == existing_mtimes:
+                source_stats = [
+                    {
+                        "source_id": source.source_id,
+                        "files": len(eligible_by_source[source.source_id]),
+                        "added": 0,
+                        "changed": 0,
+                        "unchanged": len(
+                            eligible_by_source[source.source_id]
+                        ),
+                        "parse_errors": 0,
+                        "elapsed_ms": 0.0,
+                    }
+                    for source in sources
+                ]
+                return {
+                    "snapshot": str(current),
+                    "documents": int(counts["documents"]),
+                    "chunks": int(counts["chunks"]),
+                    "added": 0,
+                    "changed": 0,
+                    "unchanged": len(current_mtimes),
+                    "removed": 0,
+                    "parse_errors": [],
+                    "_source_stats": source_stats,
+                    "_lock_wait_ms": lock_wait_ms,
+                    "elapsed_ms": round(
+                        (time.perf_counter() - started) * 1000,
+                        2,
+                    ),
+                }
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         snapshot = settings.state_dir / f"index-{stamp}-{os.getpid()}.sqlite"
         if current and not force and _schema_matches(current):
@@ -242,19 +285,38 @@ def build_index(settings: Settings, *, force: bool = False) -> dict[str, object]
         with _connect(snapshot) as connection:
             _create_schema(connection)
             existing = {
-                row["path"]: (row["memory_id"], row["content_hash"])
+                row["path"]: (
+                    row["memory_id"],
+                    row["content_hash"],
+                    row["mtime_ns"],
+                )
                 for row in connection.execute(
-                    "SELECT path, memory_id, content_hash FROM documents"
+                    "SELECT path, memory_id, content_hash, mtime_ns FROM documents"
                 )
             }
             seen: set[str] = set()
             added = changed = unchanged = removed = 0
             parse_errors: list[dict[str, str]] = []
+            source_stats: list[dict[str, object]] = []
             for source in sources:
-                for path in _eligible_markdown(source.root):
+                source_started = time.perf_counter()
+                source_added = added
+                source_changed = changed
+                source_unchanged = unchanged
+                source_error_count = len(parse_errors)
+                eligible_paths = eligible_by_source[source.source_id]
+                for path in eligible_paths:
                     relative = path.relative_to(source.root).as_posix()
                     source_path = f"{source.source_id}/{relative}"
                     seen.add(source_path)
+                    old = existing.get(source_path)
+                    if (
+                        old
+                        and old[2] == path.stat().st_mtime_ns
+                        and not force
+                    ):
+                        unchanged += 1
+                        continue
                     try:
                         document = parse_document(
                             path,
@@ -270,8 +332,12 @@ def build_index(settings: Settings, *, force: bool = False) -> dict[str, object]
                             }
                         )
                         continue
-                    old = existing.get(source_path)
                     if old and old[1] == document.content_hash and not force:
+                        if old[2] != document.mtime_ns:
+                            connection.execute(
+                                "UPDATE documents SET mtime_ns = ? WHERE path = ?",
+                                (document.mtime_ns, source_path),
+                            )
                         unchanged += 1
                         continue
                     # Check the new ID before removing the previous record. This
@@ -307,7 +373,21 @@ def build_index(settings: Settings, *, force: bool = False) -> dict[str, object]
                             settings.semantic_dimensions,
                         ),
                     )
-            for path, (memory_id, _) in existing.items():
+                source_stats.append(
+                    {
+                        "source_id": source.source_id,
+                        "files": len(eligible_paths),
+                        "added": added - source_added,
+                        "changed": changed - source_changed,
+                        "unchanged": unchanged - source_unchanged,
+                        "parse_errors": len(parse_errors) - source_error_count,
+                        "elapsed_ms": round(
+                            (time.perf_counter() - source_started) * 1000,
+                            3,
+                        ),
+                    }
+                )
+            for path, (memory_id, _, _) in existing.items():
                 if path not in seen:
                     _remove_document(connection, memory_id)
                     removed += 1
@@ -355,8 +435,56 @@ def build_index(settings: Settings, *, force: bool = False) -> dict[str, object]
         "unchanged": unchanged,
         "removed": removed,
         "parse_errors": parse_errors,
+        "_source_stats": source_stats,
+        "_lock_wait_ms": lock_wait_ms,
         "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
     }
+
+
+def build_index(settings: Settings, *, force: bool = False) -> dict[str, object]:
+    started = time.perf_counter()
+    append_event(
+        settings,
+        "index",
+        "index_started",
+        {
+            "force": force,
+            "source_ids": [
+                source.source_id for source in settings.memory_sources
+            ],
+        },
+    )
+    try:
+        result = _build_index(settings, force=force)
+    except Exception as exc:
+        append_event(
+            settings,
+            "index",
+            "index_failed",
+            {
+                "force": force,
+                "elapsed_ms": round(
+                    (time.perf_counter() - started) * 1000,
+                    3,
+                ),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
+        raise
+    source_stats = result.pop("_source_stats")
+    lock_wait_ms = result.pop("_lock_wait_ms")
+    append_event(
+        settings,
+        "index",
+        "index_completed",
+        {
+            **result,
+            "source_stats": source_stats,
+            "lock_wait_ms": lock_wait_ms,
+        },
+    )
+    return result
 
 
 class MemoryIndex:
@@ -500,7 +628,7 @@ class MemoryIndex:
                 parameters,
             ).fetchall()
         decoded = [
-            (row, {int(key): value for key, value in json.loads(row["vector_json"]).items()})
+            (row, _decode_vector(row["vector_blob"]))
             for row in rows
         ]
         # A published snapshot is immutable, so decoded vectors remain valid

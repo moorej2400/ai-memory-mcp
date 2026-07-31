@@ -186,13 +186,30 @@ class GraphifyRuntimeStatus(StrictOutput):
 
 class GraphifyStatus(StrictOutput):
     available: bool
+    stale: bool
     path: str
     nodes: int = Field(ge=0)
     edges: int = Field(ge=0)
     modified_ns: int | None = None
     age_seconds: float | None = Field(default=None, ge=0.0)
+    build_mode: str | None = None
+    index_snapshot: str | None = None
     provider_role: Literal["internal-graph-signal"]
     runtime: GraphifyRuntimeStatus
+
+
+class LogStreamStatus(StrictOutput):
+    path: str
+    exists: bool
+    bytes: int = Field(ge=0)
+
+
+class LoggingStatus(StrictOutput):
+    enabled: bool
+    directory: str
+    writable: bool
+    streams: dict[str, LogStreamStatus] = Field(default_factory=dict)
+    last_error: str | None = None
 
 
 class RuntimeStatus(StrictOutput):
@@ -207,5 +224,6 @@ class StatusResponse(StrictOutput):
     retrieval_sources: list[CanonicalMemoryStatus] = Field(default_factory=list)
     index: IndexStatus
     graphify: GraphifyStatus
+    logging: LoggingStatus
     runtime: RuntimeStatus
     checked_at: str

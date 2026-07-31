@@ -47,6 +47,18 @@ def _configured_path(name: str, default: Path) -> Path:
     return Path(os.path.expandvars(value)).expanduser()
 
 
+def _configured_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be true or false.")
+
+
 SOURCE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 
 
@@ -117,6 +129,11 @@ class Settings:
     semantic_dimensions: int = 1024
     rrf_k: int = 60
     graph_depth: int = 2
+    log_dir: Path | None = None
+    audit_logging_enabled: bool = True
+    audit_log_max_bytes: int = 25_000_000
+    audit_lock_timeout_seconds: float = 10.0
+    index_lock_timeout_seconds: float = 300.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -154,11 +171,32 @@ class Settings:
             ),
             rrf_k=int(os.getenv("AI_MEMORY_MCP_RRF_K", "60")),
             graph_depth=int(os.getenv("AI_MEMORY_MCP_GRAPH_DEPTH", "2")),
+            log_dir=_configured_path(
+                "AI_MEMORY_LOG_DIR",
+                state / "logs",
+            ),
+            audit_logging_enabled=_configured_bool(
+                "AI_MEMORY_AUDIT_LOGGING",
+                True,
+            ),
+            audit_log_max_bytes=int(
+                os.getenv("AI_MEMORY_AUDIT_LOG_MAX_BYTES", "25000000")
+            ),
+            audit_lock_timeout_seconds=float(
+                os.getenv("AI_MEMORY_AUDIT_LOCK_TIMEOUT_SECONDS", "10")
+            ),
+            index_lock_timeout_seconds=float(
+                os.getenv("AI_MEMORY_INDEX_LOCK_TIMEOUT_SECONDS", "300")
+            ),
         )
 
     @property
     def pointer_path(self) -> Path:
         return self.state_dir / "current-index.json"
+
+    @property
+    def resolved_log_dir(self) -> Path:
+        return self.log_dir or self.state_dir / "logs"
 
     @property
     def memory_sources(self) -> tuple[MemorySource, ...]:

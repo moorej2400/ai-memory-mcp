@@ -1,6 +1,7 @@
 .venv/
 .graphify-runtime/
 graphify-out/
+/logs/
 .migration-archive/
 .env
 .coverage

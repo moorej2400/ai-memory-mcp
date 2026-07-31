@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .audit import append_event, logging_status
 from .config import Settings
 from .graphify import GraphifyAdapter
 from .index import MemoryIndex, build_index, current_index_path
@@ -16,6 +17,7 @@ from .models import (
     GraphifyRuntimeStatus,
     GraphifyStatus,
     IndexStatus,
+    LoggingStatus,
     RecallCitation,
     RecallEvidence,
     RecallRelationship,
@@ -71,6 +73,76 @@ class MemoryService:
         path_prefix: str | None = None,
         limit: int | None = None,
     ) -> RecallResponse:
+        started = time.perf_counter()
+        scope_payload = {
+            "source_id": source_id,
+            "root_scope": root_scope,
+            "repository": repository,
+            "project": project,
+            "ticket": ticket,
+            "status": status,
+            "path_prefix": path_prefix,
+            "limit": limit,
+        }
+        try:
+            response, diagnostics = self._recall(
+                query,
+                source_id=source_id,
+                root_scope=root_scope,
+                repository=repository,
+                project=project,
+                ticket=ticket,
+                status=status,
+                path_prefix=path_prefix,
+                limit=limit,
+            )
+        except Exception as exc:
+            append_event(
+                self.settings,
+                "retrieval",
+                "retrieval_failed",
+                {
+                    "query": query,
+                    "scope": scope_payload,
+                    "elapsed_ms": round(
+                        (time.perf_counter() - started) * 1000,
+                        3,
+                    ),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            raise
+        append_event(
+            self.settings,
+            "retrieval",
+            "retrieval_completed",
+            {
+                "query": query,
+                "scope": scope_payload,
+                "elapsed_ms": round(
+                    (time.perf_counter() - started) * 1000,
+                    3,
+                ),
+                "diagnostics": diagnostics,
+                "response": response.model_dump(mode="json"),
+            },
+        )
+        return response
+
+    def _recall(
+        self,
+        query: str,
+        *,
+        source_id: str | None = None,
+        root_scope: str | None = None,
+        repository: str | None = None,
+        project: str | None = None,
+        ticket: str | None = None,
+        status: str = "active",
+        path_prefix: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[RecallResponse, dict[str, Any]]:
         query = query.strip()
         if not query:
             raise ValueError("Query must not be empty.")
@@ -84,24 +156,40 @@ class MemoryService:
             path_prefix=path_prefix,
         )
         if current_index_path(self.settings) is None:
-            return RecallResponse(
-                status="no_answer",
-                intent="search",
-                query=query,
-                warnings=["Memory index is not available. Call memory_sync."],
+            return (
+                RecallResponse(
+                    status="no_answer",
+                    intent="search",
+                    query=query,
+                    warnings=["Memory index is not available. Call memory_sync."],
+                ),
+                {"route": "no-index"},
             )
 
         exact = self.engine.get(self._identity_candidate(query), scope)
         if exact["found"]:
-            return self._exact_response(query, exact["memory"], scope)
+            return (
+                self._exact_response(query, exact["memory"], scope),
+                {
+                    "route": "exact",
+                    "graphify": self.engine.graph.health(),
+                },
+            )
 
         mentioned = self.engine.mentioned_documents(query, scope, limit=3)
         if self._is_relationship_query(query) and len(mentioned) >= 2:
-            return self._relationship_response(
-                query,
-                mentioned[0],
-                mentioned[1],
-                scope,
+            return (
+                self._relationship_response(
+                    query,
+                    mentioned[0],
+                    mentioned[1],
+                    scope,
+                ),
+                {
+                    "route": "relationship",
+                    "mentioned_documents": len(mentioned),
+                    "graphify": self.engine.graph.health(),
+                },
             )
 
         packet = self.engine.search(query, scope=scope, limit=limit)
@@ -127,14 +215,20 @@ class MemoryService:
         ]
         relationships = self._result_relationships(packet.results, scope)
         warnings = self._graph_warnings()
-        return RecallResponse(
-            status=packet.answer_status,
-            intent="search",
-            query=query,
-            evidence=evidence,
-            citations=citations,
-            relationships=relationships,
-            warnings=warnings,
+        return (
+            RecallResponse(
+                status=packet.answer_status,
+                intent="search",
+                query=query,
+                evidence=evidence,
+                citations=citations,
+                relationships=relationships,
+                warnings=warnings,
+            ),
+            {
+                "route": "search",
+                **packet.diagnostics,
+            },
         )
 
     def sync(self) -> SyncResponse:
@@ -177,6 +271,22 @@ class MemoryService:
             if self.settings.graph_path.exists()
             else None
         )
+        graph_index_snapshot = graph_health.get("index_snapshot")
+        graph_stale = bool(
+            index_path
+            and (
+                (
+                    graph_index_snapshot
+                    and graph_index_snapshot != index_path.name
+                )
+                or (
+                    not graph_index_snapshot
+                    and self.settings.graph_path.exists()
+                    and self.settings.graph_path.stat().st_mtime_ns
+                    < index_path.stat().st_mtime_ns
+                )
+            )
+        )
         mcp_version = importlib.metadata.version("mcp")
         return StatusResponse(
             ok=index_status.available,
@@ -200,13 +310,19 @@ class MemoryService:
             index=index_status,
             graphify=GraphifyStatus(
                 available=bool(graph_health["available"]),
+                stale=graph_stale,
                 path=str(graph_health["path"]),
                 nodes=int(graph_health["nodes"]),
                 edges=int(graph_health["edges"]),
                 modified_ns=graph_health["modified_ns"],
                 age_seconds=graph_age_seconds,
+                build_mode=graph_health.get("build_mode"),
+                index_snapshot=graph_index_snapshot,
                 provider_role="internal-graph-signal",
                 runtime=self._graphify_runtime(),
+            ),
+            logging=LoggingStatus.model_validate(
+                logging_status(self.settings)
             ),
             runtime=RuntimeStatus(
                 python=platform.python_version(),

@@ -22,6 +22,7 @@ class GraphifyAdapter:
         self.primary_source_id = primary_source_id
         self.source_ids = frozenset((primary_source_id, *source_ids))
         self._stamp: tuple[int, int] | None = None
+        self.metadata: dict[str, Any] = {}
         self.nodes: dict[str, dict[str, Any]] = {}
         self.adjacency: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
         self.source_nodes: dict[str, set[str]] = defaultdict(set)
@@ -40,6 +41,7 @@ class GraphifyAdapter:
             self.nodes = {}
             self.adjacency = defaultdict(list)
             self.source_nodes = defaultdict(set)
+            self.metadata = {}
             self._stamp = None
             return
         stat = self.graph_path.stat()
@@ -47,6 +49,8 @@ class GraphifyAdapter:
         if stamp == self._stamp:
             return
         payload = json.loads(self.graph_path.read_text(encoding="utf-8"))
+        metadata = payload.get("graph", {})
+        self.metadata = metadata if isinstance(metadata, dict) else {}
         self.nodes = {str(node["id"]): node for node in payload.get("nodes", [])}
         self.adjacency = defaultdict(list)
         self.source_nodes = defaultdict(set)
@@ -72,6 +76,8 @@ class GraphifyAdapter:
             "nodes": len(self.nodes),
             "edges": sum(len(values) for values in self.adjacency.values()) // 2,
             "modified_ns": self._stamp[0] if self._stamp else None,
+            "build_mode": self.metadata.get("build_mode"),
+            "index_snapshot": self.metadata.get("index_snapshot"),
         }
 
     def rank(self, query: str, candidate_paths: list[str], limit: int = 30) -> list[str]:

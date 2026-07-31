@@ -24,6 +24,10 @@ Run this command after a normal Markdown change:
 The command reads Markdown from all configured memory sources.
 The command publishes a new SQLite index snapshot.
 The command does not change the Markdown files.
+The command skips publication when no Markdown file changed.
+
+Concurrent commands wait for the current index publisher.
+The default wait limit is 300 seconds.
 
 ## Run the MCP server
 
@@ -74,8 +78,8 @@ The tool updates only the derived SQLite index.
 Use the maintenance script when the Graphify graph must change.
 The script uses staging and validation.
 The script keeps the last satisfactory graph if validation fails.
-The script extracts each configured memory source separately.
-The script merges the source graphs into the AI Memory provider graph.
+The script builds the provider graph from the current SQLite index.
+This procedure does not require an extraction API.
 
 Run this script for Graphify maintenance:
 
@@ -87,14 +91,43 @@ Run this script for Graphify maintenance:
 ./scripts/graphify/refresh-ai-memory-graph.sh
 ```
 
-Only one refresh can publish at a time. The script takes an advisory file lock
-for the run and reports a clear error if another refresh already holds it.
+Use semantic extraction only for optional maintenance analysis:
+
+```powershell
+.\scripts\graphify\refresh-ai-memory-graph.ps1 -SemanticExtraction
+```
+
+```bash
+./scripts/graphify/refresh-ai-memory-graph.sh --semantic-extraction
+```
+
+Only one refresh can publish at a time.
+The script uses an advisory file lock for each run.
+The script reports an error if another refresh holds the lock.
 
 Every run writes a transcript to
-`<graphify-state>/logs/ai-memory-refresh/ai-memory-refresh-<run-id>.log`. The
-transcript records each step, its output, and — when a run fails — the failure
-and the rollback, so it is the first place to look after an unsuccessful
-refresh.
+`<graphify-state>/logs/ai-memory-refresh/ai-memory-refresh-<run-id>.log`.
+The transcript records each step and its output.
+The transcript also records failures and rollback operations.
+
+## Review local logs
+
+The index log records source counts, changes, errors, lock waits, and elapsed time.
+The retrieval log records each query, result, citation, diagnostic, and elapsed time.
+
+Read these files under `AI_MEMORY_LOG_DIR`:
+
+- `index.jsonl`
+- `retrieval.jsonl`
+
+The default directory is `AI_MEMORY_MCP_STATE_DIR\logs`.
+The logger moves a full active log to a timestamped local archive.
+
+Graphify refresh events use a separate local directory.
+Read these files under `AI_MEMORY_GRAPHIFY_STATE_DIR\logs\ai-memory-refresh`.
+
+These logs can contain memory text.
+Do not copy these logs into the repository.
 
 ## Control the Graphify MCP service
 
