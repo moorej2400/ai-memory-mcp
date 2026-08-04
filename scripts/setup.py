@@ -102,9 +102,33 @@ def main() -> None:
         "Failed to update pip in the application environment.",
     )
     _run(
-        [str(application_python), "-m", "pip", "install", "-e", f"{root}[dev]"],
+        [
+            str(application_python),
+            "-m",
+            "pip",
+            "install",
+            "-e",
+            f"{root}[dev,semantic]",
+        ],
         "Failed to install AI Memory MCP.",
     )
+    try:
+        _run(
+            [
+                str(application_python),
+                "-c",
+                (
+                    "from ai_memory_mcp.embedding import resolve_provider; "
+                    "print('embedding provider:', resolve_provider('auto').name)"
+                ),
+            ],
+            "Failed to prepare the semantic embedding model.",
+        )
+    except ScriptError:
+        info(
+            "The semantic embedding model is not available. "
+            "Recall uses the hashed fallback."
+        )
 
     if not args.skip_graphify_runtime:
         graphify_interpreter = _ensure_venv(

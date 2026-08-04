@@ -263,6 +263,8 @@ class MemoryService:
                     metadata.get("memory_sources", "[]")
                 ),
                 semantic_dimensions=metadata.get("semantic_dimensions"),
+                embedding_provider=metadata.get("embedding_provider"),
+                embedding_model=metadata.get("embedding_model"),
                 documents=metadata.get("documents"),
                 chunks=metadata.get("chunks"),
             )

@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
+import pytest
+
 from ai_memory_mcp.config import Settings
-from ai_memory_mcp.embedding import HashedProvider, resolve_provider
+from ai_memory_mcp.embedding import (
+    EmbeddingUnavailable,
+    HashedProvider,
+    resolve_provider,
+)
 from ai_memory_mcp.index import build_index
 from ai_memory_mcp.retrieval import RetrievalEngine
 from ai_memory_mcp.text import semantic_vector
@@ -93,3 +100,62 @@ def test_provider_change_triggers_full_reembed(tmp_path: Path) -> None:
     assert third["added"] == 1, "fingerprint change must re-embed every document"
     engine = RetrievalEngine(resized)
     assert engine.index.metadata()["embedding_fingerprint"] == "hashed::128"
+
+
+def test_auto_falls_back_to_hashed_without_model2vec(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "model2vec", None)
+    provider = resolve_provider("auto", dimensions=64)
+    assert provider.name == "hashed"
+    assert provider.dimensions == 64
+
+
+def test_explicit_model2vec_raises_when_missing(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "model2vec", None)
+    with pytest.raises(EmbeddingUnavailable) as error:
+        resolve_provider("model2vec")
+    # The failure must name the unavailable provider, not report an unknown
+    # name: the difference tells an operator to install versus to reconfigure.
+    assert "model2vec provider unavailable" in str(error.value)
+
+
+def test_auto_prefers_model2vec_when_loadable(monkeypatch) -> None:
+    class _FakeModel2Vec:
+        name = "model2vec"
+        model = "fake-model"
+        dimensions = 8
+
+        def __init__(self, model: str = ""):
+            pass
+
+        def embed(self, text: str) -> dict[int, float]:
+            return {0: 1.0}
+
+    monkeypatch.setattr(
+        "ai_memory_mcp.embedding.Model2VecProvider", _FakeModel2Vec
+    )
+    assert resolve_provider("auto", dimensions=64).name == "model2vec"
+    assert resolve_provider("model2vec").name == "model2vec"
+
+
+def test_engine_disables_semantic_when_provider_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = _settings(tmp_path)
+    _write_note(
+        tmp_path / "vault",
+        "Tools/Proxy.md",
+        "mem-proxy",
+        "Proxy Restart",
+        "Restart the proxy with the launch script.",
+    )
+    build_index(settings, force=True)
+
+    def _raise(*args: object, **kwargs: object):
+        raise EmbeddingUnavailable("provider gone")
+
+    monkeypatch.setattr("ai_memory_mcp.retrieval.resolve_provider", _raise)
+    engine = RetrievalEngine(settings)
+    assert engine.provider is None
+    assert "Semantic retrieval disabled" in engine.provider_warning
+    packet = engine.search("proxy restart")
+    assert packet.diagnostics["candidate_counts"]["semantic"] == 0

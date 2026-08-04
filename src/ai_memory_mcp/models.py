@@ -169,6 +169,8 @@ class IndexStatus(StrictOutput):
     memory_root: str | None = None
     memory_sources: list[str] = Field(default_factory=list)
     semantic_dimensions: int | None = None
+    embedding_provider: str | None = None
+    embedding_model: str | None = None
     documents: int | None = Field(default=None, ge=0)
     chunks: int | None = Field(default=None, ge=0)
 
