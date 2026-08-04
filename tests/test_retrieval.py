@@ -112,3 +112,14 @@ def test_parallel_recall_is_consistent_and_fast(
         outcomes = list(pool.map(run, queries))
     assert all(status == "answered" for status, _ in outcomes)
     assert sorted(duration for _, duration in outcomes)[37] < 250
+
+
+def test_no_answer_returns_best_effort_leads(
+    benchmark_settings: Settings,
+) -> None:
+    service = MemoryService(benchmark_settings)
+    packet = service.recall("What is the launch date of Project Zephyr?")
+    assert packet.status == "no_answer"
+    assert packet.evidence, "low-confidence recall must still return leads"
+    assert packet.citations
+    assert any("best-effort" in warning for warning in packet.warnings)

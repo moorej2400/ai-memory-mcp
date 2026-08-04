@@ -215,6 +215,12 @@ class MemoryService:
         ]
         relationships = self._result_relationships(packet.results, scope)
         warnings = self._graph_warnings()
+        if packet.answer_status == "no_answer" and evidence:
+            warnings.append(
+                "No result met the answer threshold. Evidence contains "
+                "best-effort leads only. Verify a lead in its canonical "
+                "Markdown source before you use it."
+            )
         return (
             RecallResponse(
                 status=packet.answer_status,

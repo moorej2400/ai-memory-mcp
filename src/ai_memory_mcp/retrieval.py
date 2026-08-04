@@ -374,7 +374,7 @@ class RetrievalEngine:
         return EvidencePacket(
             query=query,
             answer_status="answered" if answered else "no_answer",
-            results=hits if answered else [],
+            results=hits,
             plan={
                 "scope": asdict(planned_scope),
                 "retrievers": ["lexical", "semantic", "graphify"],
