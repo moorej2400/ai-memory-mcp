@@ -173,6 +173,10 @@ An exact identity returns the complete record.
 A relationship question returns a graph path when a path exists.
 A general question runs lexical, semantic, and graph retrieval.
 
+Recall reports `answered` for an exact match, sufficient lexical coverage, or a clear semantic lead.
+A paraphrase answer needs a lexical anchor and a semantic margin above the other results.
+The two conditions together keep an absent answer at `no_answer`.
+
 A `no_answer` status still returns ranked best-effort evidence.
 A warning marks that evidence as leads that require verification.
 

@@ -39,6 +39,8 @@ STOPWORDS = {
 }
 
 
+SEMANTIC_COVERAGE_MIN = 0.20
+SEMANTIC_MARGIN_MIN = 0.35
 FRESHNESS_CAP = 0.03
 FRESHNESS_HALF_LIFE_DAYS = 180.0
 REVIEW_OVERDUE_PENALTY = 0.03
@@ -430,9 +432,30 @@ class RetrievalEngine:
             and top.signals.get("intent_title_overlap", 0.0) >= 2
             and top.signals.get("semantic", 0.0) >= 0.4
         )
+        # A paraphrase answer shares few query tokens, so query_coverage alone
+        # rejects it. A semantic margin alone is also unsafe: on a small corpus
+        # one note leads the ranking even when nothing answers the question.
+        # Requiring a lexical anchor AND a clear semantic lead separates a real
+        # paraphrase match from a confident-looking miss.
+        top_semantic = top.signals.get("semantic", 0.0) if top else 0.0
+        runner_up_semantic = max(
+            (hit.signals.get("semantic", 0.0) for hit in hits[1:]),
+            default=0.0,
+        )
+        semantic_margin = (
+            (top_semantic - runner_up_semantic) / top_semantic
+            if top_semantic > 0
+            else 0.0
+        )
+        semantic_evidence = bool(
+            top
+            and semantic_margin >= SEMANTIC_MARGIN_MIN
+            and top.signals.get("query_coverage", 0.0) >= SEMANTIC_COVERAGE_MIN
+        )
         answered = bool(top) and (
             exact_evidence
             or intent_evidence
+            or semantic_evidence
             or (
                 corroborated_text
                 and top_score >= 0.045
