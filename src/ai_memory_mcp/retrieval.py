@@ -4,6 +4,7 @@ import re
 import sqlite3
 import time
 from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import Any
 
 from .config import Settings
@@ -36,6 +37,24 @@ STOPWORDS = {
     "why",
     "with",
 }
+
+
+FRESHNESS_CAP = 0.03
+FRESHNESS_HALF_LIFE_DAYS = 180.0
+REVIEW_OVERDUE_PENALTY = 0.03
+
+
+def _parse_utc(value: str) -> datetime | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _fts_expression(query: str) -> str:
@@ -71,6 +90,8 @@ def _row_hit(row: sqlite3.Row, score: float, source: str, rank: int) -> SearchHi
         heading=row["heading"],
         text=row["text"],
         score=score,
+        updated=row["updated"],
+        review_after=row["review_after"],
         ranks={source: rank},
         signals={source: score},
     )
@@ -79,6 +100,7 @@ def _row_hit(row: sqlite3.Row, score: float, source: str, rank: int) -> SearchHi
 class RetrievalEngine:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.now = lambda: datetime.now(timezone.utc)
         self.index = MemoryIndex(settings)
         metadata = self.index.metadata()
         self.provider: EmbeddingProvider | None
@@ -125,7 +147,7 @@ class RetrievalEngine:
         with self.index.connection() as connection:
             rows = connection.execute(
                 f"""
-                SELECT c.*, d.identifiers_json, bm25(
+                SELECT c.*, d.identifiers_json, d.updated, d.review_after, bm25(
                     chunks_fts, 0.0, 4.0, 2.0, 1.0, 7.0
                 ) AS lexical_score
                 FROM chunks_fts f
@@ -178,7 +200,7 @@ class RetrievalEngine:
         with self.index.connection() as connection:
             rows = connection.execute(
                 f"""
-                SELECT c.* FROM documents d
+                SELECT c.*, d.updated, d.review_after FROM documents d
                 JOIN chunks c USING(memory_id)
                 WHERE d.path IN ({placeholders})
                 AND c.ordinal = 0
@@ -222,6 +244,8 @@ class RetrievalEngine:
                         heading=hit.heading,
                         text=hit.text,
                         score=0.0,
+                        updated=hit.updated,
+                        review_after=hit.review_after,
                     )
                     by_memory[hit.memory_id] = fused
                 # A long note can yield many matching sections. Each retriever
@@ -242,6 +266,7 @@ class RetrievalEngine:
                 fused.score += 1.0 / (self.settings.rrf_k + rank)
                 fused.ranks[source] = rank
                 fused.signals[source] = hit.score
+        now = self.now()
         for hit in by_memory.values():
             searchable = f"{hit.memory_id} {hit.path} {hit.title} {hit.heading} {hit.text}".casefold()
             title = hit.title.casefold()
@@ -279,6 +304,24 @@ class RetrievalEngine:
             hit.score += min(0.05, hit.signals.get("semantic", 0.0) * 0.08)
             hit.score += min(0.06, hit.signals["query_coverage"] * 0.09)
             hit.score += min(0.08, intent_title_overlap * 0.04)
+            # Freshness is a tiebreaker, not a relevance signal: the cap sits
+            # below every exact-match bonus so it only reorders near-equals.
+            updated_at = _parse_utc(hit.updated)
+            if updated_at is not None:
+                age_days = max(
+                    0.0, (now - updated_at).total_seconds() / 86400.0
+                )
+                freshness = FRESHNESS_CAP * 0.5 ** (
+                    age_days / FRESHNESS_HALF_LIFE_DAYS
+                )
+                hit.score += freshness
+                hit.signals["freshness"] = freshness
+                if freshness > 0.02:
+                    hit.reasons.append("recently updated")
+            review_at = _parse_utc(hit.review_after)
+            if review_at is not None and review_at < now:
+                hit.score -= REVIEW_OVERDUE_PENALTY
+                hit.reasons.append("review overdue")
         ranked = sorted(
             by_memory.values(),
             key=lambda hit: (hit.score, -min(hit.ranks.values()), hit.title.casefold()),

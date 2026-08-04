@@ -646,7 +646,7 @@ class MemoryIndex:
             rows = connection.execute(
                 f"""
                 SELECT c.*, d.status, d.root_scope, d.scope_kind, d.scope_id,
-                       d.projects_json, d.repos_json
+                       d.projects_json, d.repos_json, d.updated, d.review_after
                 FROM chunks c JOIN documents d USING(memory_id)
                 {where}
                 """,

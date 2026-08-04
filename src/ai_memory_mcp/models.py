@@ -61,6 +61,8 @@ class SearchHit:
     heading: str
     text: str
     score: float
+    updated: str = ""
+    review_after: str = ""
     ranks: dict[str, int] = field(default_factory=dict)
     signals: dict[str, float] = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
