@@ -215,6 +215,8 @@ class MemoryService:
         ]
         relationships = self._result_relationships(packet.results, scope)
         warnings = self._graph_warnings()
+        if self.engine.provider_warning:
+            warnings.append(self.engine.provider_warning)
         if packet.answer_status == "no_answer" and evidence:
             warnings.append(
                 "No result met the answer threshold. Evidence contains "

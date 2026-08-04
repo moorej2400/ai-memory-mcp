@@ -23,6 +23,7 @@ def benchmark_settings(project_root: Path) -> Settings:
         state_dir=benchmark / "runs" / f"pytest-state-{stamp}",
         graph_path=benchmark / "fixtures" / "graph.json",
         graphify_mcp_url="",
+        embedding_provider="hashed",
     )
     build_index(settings, force=True)
     return settings

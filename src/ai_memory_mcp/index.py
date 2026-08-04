@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .audit import append_event, file_lock
 from .config import Settings
+from .embedding import fingerprint, resolve_provider
 from .models import MemoryChunk, MemoryDocument, ScopeFilter
 from .text import chunk_document, parse_document
 
@@ -204,6 +205,17 @@ def _schema_matches(path: Path) -> bool:
         return False
 
 
+def _index_metadata_value(path: Path, key: str) -> str | None:
+    try:
+        with _connect(path, read_only=True) as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = ?", (key,)
+            ).fetchone()
+            return str(row["value"]) if row else None
+    except (OSError, sqlite3.DatabaseError):
+        return None
+
+
 def _build_index(settings: Settings, *, force: bool = False) -> dict[str, object]:
     started = time.perf_counter()
     sources = settings.memory_sources
@@ -219,6 +231,19 @@ def _build_index(settings: Settings, *, force: bool = False) -> dict[str, object
         settings.index_lock_timeout_seconds,
     ) as lock_wait_ms:
         current = current_index_path(settings)
+        provider = resolve_provider(
+            settings.embedding_provider,
+            model=settings.embedding_model,
+            dimensions=settings.semantic_dimensions,
+        )
+        provider_fingerprint = fingerprint(provider)
+        if current and _index_metadata_value(
+            current, "embedding_fingerprint"
+        ) != provider_fingerprint:
+            # A provider change invalidates every stored vector. This must run
+            # before the mtime fast path below: unchanged files still need new
+            # vectors when the embedding provider changes.
+            current = None
         eligible_by_source = {
             source.source_id: _eligible_markdown(source.root)
             for source in sources
@@ -368,10 +393,7 @@ def _build_index(settings: Settings, *, force: bool = False) -> dict[str, object
                     _insert_document(
                         connection,
                         document,
-                        chunk_document(
-                            document,
-                            settings.semantic_dimensions,
-                        ),
+                        chunk_document(document, provider),
                     )
                 source_stats.append(
                     {
@@ -406,7 +428,10 @@ def _build_index(settings: Settings, *, force: bool = False) -> dict[str, object
                     [source.source_id for source in sources],
                     separators=(",", ":"),
                 ),
-                "semantic_dimensions": str(settings.semantic_dimensions),
+                "semantic_dimensions": str(provider.dimensions),
+                "embedding_provider": provider.name,
+                "embedding_model": provider.model,
+                "embedding_fingerprint": provider_fingerprint,
                 "documents": str(counts["documents"]),
                 "chunks": str(counts["chunks"]),
             }

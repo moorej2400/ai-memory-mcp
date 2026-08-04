@@ -192,7 +192,9 @@ def _bounded_sections(body: str) -> list[tuple[str, str]]:
     return chunks
 
 
-def chunk_document(document: MemoryDocument, dimensions: int) -> list[MemoryChunk]:
+def chunk_document(document: MemoryDocument, provider) -> list[MemoryChunk]:
+    """`provider` satisfies embedding.EmbeddingProvider (duck-typed to avoid
+    an import cycle: embedding.py imports semantic_vector from this module)."""
     chunks: list[MemoryChunk] = []
     for ordinal, (heading, text) in enumerate(
         _bounded_sections(document.body)
@@ -210,7 +212,7 @@ def chunk_document(document: MemoryDocument, dimensions: int) -> list[MemoryChun
                 heading=heading,
                 ordinal=ordinal,
                 text=text,
-                vector=semantic_vector(contextual, dimensions),
+                vector=provider.embed(contextual),
             )
         )
     return chunks

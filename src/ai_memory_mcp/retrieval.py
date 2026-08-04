@@ -7,10 +7,11 @@ from dataclasses import asdict
 from typing import Any
 
 from .config import Settings
+from .embedding import EmbeddingProvider, EmbeddingUnavailable, resolve_provider
 from .graphify import GraphifyAdapter
 from .index import MemoryIndex, scope_sql
 from .models import EvidencePacket, ScopeFilter, SearchHit
-from .text import cosine_sparse, query_identifiers, semantic_vector, tokenize
+from .text import cosine_sparse, query_identifiers, tokenize
 
 TICKET_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,12}-\d+\b", re.IGNORECASE)
 STOPWORDS = {
@@ -79,6 +80,28 @@ class RetrievalEngine:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.index = MemoryIndex(settings)
+        metadata = self.index.metadata()
+        self.provider: EmbeddingProvider | None
+        try:
+            self.provider = resolve_provider(
+                metadata.get("embedding_provider", "hashed"),
+                model=metadata.get("embedding_model", ""),
+                dimensions=int(
+                    metadata.get(
+                        "semantic_dimensions",
+                        settings.semantic_dimensions,
+                    )
+                ),
+            )
+            self.provider_warning = ""
+        except EmbeddingUnavailable as exc:
+            # Lexical and graph retrieval still work; semantic is disabled
+            # until the recorded provider is installed or the index rebuilt.
+            self.provider = None
+            self.provider_warning = (
+                f"Semantic retrieval disabled: {exc}. "
+                "Install the provider or run memory_sync to rebuild."
+            )
         self.graph = GraphifyAdapter(
             settings.graph_path,
             primary_source_id=settings.primary_source_id,
@@ -123,7 +146,9 @@ class RetrievalEngine:
     def _semantic(
         self, query: str, scope: ScopeFilter, limit: int
     ) -> list[SearchHit]:
-        vector = semantic_vector(query, self.settings.semantic_dimensions)
+        if self.provider is None:
+            return []
+        vector = self.provider.embed(query)
         scored = [
             (cosine_sparse(vector, candidate), row)
             for row, candidate in self.index.all_vectors(scope)

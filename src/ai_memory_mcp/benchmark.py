@@ -67,6 +67,7 @@ def run_benchmark(label: str) -> dict[str, Any]:
         state_dir=state_dir,
         graph_path=root / "fixtures" / "graph.json",
         graphify_mcp_url="",
+        embedding_provider="hashed",
     )
     index_result = build_index(settings, force=True)
     service = MemoryService(settings)

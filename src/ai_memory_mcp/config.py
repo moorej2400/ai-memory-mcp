@@ -134,6 +134,8 @@ class Settings:
     audit_log_max_bytes: int = 25_000_000
     audit_lock_timeout_seconds: float = 10.0
     index_lock_timeout_seconds: float = 300.0
+    embedding_provider: str = "auto"
+    embedding_model: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -188,6 +190,10 @@ class Settings:
             index_lock_timeout_seconds=float(
                 os.getenv("AI_MEMORY_INDEX_LOCK_TIMEOUT_SECONDS", "300")
             ),
+            embedding_provider=os.getenv(
+                "AI_MEMORY_MCP_EMBEDDING_PROVIDER", "auto"
+            ),
+            embedding_model=os.getenv("AI_MEMORY_MCP_EMBEDDING_MODEL", ""),
         )
 
     @property
