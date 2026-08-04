@@ -70,7 +70,9 @@ repository-owned scripts.
 | `AI_MEMORY_MCP_HOST` | `127.0.0.1` | Sets the HTTP host. |
 | `AI_MEMORY_MCP_PORT` | `4334` | Sets the HTTP port. |
 | `AI_MEMORY_MCP_RESULT_LIMIT` | `8` | Sets the default result limit. |
-| `AI_MEMORY_MCP_SEMANTIC_DIMENSIONS` | `1024` | Sets the semantic vector size. |
+| `AI_MEMORY_MCP_SEMANTIC_DIMENSIONS` | `1024` | Sets the hashed semantic vector size. |
+| `AI_MEMORY_MCP_EMBEDDING_PROVIDER` | `auto` | Selects `model2vec`, `hashed`, or `auto`. |
+| `AI_MEMORY_MCP_EMBEDDING_MODEL` | `minishlab/potion-base-8M` | Sets the Model2Vec model name. |
 | `AI_MEMORY_MCP_RRF_K` | `60` | Sets the RRF constant. |
 | `AI_MEMORY_MCP_GRAPH_DEPTH` | `2` | Sets the graph traversal depth. |
 | `AI_MEMORY_AUDIT_LOGGING` | `true` | Enables local index and retrieval logs. |

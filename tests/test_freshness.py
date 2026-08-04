@@ -66,7 +66,9 @@ def test_newer_note_outranks_stale_twin(tmp_path: Path) -> None:
     )
     packet = _engine(tmp_path).search("how to log in to the log console")
     ordered = [hit.memory_id for hit in packet.results]
-    assert ordered.index("mem-log-console-new") < ordered.index("mem-log-console-old")
+    assert ordered.index("mem-log-console-new") < ordered.index(
+        "mem-log-console-old"
+    )
     top = packet.results[0]
     assert top.signals["freshness"] > 0.02
     assert "recently updated" in top.reasons

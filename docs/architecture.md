@@ -62,8 +62,15 @@ Exact matches get priority for identifiers, paths, filenames, and error text.
 
 ### Semantic retrieval
 
-Deterministic semantic vectors supply paraphrase results.
+A local embedding provider supplies paraphrase results.
+The default provider is Model2Vec with the `minishlab/potion-base-8M` model.
+The hashed feature provider is the automatic fallback.
 The semantic index stays local and does not need an external API.
+
+The index records the embedding provider that built it.
+A query always uses the recorded provider.
+A provider change makes the indexer build all vectors again.
+If the recorded provider is not available, recall disables the semantic signal and gives a warning.
 
 ### Graphify provider
 
@@ -102,6 +109,9 @@ The facade returns source paths and retrieval evidence.
 
 Graph traversal is one retrieval signal.
 Graph traversal is not the only retrieval method.
+
+Fusion adds a bounded freshness bonus from the `updated` date.
+An expired `review_after` date applies a bounded penalty and adds a `review overdue` reason.
 
 ## Refresh procedure
 
@@ -162,6 +172,9 @@ Examples include unsafe updates, unstable serialization, or insufficient provena
 An exact identity returns the complete record.
 A relationship question returns a graph path when a path exists.
 A general question runs lexical, semantic, and graph retrieval.
+
+A `no_answer` status still returns ranked best-effort evidence.
+A warning marks that evidence as leads that require verification.
 
 The MCP does not expose provider diagnostics in normal recall results.
 The MCP does not expose full Graphify rebuilds.

@@ -71,7 +71,7 @@ flowchart LR
 | Retrieval-only vaults | Supply additional records without receiving writes. |
 | Memory indexer | Validates records and publishes versioned SQLite snapshots. |
 | SQLite FTS5 | Supplies exact and lexical candidates. |
-| Local semantic index | Supplies paraphrase candidates without an external API. |
+| Local semantic index | Supplies paraphrase candidates with Model2Vec embeddings or a hashed fallback, without an external API. |
 | Graphify adapter | Supplies relationships, neighbors, and paths. |
 | Retrieval engine | Applies scope, RRF fusion, reranking, and context expansion. |
 | MCP facade | Supplies the stable public tools and evidence packets. |

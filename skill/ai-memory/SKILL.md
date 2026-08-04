@@ -113,8 +113,9 @@ For recall requests:
 2. Call `memory_recall` first with source, domain, repository, ticket, project, status, or path scope when known.
 3. Inspect the returned source ID, Markdown path, status, freshness, and provenance.
 4. Prefer an active canonical memory note over legacy session or vault results.
-5. Search canonical Markdown directly when the facade is unavailable, stale, ambiguous, or missing expected results.
-6. State when an answer came only from legacy, stale, or unverified memory.
+5. Treat `no_answer` evidence as unverified leads. Read the cited Markdown before you use a lead, and state when no lead survived verification.
+6. Search canonical Markdown directly when the facade is unavailable, stale, ambiguous, or missing expected results.
+7. State when an answer came only from legacy, stale, or unverified memory.
 
 Do not treat a Graphify node as authority for a write target until the canonical Markdown exists and has been inspected.
 
