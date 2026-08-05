@@ -75,6 +75,12 @@ If the recorded provider is not available, recall disables the semantic signal a
 ### Graphify provider
 
 Graphify supplies graph nodes, edges, neighbors, and paths.
+
+The graph build makes an edge from three sources.
+A `primary_scope` value makes a `belongs-to` edge.
+A frontmatter `related` entry makes a `declared-related` edge.
+A body wikilink makes a `body-link` edge.
+The build reports unresolved and ambiguous link counts separately.
 The repository pins Graphify 0.9.26 in an isolated environment.
 
 The routine refresh builds a Graphify-compatible graph from the current SQLite index.

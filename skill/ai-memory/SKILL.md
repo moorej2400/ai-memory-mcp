@@ -63,10 +63,11 @@ Run this workflow at meaningful checkpoints and before the final response of sub
 4. **Recall memory.** Use `memory_recall` across all configured sources with the narrowest safe scope.
 5. **Inspect canonical Markdown.** Read candidates from their reported source before choosing a write action.
 6. **Choose one action.** Update, create, merge, mark `needs-review`, supersede, route to `custom-skills-master`, retain session-only, or skip with a reason.
-7. **Write a small verified batch.** Apply concise Markdown changes and preserve identity, provenance, links, and predecessor state.
-8. **Update navigation surfaces.** Touch only the relevant anchor, map, review queue, conflict, or stale-memory index.
-9. **Refresh once.** After the material batch, run the narrow AI-Memory refresh and verify Graphify health.
-10. **Report separate outcomes.** State what was written, merged or superseded, and whether indexing succeeded.
+7. **Find the links.** Before you write, identify the existing notes that give context. Use the step 4 recall results.
+8. **Write a small verified batch.** Apply concise Markdown changes and preserve identity, provenance, links, and predecessor state.
+9. **Update navigation surfaces.** Touch only the relevant anchor, map, review queue, conflict, or stale-memory index.
+10. **Refresh once.** After the material batch, run the narrow AI-Memory refresh and verify Graphify health.
+11. **Report separate outcomes.** State what was written, merged or superseded, and whether indexing succeeded.
 
 An explicit user request to save memory enters at step 1; it does not bypass search, scope, safety, deduplication, or verification.
 
@@ -128,6 +129,17 @@ Do not treat a Graphify node as authority for a write target until the canonical
 - Keep filename, frontmatter `title`, and H1 aligned for ordinary notes.
 - Keep `_repo.md`, `_ticket.md`, and `_project.md` as structural anchor exceptions.
 - Use `review_after` for information that is likely to change.
+
+Every new note must connect to the memory graph. An isolated note is very difficult to find again.
+
+- Search for related notes before you write. Use the recall results from the capture workflow.
+- Add a `[[Note Title]]` wikilink in the body for each note that gives useful context.
+- Link to the applicable anchor or index note.
+- Use the exact title of the target note. An unknown title makes a broken link. A title that two notes share makes an ambiguous link. The graph build discards both.
+- Add a wikilink in the other note also when the relation is important in both directions.
+- Do not add a link that gives no context. Three good links are better than ten weak links.
+
+The graph build makes an edge from a body wikilink and from a frontmatter `related` entry. Use `related` for the primary relation. Use body wikilinks for context inside the text.
 
 When new verified information conflicts with active memory:
 
@@ -200,6 +212,7 @@ Before considering a memory operation complete, check the relevant cases:
 - **Source safety:** Synchronization does not modify retrieval-only vaults.
 - **Conflict:** Contradictory facts remain linked and reviewable until resolved.
 - **Skill boundary:** Repeatable procedures route to `custom-skills-master`.
+- **Links:** Each new note has at least one link to a related note or to its anchor.
 - **Indexing:** Refresh failure is reported as `saved, not indexed`.
 
 In the final response, summarize only material memory actions and indexing state. If nothing qualified for durable capture, do not invent memory noise.
