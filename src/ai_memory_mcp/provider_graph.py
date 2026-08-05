@@ -10,6 +10,7 @@ from typing import Any
 
 from .config import Settings
 from .index import current_index_path
+from .text import wikilink_targets
 
 
 def _values(raw: str) -> list[str]:
@@ -46,6 +47,28 @@ def _related_keys(value: str) -> list[str]:
     return list(dict.fromkeys(key for key in keys if key))
 
 
+def _resolve_link(
+    value: str,
+    identity_candidates: dict[str, set[str]],
+) -> tuple[str | None, str]:
+    """Resolve one link target to a memory_id.
+
+    Separating "no such note" from "several notes match" matters: the first is
+    a broken link the author can fix, the second needs a disambiguating title.
+    """
+    candidates: set[str] = set()
+    for key in _related_keys(value):
+        matches = identity_candidates.get(key, set())
+        if len(matches) == 1:
+            return next(iter(matches)), "resolved"
+        candidates.update(matches)
+    if not candidates:
+        return None, "unresolved"
+    if len(candidates) > 1:
+        return None, "ambiguous"
+    return next(iter(candidates)), "resolved"
+
+
 def build_provider_graph(
     settings: Settings,
     output_dir: Path,
@@ -62,7 +85,7 @@ def build_provider_graph(
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """
-            SELECT memory_id, source_id, path, title, status, root_scope,
+            SELECT memory_id, source_id, path, title, body, status, root_scope,
                    scope_kind, scope_id, related_json, identifiers_json,
                    projects_json, repos_json, tools_json, content_hash, mtime_ns
             FROM documents
@@ -156,6 +179,43 @@ def build_provider_graph(
                 }
             )
 
+    # Second pass: body wikilinks. It runs after every frontmatter edge exists
+    # so a body link never duplicates a pair already joined by `related`.
+    body_links = 0
+    unresolved_body_links = 0
+    ambiguous_body_links = 0
+    for row in rows:
+        node_id = node_id_by_memory[str(row["memory_id"])]
+        source_file = str(row["path"]).replace("\\", "/")
+        for target in dict.fromkeys(wikilink_targets([str(row["body"])])):
+            target_memory_id, state = _resolve_link(target, identity_candidates)
+            if state == "unresolved":
+                unresolved_body_links += 1
+                continue
+            if state == "ambiguous":
+                ambiguous_body_links += 1
+                continue
+            target_id = node_id_by_memory[str(target_memory_id)]
+            if target_id == node_id:
+                continue
+            edge_source_id, edge_target_id = sorted((node_id, target_id))
+            if (edge_source_id, edge_target_id, "declared-related") in edge_keys:
+                continue
+            edge_key = (edge_source_id, edge_target_id, "body-link")
+            if edge_key in edge_keys:
+                continue
+            edge_keys.add(edge_key)
+            body_links += 1
+            links.append(
+                {
+                    "source": edge_source_id,
+                    "target": edge_target_id,
+                    "relation": "body-link",
+                    "confidence": "DECLARED",
+                    "source_file": source_file,
+                }
+            )
+
     for (scope_kind, scope_id), node_id in sorted(scope_nodes.items()):
         nodes.append(
             {
@@ -207,6 +267,9 @@ def build_provider_graph(
         "edges": len(links),
         "scopes": len(scope_nodes),
         "unresolved_related": unresolved_related,
+        "body_links": body_links,
+        "unresolved_body_links": unresolved_body_links,
+        "ambiguous_body_links": ambiguous_body_links,
         "output_dir": str(output_dir),
         "built_at": built_at,
     }
