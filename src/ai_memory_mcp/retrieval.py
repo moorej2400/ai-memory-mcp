@@ -59,6 +59,17 @@ def _parse_utc(value: str) -> datetime | None:
     return parsed
 
 
+def _lexical_score(bm25: float) -> float:
+    """Convert an FTS5 bm25() value into a bounded, higher-is-better score.
+
+    bm25() returns negative values where a more negative value is a better
+    match. Clamping the raw value at zero first (the previous behaviour)
+    collapsed every hit to exactly 1.0 and destroyed the lexical signal.
+    """
+    relevance = max(0.0, -bm25)
+    return relevance / (1.0 + relevance)
+
+
 def _fts_expression(query: str) -> str:
     terms = list(dict.fromkeys(tokenize(query)))
     if not terms:
@@ -163,7 +174,7 @@ class RetrievalEngine:
                 [_fts_expression(query), *parameters, limit],
             ).fetchall()
         return [
-            _row_hit(row, 1.0 / (1.0 + max(0.0, row["lexical_score"])), "lexical", rank)
+            _row_hit(row, _lexical_score(row["lexical_score"]), "lexical", rank)
             for rank, row in enumerate(rows, 1)
         ]
 
