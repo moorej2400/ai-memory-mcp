@@ -159,6 +159,15 @@ Every durable note must meet these goals:
 - Make the note self-sufficient. A future agent must get the answer from this note without the source conversation.
 - Keep the note as short as the fact permits. Record detail that changes the outcome. Do not record narrative that does not.
 
+### Searchable Terms
+
+Retrieval is lexical first. A word that is not in the note cannot match a query. The index extracts identifiers from the note text automatically. There is no separate keyword field.
+
+- Name each system, tool, and product with its real name. Add the alternate names that people use for it.
+- Include exact strings verbatim: commands, URLs, hostnames, settings, error text, and ticket identifiers.
+- Write the fact with the words a future question will use. State a procedure as the user would ask for it.
+- Do not hide a key term behind a paraphrase. A note that only says "the log console" cannot answer a query that uses the product name.
+
 ## Sessions and Handoffs
 
 Treat sessions and handoffs as optional scoped context, not the default destination for every task.
@@ -225,6 +234,7 @@ Before considering a memory operation complete, check the relevant cases:
 - **Skill boundary:** Repeatable procedures route to `custom-skills-master`.
 - **Links:** Each new note has at least one link to a related note or to its anchor.
 - **Summary:** Each new note starts with a summary that can stand alone as the answer.
+- **Searchable terms:** Each new note contains the names, aliases, and exact strings a future query will use.
 - **Indexing:** Refresh failure is reported as `saved, not indexed`.
 
 In the final response, summarize only material memory actions and indexing state. If nothing qualified for durable capture, do not invent memory noise.

@@ -116,6 +116,14 @@ superseded_by: null
 
 For ordinary notes, keep the filename, `title`, and H1 aligned. Assign exactly one primary scope and link upward to the applicable anchor or index.
 
+### Identifier Extraction
+
+The full-text index contains the `title`, the headings, the body text, and the extracted identifiers. It does not contain the other frontmatter fields. A term in `related_tools` or `related_projects` alone is not searchable.
+
+The index extracts identifiers from the complete file automatically. It finds ticket identifiers, pull-request references, and file paths. The frontmatter has no separate keyword field.
+
+Write each name, alias, and exact string into the title, a heading, or the body.
+
 ## Session and Handoff Additions
 
 For `type: ai-session`, add stable `session_id` and concise source-thread metadata when available. Preserve only useful sections such as:
