@@ -4,6 +4,7 @@ graphify-out/
 /logs/
 .migration-archive/
 .env
+/local.agents.md
 .coverage
 build/
 dist/
