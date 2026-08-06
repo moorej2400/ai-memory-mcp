@@ -64,7 +64,7 @@ Run this workflow at meaningful checkpoints and before the final response of sub
 5. **Inspect canonical Markdown.** Read candidates from their reported source before choosing a write action.
 6. **Choose one action.** Update, create, merge, mark `needs-review`, supersede, route to `custom-skills-master`, retain session-only, or skip with a reason.
 7. **Find the links.** Before you write, identify the existing notes that give context. Use the step 4 recall results.
-8. **Write a small verified batch.** Apply concise Markdown changes and preserve identity, provenance, links, and predecessor state.
+8. **Write a small verified batch.** Apply concise Markdown changes that meet the note content rules. Preserve identity, provenance, links, and predecessor state.
 9. **Update navigation surfaces.** Touch only the relevant anchor, map, review queue, conflict, or stale-memory index.
 10. **Refresh once.** After the material batch, run the narrow AI-Memory refresh and verify Graphify health.
 11. **Report separate outcomes.** State what was written, merged or superseded, and whether indexing succeeded.
@@ -148,6 +148,17 @@ When new verified information conflicts with active memory:
 3. After resolution, mark the predecessor `superseded` and set reciprocal `supersedes` and `superseded_by` links.
 4. Keep the predecessor readable; never erase it during normal consolidation.
 
+## Note Content
+
+Choose the format that fits the material. Use prose, lists, tables, or code blocks as the content requires. Do not force one template onto every note.
+
+Every durable note must meet these goals:
+
+- Start the body with a summary of one to three sentences. A reader who stops after the summary must still get the core fact.
+- Put the detail after the summary. Include the steps, values, and background that make the fact usable.
+- Make the note self-sufficient. A future agent must get the answer from this note without the source conversation.
+- Keep the note as short as the fact permits. Record detail that changes the outcome. Do not record narrative that does not.
+
 ## Sessions and Handoffs
 
 Treat sessions and handoffs as optional scoped context, not the default destination for every task.
@@ -213,6 +224,7 @@ Before considering a memory operation complete, check the relevant cases:
 - **Conflict:** Contradictory facts remain linked and reviewable until resolved.
 - **Skill boundary:** Repeatable procedures route to `custom-skills-master`.
 - **Links:** Each new note has at least one link to a related note or to its anchor.
+- **Summary:** Each new note starts with a summary that can stand alone as the answer.
 - **Indexing:** Refresh failure is reported as `saved, not indexed`.
 
 In the final response, summarize only material memory actions and indexing state. If nothing qualified for durable capture, do not invent memory noise.
