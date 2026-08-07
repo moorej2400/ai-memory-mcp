@@ -62,7 +62,7 @@ Run this workflow at meaningful checkpoints and before the final response of sub
 3. **Choose one primary scope.** Use repository, ticket, project, area, tool, person, decision, reference, or session-only.
 4. **Recall memory.** Use `memory_recall` across all configured sources with the narrowest safe scope.
 5. **Inspect canonical Markdown.** Read candidates from their reported source before choosing a write action.
-6. **Choose one action.** Update, create, merge, mark `needs-review`, supersede, route to `custom-skills-master`, retain session-only, or skip with a reason.
+6. **Choose one action.** Update, create, enrich, merge, mark `needs-review`, supersede, route to `custom-skills-master`, retain session-only, or skip with a reason.
 7. **Find the links.** Before you write, identify the existing notes that give context. Use the step 4 recall results.
 8. **Write a small verified batch.** Apply concise Markdown changes that meet the note content rules. Preserve identity, provenance, links, and predecessor state.
 9. **Update navigation surfaces.** Touch only the relevant anchor, map, review queue, conflict, or stale-memory index.
@@ -89,6 +89,35 @@ Use the primary scope, entity, and property as the claim identity.
 - Preserve the prior value in provenance or concise change history when it remains useful.
 - If the prior value has a separate record, mark that record `superseded` and link both records.
 - If authoritative sources conflict, preserve both claims and mark them `needs-review`.
+
+## Enrich Existing Notes
+
+`Refresh Existing Facts` applies when a value changes. This section applies when the fact stays correct, but the note was difficult to find or incomplete. Enrich automatically. Do not wait for a request.
+
+Enrich when one of these occurs:
+
+- Recall returned `no_answer`, and you then found the answer by a direct search.
+- You needed more than one query to find the note.
+- The note answered only part of the question.
+- You found a related note that this note does not link to.
+
+Make the smallest change that closes the gap:
+
+- Add the words of the query that worked. Add the names and aliases that were absent.
+- Add the missing detail below the summary.
+- Add the missing link.
+- Set `updated` to the current date. A term change is material because it changes retrieval.
+
+If the answer is only in a source vault, write a new note in the primary vault. Put the source path in `provenance`. Never edit a source vault.
+
+### Enrichment Guardrails
+
+- Enrich only after you used the note and found a specific gap.
+- Do not rewrite text that works. Do not enrich for style.
+- Keep the summary short. Put new detail after it.
+- Do not add a term that the note content does not support.
+- Do not create a second note for a fact that an existing note holds.
+- Refresh the index after the batch. An unindexed change does not help the next agent.
 
 ## Route Storage
 
@@ -235,6 +264,7 @@ Before considering a memory operation complete, check the relevant cases:
 - **Links:** Each new note has at least one link to a related note or to its anchor.
 - **Summary:** Each new note starts with a summary that can stand alone as the answer.
 - **Searchable terms:** Each new note contains the names, aliases, and exact strings a future query will use.
+- **Enrichment:** A note that was difficult to find gets the missing terms, detail, or links.
 - **Indexing:** Refresh failure is reported as `saved, not indexed`.
 
 In the final response, summarize only material memory actions and indexing state. If nothing qualified for durable capture, do not invent memory noise.
