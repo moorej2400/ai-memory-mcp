@@ -225,6 +225,10 @@ class Settings:
         return self.state_dir / "current-index.json"
 
     @property
+    def artifact_pointer_path(self) -> Path:
+        return self.state_dir / "current-artifact-index.json"
+
+    @property
     def resolved_log_dir(self) -> Path:
         return self.log_dir or self.state_dir / "logs"
 

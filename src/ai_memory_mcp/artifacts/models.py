@@ -244,3 +244,47 @@ class DistillationCandidate(StrictModel):
     latest_event_id: str
     source_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     status: DistillationStatus = "pending"
+
+
+class ArtifactBurstRecord(StrictModel):
+    artifact_id: str
+    artifact_uri: str
+    parent_artifact_id: str
+    parent_title: str = ""
+    source: str
+    source_instance: str
+    entity: ArtifactEntity
+    author_id: str = ""
+    author_name: str = ""
+    participant_names: tuple[str, ...] = ()
+    occurred_at: datetime
+    text: str
+    classification: str = ""
+    reactions: tuple[str, ...] = ()
+    attachment_link: bool = False
+    deleted: bool = False
+    redacted: bool = False
+
+
+class ArtifactBurst(StrictModel):
+    burst_id: str
+    source: str
+    source_instance: str
+    entity: ArtifactEntity
+    parent_artifact_id: str
+    parent_title: str = ""
+    author_id: str = ""
+    author_name: str = ""
+    first_artifact_uri: str
+    last_artifact_uri: str
+    started_at: datetime
+    ended_at: datetime
+    record_count: int = Field(ge=1, le=8)
+    text: str
+    embed: bool
+
+
+class ArtifactVectorSearchResult(StrictModel):
+    hits: list[ArtifactSearchHit] = Field(default_factory=list)
+    available: bool = False
+    stale: bool = False

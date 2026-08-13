@@ -245,6 +245,7 @@ class MemoryService:
 
         artifact_hits = []
         artifact_warning: str | None = None
+        artifact_semantic_warning: str | None = None
         use_artifacts = not markdown_filters or artifact_filters
         if use_artifacts and artifact_available:
             artifact_scope = ArtifactScope(
@@ -259,6 +260,20 @@ class MemoryService:
                 artifact_scope,
                 limit=max(40, requested_limit * 8),
             )
+            from .artifacts.vector_index import search_artifact_vectors
+
+            semantic = search_artifact_vectors(
+                self.settings,
+                query,
+                artifact_scope,
+                limit=max(40, requested_limit * 8),
+            )
+            artifact_hits.extend(semantic.hits)
+            if semantic.stale:
+                artifact_semantic_warning = (
+                    "Artifact semantic index is stale. Raw artifact search "
+                    "remains available."
+                )
         elif artifact_filters and not artifact_available:
             artifact_warning = "Artifact database is not available for this filter."
 
@@ -271,6 +286,8 @@ class MemoryService:
                 )
             if artifact_warning:
                 warnings.append(artifact_warning)
+            if artifact_semantic_warning:
+                warnings.append(artifact_semantic_warning)
             return (
                 RecallResponse(
                     status="no_answer",
@@ -335,6 +352,8 @@ class MemoryService:
         )
         if artifact_warning:
             response.warnings.append(artifact_warning)
+        if artifact_semantic_warning:
+            response.warnings.append(artifact_semantic_warning)
         return response, diagnostics
 
     def _packet_response(
@@ -484,11 +503,29 @@ class MemoryService:
         )
 
     def sync(self) -> SyncResponse:
-        indexed = build_index(self.settings, force=False)
-        self._engine = RetrievalEngine(self.settings)
+        from .artifacts.vector_index import build_artifact_vector_index
+
+        index_result = None
+        artifact_result = None
+        errors: list[str] = []
+        try:
+            indexed = build_index(self.settings, force=False)
+            index_result = SyncIndexResult.model_validate(indexed)
+            self._engine = RetrievalEngine(self.settings)
+        except Exception as exc:
+            errors.append(f"Markdown index: {type(exc).__name__}: {exc}")
+        if self.settings.artifact_db.is_file():
+            try:
+                artifact_result = build_artifact_vector_index(self.settings)
+            except Exception as exc:
+                errors.append(
+                    f"Artifact index: {type(exc).__name__}: {exc}"
+                )
         return SyncResponse(
-            ok=True,
-            index=SyncIndexResult.model_validate(indexed),
+            ok=index_result is not None or artifact_result is not None,
+            index=index_result,
+            artifact_index=artifact_result,
+            errors=errors,
         )
 
     def status(self) -> StatusResponse:

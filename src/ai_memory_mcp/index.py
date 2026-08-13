@@ -138,7 +138,7 @@ def _insert_document(
                 chunk.heading,
                 chunk.ordinal,
                 chunk.text,
-                _encode_vector(chunk.vector),
+                encode_vector(chunk.vector),
             ),
         )
         connection.execute(
@@ -153,14 +153,14 @@ def _insert_document(
         )
 
 
-def _encode_vector(vector: dict[int, float]) -> bytes:
+def encode_vector(vector: dict[int, float]) -> bytes:
     return b"".join(
         _VECTOR_ITEM.pack(index, value)
         for index, value in sorted(vector.items())
     )
 
 
-def _decode_vector(payload: bytes) -> dict[int, float]:
+def decode_vector(payload: bytes) -> dict[int, float]:
     if len(payload) % _VECTOR_ITEM.size:
         raise ValueError("Stored semantic vector has an invalid byte length.")
     return {
@@ -653,7 +653,7 @@ class MemoryIndex:
                 parameters,
             ).fetchall()
         decoded = [
-            (row, _decode_vector(row["vector_blob"]))
+            (row, decode_vector(row["vector_blob"]))
             for row in rows
         ]
         # A published snapshot is immutable, so decoded vectors remain valid

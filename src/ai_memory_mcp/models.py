@@ -167,9 +167,23 @@ class SyncIndexResult(StrictOutput):
     elapsed_ms: float = Field(ge=0.0)
 
 
+class ArtifactIndexResult(StrictOutput):
+    snapshot: str
+    change_counter: int = Field(ge=0)
+    bursts: int = Field(ge=0)
+    embedded_bursts: int = Field(ge=0)
+    embedding_provider: str
+    embedding_model: str
+    embedding_fingerprint: str
+    unchanged: bool = False
+    elapsed_ms: float = Field(ge=0.0)
+
+
 class SyncResponse(StrictOutput):
     ok: bool
-    index: SyncIndexResult
+    index: SyncIndexResult | None = None
+    artifact_index: ArtifactIndexResult | None = None
+    errors: list[str] = Field(default_factory=list)
 
 
 class CanonicalMemoryStatus(StrictOutput):
