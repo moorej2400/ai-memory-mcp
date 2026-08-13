@@ -176,6 +176,58 @@ After approval, move obsolete outputs to a recoverable archive.
 Do not automate the archive move.
 Do not delete the legacy database or notes.
 
+## Switch a provider pipeline
+
+Use one complete JSONL batch as the handoff boundary.
+Keep provider state separate from the canonical artifact database.
+
+Before the switch, create a verified artifact backup.
+Before the switch, complete the legacy migration dry run.
+
+1. Run the provider fetch.
+2. Publish one complete JSONL batch.
+3. Ingest the batch with `ai-memory-artifact ingest`.
+4. Save the intake receipt outside the repository.
+5. If message or cue data changed, run `memory_sync`.
+6. Queue agent distillation for pending meetings and conversations.
+
+Do not use the intake receipt as a provider cursor.
+Do not point the provider at the canonical artifact database.
+Keep the old scheduled process available for rollback.
+
+Test one provider batch before the scheduled switch.
+Verify that the receipt has no conflict.
+Verify that raw search returns the expected text.
+Verify that artifact read returns ordered context.
+Verify that each new meeting enters the pending queue.
+Verify that Markdown does not contain a full transcript.
+
+Run one bounded reconciliation after the scheduled switch.
+Stop the cutover if the provider reports incomplete coverage as complete.
+Check each expected tombstone and unchanged record.
+
+After all checks pass, request approval for the archive move.
+Move legacy outputs only after approval.
+Keep the archive recoverable.
+
+## Validate artifact performance
+
+Run the synthetic artifact benchmark on macOS or Linux:
+
+```bash
+PYTHONPATH=src ./.venv/bin/python benchmarks/artifacts/generate_fixture.py
+```
+
+Run the frozen retrieval benchmark:
+
+```bash
+./.venv/bin/ai-memory-benchmark --label artifact-store-validation
+```
+
+The artifact benchmark writes generated data under the ignored `benchmarks/runs/` directory.
+The benchmark does not use live messages, meetings, or memory notes.
+Do not use one benchmark run as a strict performance limit.
+
 ## Run the MCP server
 
 Use the standard input and output transport for local agents:
