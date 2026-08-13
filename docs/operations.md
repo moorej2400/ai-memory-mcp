@@ -29,6 +29,62 @@ The command skips publication when no Markdown file changed.
 Concurrent commands wait for the current index publisher.
 The default wait limit is 300 seconds.
 
+## Manage raw artifacts
+
+Put the artifact database and object directory on local storage.
+Do not put the active SQLite database on a network file system.
+
+Ingest one complete JSONL batch:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe ingest --input batch.jsonl
+```
+
+```bash
+./.venv/bin/ai-memory-artifact ingest --input batch.jsonl
+```
+
+Use `--input -` to read the complete batch from standard input.
+The command validates the complete batch before it changes SQLite.
+The intake receipt confirms storage only.
+The receipt is not a provider cursor.
+
+Check the database status:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe status
+```
+
+```bash
+./.venv/bin/ai-memory-artifact status
+```
+
+Search active raw artifacts:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe search --query "rotation procedure" --source chat-source
+```
+
+```bash
+./.venv/bin/ai-memory-artifact search --query "rotation procedure" --source chat-source
+```
+
+Read ordered context from one stable citation:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe read --reference artifact://message/<artifact-id> --limit 20
+```
+
+```bash
+./.venv/bin/ai-memory-artifact read --reference artifact://message/<artifact-id> --limit 20
+```
+
+Use `pending` to list artifacts that need Markdown distillation.
+Use `mark-distilled` after you validate the current Markdown note.
+Use `mark-no-durable-memory` only for a reviewed conversation.
+Use `backup` to create a consistent SQLite and object manifest backup.
+Use `migrate-legacy` to stage a supported legacy import.
+
 ## Run the MCP server
 
 Use the standard input and output transport for local agents:

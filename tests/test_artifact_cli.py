@@ -1,0 +1,162 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from ai_memory_mcp.artifacts.cli import main
+
+
+def _configure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("AI_MEMORY_WORK_DIR", str(tmp_path / "vault"))
+    monkeypatch.setenv("AI_MEMORY_MCP_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("AI_MEMORY_ARTIFACT_DB", str(tmp_path / "artifacts.sqlite3"))
+    monkeypatch.setenv(
+        "AI_MEMORY_ARTIFACT_OBJECTS_DIR",
+        str(tmp_path / "objects"),
+    )
+    monkeypatch.setenv(
+        "AI_MEMORY_ARTIFACT_BACKUP_DIR",
+        str(tmp_path / "backups"),
+    )
+
+
+def _batch_file(tmp_path: Path) -> Path:
+    records = [
+        {
+            "schema": "ai-memory/artifact-batch@1",
+            "record": "batch",
+            "batch_id": "cli-batch-1",
+            "source": "chat-source",
+            "source_instance": "workspace",
+            "observed_at": "2026-01-02T12:00:00Z",
+            "event_count": 2,
+        },
+        {
+            "schema": "ai-memory/artifact-event@1",
+            "record": "event",
+            "entity": "conversation",
+            "operation": "upsert",
+            "external_id": "conversation-1",
+            "source_updated_at": "2026-01-02T10:00:00Z",
+            "payload": {
+                "title": "Example conversation",
+                "occurred_at": "2026-01-02T10:00:00Z",
+                "text": "Rotation discussion",
+                "content_format": "plain",
+            },
+        },
+        {
+            "schema": "ai-memory/artifact-event@1",
+            "record": "event",
+            "entity": "message",
+            "operation": "upsert",
+            "external_id": "message-1",
+            "parent": {
+                "entity": "conversation",
+                "external_id": "conversation-1",
+            },
+            "source_updated_at": "2026-01-02T10:05:00Z",
+            "payload": {
+                "occurred_at": "2026-01-02T10:05:00Z",
+                "text": "Use the documented rotation procedure.",
+                "content_format": "plain",
+            },
+        },
+    ]
+    path = tmp_path / "batch.jsonl"
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _one_json(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    lines = captured.out.splitlines()
+    assert len(lines) == 1
+    value = json.loads(lines[0])
+    assert isinstance(value, dict)
+    return value
+
+
+def test_ingest_status_search_and_read_write_json_objects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    batch_path = _batch_file(tmp_path)
+
+    assert main(["ingest", "--input", str(batch_path)]) == 0
+    receipt = _one_json(capsys)
+    assert receipt["accepted"] == 2
+
+    assert main(["status"]) == 0
+    status = _one_json(capsys)
+    assert status["available"] is True
+    assert status["schema_version"] == 1
+    assert status["artifacts"] == 2
+    assert status["active_artifacts"] == 2
+    assert status["batches"] == 1
+
+    assert main(
+        [
+            "search",
+            "--query",
+            "documented procedure",
+            "--source",
+            "chat-source",
+            "--entity",
+            "message",
+        ]
+    ) == 0
+    search = _one_json(capsys)
+    assert len(search["results"]) == 1
+    reference = search["results"][0]["artifact_uri"]
+
+    assert main(["read", "--reference", reference, "--limit", "20"]) == 0
+    read = _one_json(capsys)
+    assert read["focus"] == reference
+    assert read["records"][0]["text"].startswith("Use the documented")
+
+
+def test_validation_error_uses_stderr_and_exit_code_two(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    invalid = tmp_path / "invalid.jsonl"
+    invalid.write_text("not JSON\n", encoding="utf-8")
+    assert main(["ingest", "--input", str(invalid)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "invalid JSON" in captured.err
+
+
+def test_intake_failure_uses_stderr_and_exit_code_one(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    batch_path = _batch_file(tmp_path)
+    assert main(["ingest", "--input", str(batch_path)]) == 0
+    capsys.readouterr()
+
+    text = batch_path.read_text(encoding="utf-8")
+    batch_path.write_text(
+        text.replace("documented", "approved"),
+        encoding="utf-8",
+    )
+    assert main(["ingest", "--input", str(batch_path)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "batch ID" in captured.err

@@ -24,6 +24,7 @@ Documentation = "docs/architecture.md"
 ai-memory-mcp = "ai_memory_mcp.server:main"
 ai-memory-index = "ai_memory_mcp.cli:index_main"
 ai-memory-benchmark = "ai_memory_mcp.benchmark:main"
+ai-memory-artifact = "ai_memory_mcp.artifacts.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ai_memory_mcp"]
