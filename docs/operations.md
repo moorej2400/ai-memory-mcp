@@ -134,6 +134,8 @@ Keep the source backup until the restored database passes operational checks.
 
 Keep each legacy source active until all verification checks pass.
 The migration opens the legacy SQLite database in read-only mode.
+The migration creates a stable logical snapshot with the SQLite backup API.
+The snapshot includes committed WAL data.
 The migration does not change the database or Markdown notes.
 
 Run a dry-run check on Windows:
@@ -149,6 +151,7 @@ Run a dry-run check on macOS or Linux:
 ```
 
 Check the reported counts and unresolved identities.
+The `database_sha256` value identifies the logical database snapshot.
 Stop the import if a required count is incorrect.
 
 Import the checked sources on Windows:
