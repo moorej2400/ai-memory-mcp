@@ -137,10 +137,34 @@ class ArtifactSearch:
             ).fetchall()
         return [self._search_hit(row) for row in rows]
 
+    def get(self, reference: str) -> ArtifactSearchHit:
+        """Return one exact active artifact for internal identity routing."""
+        entity, artifact_value = parse_artifact_uri(reference)
+        with connect_artifact_db(
+            self.settings.artifact_db,
+            read_only=True,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM artifacts
+                WHERE artifact_id = ? AND entity = ?
+                  AND deleted_at IS NULL AND redacted_at IS NULL
+                """,
+                (artifact_value, entity),
+            ).fetchone()
+        if row is None:
+            raise KeyError("The artifact reference does not exist or is inactive.")
+        return self._search_hit(row, score=1.0)
+
     @staticmethod
-    def _search_hit(row: sqlite3.Row) -> ArtifactSearchHit:
-        relevance = max(0.0, -float(row["lexical_score"]))
-        score = relevance / (1.0 + relevance)
+    def _search_hit(
+        row: sqlite3.Row,
+        *,
+        score: float | None = None,
+    ) -> ArtifactSearchHit:
+        if score is None:
+            relevance = max(0.0, -float(row["lexical_score"]))
+            score = relevance / (1.0 + relevance)
         return ArtifactSearchHit(
             artifact_id=str(row["artifact_id"]),
             artifact_uri=artifact_uri(
@@ -150,6 +174,7 @@ class ArtifactSearch:
             entity=str(row["entity"]),
             source=str(row["source"]),
             source_instance=str(row["source_instance"]),
+            external_id=str(row["external_id"]),
             title=str(row["title"]),
             text=str(row["text_content"])[:5000],
             author_name=str(row["author_name"]),
@@ -171,7 +196,7 @@ class ArtifactSearch:
             raise ValueError("The artifact read direction is invalid.")
         if limit <= 0:
             raise ValueError("The artifact read limit must be positive.")
-        limit = min(limit, 100)
+        limit = min(limit, 200)
         entity, artifact_value = parse_artifact_uri(reference)
         with connect_artifact_db(
             self.settings.artifact_db,

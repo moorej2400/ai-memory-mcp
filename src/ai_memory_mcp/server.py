@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+from datetime import datetime
 from typing import Annotated, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from .artifacts.models import ArtifactReadResponse
 from .config import Settings
 from .models import RecallResponse, StatusResponse, SyncResponse
 from .service import MemoryService
@@ -34,7 +36,8 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         "ai-memory",
         instructions=(
             "Use memory_recall for all memory retrieval. The server selects exact, "
-            "search, neighbor, and relationship behavior. Use memory_sync after "
+            "search, raw-artifact, neighbor, and relationship behavior. Use "
+            "memory_artifact_read for ordered raw context. Use memory_sync after "
             "canonical Markdown changes. Use memory_status for diagnostics."
         ),
         host=settings.host,
@@ -109,6 +112,41 @@ def create_server(settings: Settings | None = None) -> FastMCP:
                 description="Optional canonical path prefix.",
             ),
         ] = None,
+        source_label: Annotated[
+            str | None,
+            Field(
+                pattern=r"^[a-z][a-z0-9-]{0,62}$",
+                description="Optional raw artifact connector label.",
+            ),
+        ] = None,
+        source_instance: Annotated[
+            str | None,
+            Field(
+                pattern=r"^[a-z][a-z0-9-]{0,62}$",
+                description="Optional raw artifact connector instance.",
+            ),
+        ] = None,
+        artifact_kind: Annotated[
+            Literal[
+                "conversation",
+                "message",
+                "meeting",
+                "recording",
+                "transcript",
+                "transcript-cue",
+                "attachment",
+            ]
+            | None,
+            Field(description="Optional raw artifact entity kind."),
+        ] = None,
+        date_from: Annotated[
+            datetime | None,
+            Field(description="Optional earliest raw artifact time."),
+        ] = None,
+        date_to: Annotated[
+            datetime | None,
+            Field(description="Optional latest raw artifact time."),
+        ] = None,
         limit: Annotated[
             int,
             Field(
@@ -128,7 +166,64 @@ def create_server(settings: Settings | None = None) -> FastMCP:
             ticket=ticket,
             status=status,
             path_prefix=path_prefix,
+            source_label=source_label,
+            source_instance=source_instance,
+            artifact_kind=artifact_kind,
+            date_from=date_from,
+            date_to=date_to,
             limit=limit,
+        )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+        structured_output=True,
+    )
+    def memory_artifact_read(
+        reference: Annotated[
+            str,
+            Field(
+                min_length=1,
+                max_length=200,
+                description="Exact artifact URI.",
+            ),
+        ],
+        cursor: Annotated[
+            str | None,
+            Field(
+                min_length=1,
+                max_length=500,
+                description="Optional opaque keyset cursor.",
+            ),
+        ] = None,
+        direction: Annotated[
+            Literal["before", "after", "around"],
+            Field(description="Context direction."),
+        ] = "around",
+        limit: Annotated[
+            int,
+            Field(
+                ge=1,
+                le=200,
+                description="Maximum ordered artifact records.",
+            ),
+        ] = 50,
+        include_payload: Annotated[
+            bool,
+            Field(description="Return the exact focus payload only."),
+        ] = False,
+    ) -> ArtifactReadResponse:
+        """Read ordered raw context from one stable artifact citation."""
+        return service.artifact_read(
+            reference,
+            cursor=cursor,
+            direction=direction,
+            limit=limit,
+            include_payload=include_payload,
         )
 
     @mcp.tool(

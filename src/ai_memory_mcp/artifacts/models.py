@@ -188,6 +188,7 @@ class ArtifactSearchHit(StrictModel):
     entity: ArtifactEntity
     source: str
     source_instance: str
+    external_id: str = ""
     title: str = ""
     text: str = ""
     author_name: str = ""

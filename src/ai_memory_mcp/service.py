@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import hashlib
 import json
 import platform
 import time
@@ -8,12 +9,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .artifacts.identity import parse_artifact_uri
+from .artifacts.models import ArtifactReadResponse, ArtifactScope
+from .artifacts.schema import (
+    artifact_database_status,
+    connect_artifact_db,
+)
+from .artifacts.search import ArtifactSearch
 from .audit import append_event, logging_status
 from .config import Settings
 from .graphify import GraphifyAdapter
 from .index import MemoryIndex, build_index, current_index_path
 from .models import (
     CanonicalMemoryStatus,
+    ArtifactDatabaseStatus,
     GraphifyRuntimeStatus,
     GraphifyStatus,
     IndexStatus,
@@ -35,7 +44,11 @@ from .platform_paths import (
     venv_python,
     venv_site_packages,
 )
-from .retrieval import RetrievalEngine
+from .retrieval import (
+    RAW_ARTIFACT_WARNING,
+    RetrievalEngine,
+    merge_artifact_evidence,
+)
 from .text import tokenize
 
 RELATIONSHIP_TERMS = {
@@ -71,6 +84,11 @@ class MemoryService:
         ticket: str | None = None,
         status: str = "active",
         path_prefix: str | None = None,
+        source_label: str | None = None,
+        source_instance: str | None = None,
+        artifact_kind: str | None = None,
+        date_from: str | datetime | None = None,
+        date_to: str | datetime | None = None,
         limit: int | None = None,
     ) -> RecallResponse:
         started = time.perf_counter()
@@ -82,6 +100,11 @@ class MemoryService:
             "ticket": ticket,
             "status": status,
             "path_prefix": path_prefix,
+            "source_label": source_label,
+            "source_instance": source_instance,
+            "artifact_kind": artifact_kind,
+            "date_from": date_from,
+            "date_to": date_to,
             "limit": limit,
         }
         try:
@@ -94,6 +117,11 @@ class MemoryService:
                 ticket=ticket,
                 status=status,
                 path_prefix=path_prefix,
+                source_label=source_label,
+                source_instance=source_instance,
+                artifact_kind=artifact_kind,
+                date_from=date_from,
+                date_to=date_to,
                 limit=limit,
             )
         except Exception as exc:
@@ -113,19 +141,20 @@ class MemoryService:
                 },
             )
             raise
+        audit_query, audit_response = self._audit_recall_payload(query, response)
         append_event(
             self.settings,
             "retrieval",
             "retrieval_completed",
             {
-                "query": query,
+                **audit_query,
                 "scope": scope_payload,
                 "elapsed_ms": round(
                     (time.perf_counter() - started) * 1000,
                     3,
                 ),
                 "diagnostics": diagnostics,
-                "response": response.model_dump(mode="json"),
+                "response": audit_response,
             },
         )
         return response
@@ -141,11 +170,17 @@ class MemoryService:
         ticket: str | None = None,
         status: str = "active",
         path_prefix: str | None = None,
+        source_label: str | None = None,
+        source_instance: str | None = None,
+        artifact_kind: str | None = None,
+        date_from: str | datetime | None = None,
+        date_to: str | datetime | None = None,
         limit: int | None = None,
     ) -> tuple[RecallResponse, dict[str, Any]]:
         query = query.strip()
         if not query:
             raise ValueError("Query must not be empty.")
+        requested_limit = max(1, min(limit or self.settings.result_limit, 20))
         scope = ScopeFilter(
             source_id=source_id,
             root_scope=root_scope,
@@ -155,44 +190,162 @@ class MemoryService:
             status=status,
             path_prefix=path_prefix,
         )
-        if current_index_path(self.settings) is None:
+        artifact_filters = any(
+            value is not None
+            for value in (
+                source_label,
+                source_instance,
+                artifact_kind,
+                date_from,
+                date_to,
+            )
+        )
+        markdown_filters = any(
+            value is not None
+            for value in (
+                source_id,
+                root_scope,
+                repository,
+                project,
+                ticket,
+                path_prefix,
+            )
+        ) or status != "active"
+        artifact_available = self.settings.artifact_db.is_file()
+        index_available = current_index_path(self.settings) is not None
+
+        if query.startswith("artifact://"):
+            parse_artifact_uri(query)
+            if not artifact_available:
+                return (
+                    RecallResponse(
+                        status="no_answer",
+                        intent="exact",
+                        query=query,
+                        warnings=["Artifact database is not available."],
+                    ),
+                    {"route": "artifact-missing"},
+                )
+            exact_hit = ArtifactSearch(self.settings).get(query)
+            packet = merge_artifact_evidence(
+                query,
+                None,
+                [exact_hit],
+                settings=self.settings,
+                now=datetime.now(timezone.utc),
+                limit=1,
+            )
+            return self._packet_response(
+                query,
+                packet,
+                scope,
+                intent="exact",
+                markdown_used=False,
+            )
+
+        artifact_hits = []
+        artifact_warning: str | None = None
+        use_artifacts = not markdown_filters or artifact_filters
+        if use_artifacts and artifact_available:
+            artifact_scope = ArtifactScope(
+                source=source_label,
+                source_instance=source_instance,
+                entities=(artifact_kind,) if artifact_kind else (),
+                date_from=date_from,
+                date_to=date_to,
+            )
+            artifact_hits = ArtifactSearch(self.settings).search(
+                query,
+                artifact_scope,
+                limit=max(40, requested_limit * 8),
+            )
+        elif artifact_filters and not artifact_available:
+            artifact_warning = "Artifact database is not available for this filter."
+
+        use_markdown = index_available and not artifact_filters
+        if not use_markdown and not artifact_hits:
+            warnings = []
+            if not index_available and not artifact_filters:
+                warnings.append(
+                    "Memory index is not available. Call memory_sync."
+                )
+            if artifact_warning:
+                warnings.append(artifact_warning)
             return (
                 RecallResponse(
                     status="no_answer",
                     intent="search",
                     query=query,
-                    warnings=["Memory index is not available. Call memory_sync."],
+                    warnings=warnings,
                 ),
-                {"route": "no-index"},
+                {"route": "no-provider"},
             )
 
-        exact = self.engine.get(self._identity_candidate(query), scope)
-        if exact["found"]:
-            return (
-                self._exact_response(query, exact["memory"], scope),
-                {
-                    "route": "exact",
-                    "graphify": self.engine.graph.health(),
-                },
-            )
+        if use_markdown:
+            exact = self.engine.get(self._identity_candidate(query), scope)
+            if exact["found"] and not artifact_hits:
+                return (
+                    self._exact_response(query, exact["memory"], scope),
+                    {
+                        "route": "exact",
+                        "graphify": self.engine.graph.health(),
+                    },
+                )
 
-        mentioned = self.engine.mentioned_documents(query, scope, limit=3)
-        if self._is_relationship_query(query) and len(mentioned) >= 2:
-            return (
-                self._relationship_response(
-                    query,
-                    mentioned[0],
-                    mentioned[1],
-                    scope,
-                ),
-                {
-                    "route": "relationship",
-                    "mentioned_documents": len(mentioned),
-                    "graphify": self.engine.graph.health(),
-                },
+            mentioned = self.engine.mentioned_documents(query, scope, limit=3)
+            if (
+                not artifact_hits
+                and self._is_relationship_query(query)
+                and len(mentioned) >= 2
+            ):
+                return (
+                    self._relationship_response(
+                        query,
+                        mentioned[0],
+                        mentioned[1],
+                        scope,
+                    ),
+                    {
+                        "route": "relationship",
+                        "mentioned_documents": len(mentioned),
+                        "graphify": self.engine.graph.health(),
+                    },
+                )
+            markdown_packet = self.engine.search(
+                query,
+                scope=scope,
+                limit=requested_limit,
             )
+        else:
+            markdown_packet = None
+        packet = merge_artifact_evidence(
+            query,
+            markdown_packet,
+            artifact_hits,
+            settings=self.settings,
+            now=datetime.now(timezone.utc),
+            limit=requested_limit,
+        )
+        response, diagnostics = self._packet_response(
+            query,
+            packet,
+            scope,
+            intent="search",
+            markdown_used=markdown_packet is not None,
+        )
+        if artifact_warning:
+            response.warnings.append(artifact_warning)
+        return response, diagnostics
 
-        packet = self.engine.search(query, scope=scope, limit=limit)
+    def _packet_response(
+        self,
+        query: str,
+        packet: Any,
+        scope: ScopeFilter,
+        *,
+        intent: str,
+        markdown_used: bool,
+    ) -> tuple[RecallResponse, dict[str, Any]]:
         evidence = [
             RecallEvidence(
                 memory_id=hit.memory_id,
@@ -201,6 +354,11 @@ class MemoryService:
                 text=hit.text,
                 score=max(0.0, hit.score),
                 reasons=hit.reasons,
+                evidence_class=hit.evidence_class,
+                artifact_uri=hit.artifact_uri,
+                source_label=hit.source_label,
+                source_instance=hit.source_instance,
+                occurred_at=hit.occurred_at,
             )
             for hit in packet.results
         ]
@@ -210,14 +368,32 @@ class MemoryService:
                 source_id=hit.source_id,
                 path=hit.path,
                 title=hit.title,
+                evidence_class=hit.evidence_class,
+                artifact_uri=hit.artifact_uri,
+                source_label=hit.source_label,
+                source_instance=hit.source_instance,
+                occurred_at=hit.occurred_at,
             )
             for hit in packet.results
         ]
-        relationships = self._result_relationships(packet.results, scope)
-        warnings = self._graph_warnings()
-        if self.engine.provider_warning:
+        distilled_hits = [
+            hit for hit in packet.results if hit.evidence_class == "distilled"
+        ]
+        relationships = (
+            self._result_relationships(distilled_hits, scope)
+            if markdown_used and distilled_hits
+            else []
+        )
+        warnings = self._graph_warnings() if markdown_used else []
+        if markdown_used and self.engine.provider_warning:
             warnings.append(self.engine.provider_warning)
-        if packet.answer_status == "no_answer" and evidence:
+        if (
+            packet.answer_status == "no_answer"
+            and evidence
+            and evidence[0].evidence_class in {"raw", "burst"}
+        ):
+            warnings.append(RAW_ARTIFACT_WARNING)
+        elif packet.answer_status == "no_answer" and evidence:
             warnings.append(
                 "No result met the answer threshold. Evidence contains "
                 "best-effort leads only. Verify a lead in its canonical "
@@ -226,7 +402,7 @@ class MemoryService:
         return (
             RecallResponse(
                 status=packet.answer_status,
-                intent="search",
+                intent=intent,
                 query=query,
                 evidence=evidence,
                 citations=citations,
@@ -234,9 +410,77 @@ class MemoryService:
                 warnings=warnings,
             ),
             {
-                "route": "search",
+                "route": "artifact" if not markdown_used else "search",
                 **packet.diagnostics,
             },
+        )
+
+    def artifact_read(
+        self,
+        reference: str,
+        *,
+        cursor: str | None = None,
+        direction: str = "around",
+        limit: int = 50,
+        include_payload: bool = False,
+    ) -> ArtifactReadResponse:
+        parse_artifact_uri(reference)
+        if not self.settings.artifact_db.is_file():
+            raise FileNotFoundError("Artifact database is not available.")
+        return ArtifactSearch(self.settings).read(
+            reference,
+            cursor=cursor,
+            direction=direction,
+            limit=limit,
+            include_payload=include_payload,
+        )
+
+    @staticmethod
+    def _audit_recall_payload(
+        query: str,
+        response: RecallResponse,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        payload = response.model_dump(mode="json")
+        raw_paths: set[str] = set()
+        sanitized: list[dict[str, Any]] = []
+        contains_raw = False
+        for evidence in response.evidence:
+            if evidence.evidence_class == "distilled":
+                sanitized.append(evidence.model_dump(mode="json"))
+                continue
+            contains_raw = True
+            if evidence.artifact_uri:
+                raw_paths.add(evidence.artifact_uri)
+            sanitized.append(
+                {
+                    "artifact_uri": evidence.artifact_uri,
+                    "evidence_class": evidence.evidence_class,
+                    "source_label": evidence.source_label,
+                    "score": evidence.score,
+                    "text_sha256": hashlib.sha256(
+                        evidence.text.encode("utf-8")
+                    ).hexdigest(),
+                    "text_characters": len(evidence.text),
+                }
+            )
+        payload["evidence"] = sanitized
+        if not contains_raw:
+            return {"query": query}, payload
+        payload.pop("query", None)
+        payload["query_sha256"] = hashlib.sha256(query.encode("utf-8")).hexdigest()
+        payload["query_characters"] = len(query)
+        payload["citations"] = [
+            ({"artifact_uri": citation.path}
+             if citation.path in raw_paths
+             else citation.model_dump(mode="json"))
+            for citation in response.citations
+        ]
+        return (
+            {
+                "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+                "query_characters": len(query),
+            },
+            payload,
         )
 
     def sync(self) -> SyncResponse:
@@ -298,8 +542,9 @@ class MemoryService:
             )
         )
         mcp_version = importlib.metadata.version("mcp")
+        artifact_status = self._artifact_status()
         return StatusResponse(
-            ok=index_status.available,
+            ok=index_status.available or artifact_status.available,
             canonical_memory_root=CanonicalMemoryStatus(
                 source_id=self.settings.primary_source_id,
                 path=str(self.settings.memory_root),
@@ -318,6 +563,7 @@ class MemoryService:
                 for source in self.settings.retrieval_sources
             ],
             index=index_status,
+            artifact_database=artifact_status,
             graphify=GraphifyStatus(
                 available=bool(graph_health["available"]),
                 stale=graph_stale,
@@ -340,6 +586,61 @@ class MemoryService:
                 mcp_supported=mcp_version.startswith("1."),
             ),
             checked_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    def _artifact_status(self) -> ArtifactDatabaseStatus:
+        path = self.settings.artifact_db
+        if not path.is_file():
+            return ArtifactDatabaseStatus(
+                available=False,
+                path=str(path),
+                integrity="missing",
+            )
+        try:
+            health = artifact_database_status(self.settings)
+            with connect_artifact_db(path, read_only=True) as connection:
+                artifacts = int(
+                    connection.execute(
+                        "SELECT count(*) FROM artifacts"
+                    ).fetchone()[0]
+                )
+                active = int(
+                    connection.execute(
+                        "SELECT count(*) FROM artifacts "
+                        "WHERE deleted_at IS NULL AND redacted_at IS NULL"
+                    ).fetchone()[0]
+                )
+                batches = int(
+                    connection.execute(
+                        "SELECT count(*) FROM artifact_batches"
+                    ).fetchone()[0]
+                )
+                pending = int(
+                    connection.execute(
+                        "SELECT count(*) FROM distillation_state "
+                        "WHERE status = 'pending'"
+                    ).fetchone()[0]
+                )
+                fts_available = connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'artifacts_fts'"
+                ).fetchone() is not None
+        except Exception as exc:
+            return ArtifactDatabaseStatus(
+                available=False,
+                path=str(path),
+                integrity=f"{type(exc).__name__}: {exc}",
+            )
+        return ArtifactDatabaseStatus(
+            available=health.integrity == "ok",
+            path=str(path),
+            schema_version=health.schema_version,
+            integrity=health.integrity,
+            artifacts=artifacts,
+            active_artifacts=active,
+            batches=batches,
+            fts_available=fts_available,
+            pending_distillations=pending,
         )
 
     @staticmethod

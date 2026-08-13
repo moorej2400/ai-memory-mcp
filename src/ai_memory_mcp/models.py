@@ -67,6 +67,13 @@ class SearchHit:
     signals: dict[str, float] = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
     graph_neighbors: list[str] = field(default_factory=list)
+    evidence_class: Literal["distilled", "raw", "burst"] = "distilled"
+    artifact_uri: str | None = None
+    source_label: str | None = None
+    source_instance: str | None = None
+    occurred_at: str | None = None
+    artifact_kind: str | None = None
+    external_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -101,6 +108,11 @@ class RecallEvidence(StrictOutput):
     text: str
     score: float = Field(ge=0.0)
     reasons: list[str] = Field(default_factory=list)
+    evidence_class: Literal["distilled", "raw", "burst"] = "distilled"
+    artifact_uri: str | None = None
+    source_label: str | None = None
+    source_instance: str | None = None
+    occurred_at: str | None = None
 
 
 class RecallCitation(StrictOutput):
@@ -108,6 +120,11 @@ class RecallCitation(StrictOutput):
     source_id: str
     path: str
     title: str
+    evidence_class: Literal["distilled", "raw", "burst"] = "distilled"
+    artifact_uri: str | None = None
+    source_label: str | None = None
+    source_instance: str | None = None
+    occurred_at: str | None = None
 
 
 class RecallRelationship(StrictOutput):
@@ -177,6 +194,18 @@ class IndexStatus(StrictOutput):
     chunks: int | None = Field(default=None, ge=0)
 
 
+class ArtifactDatabaseStatus(StrictOutput):
+    available: bool
+    path: str
+    schema_version: int | None = None
+    integrity: str | None = None
+    artifacts: int = Field(default=0, ge=0)
+    active_artifacts: int = Field(default=0, ge=0)
+    batches: int = Field(default=0, ge=0)
+    fts_available: bool = False
+    pending_distillations: int = Field(default=0, ge=0)
+
+
 class GraphifyRuntimeStatus(StrictOutput):
     consistent: bool
     expected: str
@@ -227,6 +256,7 @@ class StatusResponse(StrictOutput):
     canonical_memory_root: CanonicalMemoryStatus
     retrieval_sources: list[CanonicalMemoryStatus] = Field(default_factory=list)
     index: IndexStatus
+    artifact_database: ArtifactDatabaseStatus
     graphify: GraphifyStatus
     logging: LoggingStatus
     runtime: RuntimeStatus
