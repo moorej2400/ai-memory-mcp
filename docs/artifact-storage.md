@@ -42,6 +42,11 @@ Use `memory_artifact_read` to read ordered source context around an artifact cit
 Attachment files stay in content-addressed object storage.
 SQLite stores each object hash, media type, size, and relative object path.
 
+Each object uses the path `sha256/<digest-prefix>/<digest>`.
+The intake process verifies the complete SHA-256 digest before publication.
+The intake process copies the file and does not change the provider source file.
+SQLite never stores the local provider source path.
+
 ## Recovery
 
 Create a consistent SQLite backup before each schema migration.

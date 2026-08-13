@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,6 +15,7 @@ from .models import (
     ArtifactPayload,
     ParsedArtifactBatch,
     RedactionPayload,
+    StoredObject,
 )
 from .schema import connect_artifact_db, migrate_artifact_db
 
@@ -60,7 +60,12 @@ def _payload_document(
 ) -> dict[str, Any] | None:
     if payload is None:
         return None
-    return payload.model_dump(mode="json", by_alias=True)
+    document = payload.model_dump(mode="json", by_alias=True)
+    if isinstance(payload, ArtifactPayload):
+        object_input = document.get("object")
+        if isinstance(object_input, dict):
+            object_input.pop("local_source_path", None)
+    return document
 
 
 def _payload_fields(payload: ArtifactPayload) -> dict[str, Any]:
@@ -93,6 +98,7 @@ class ArtifactStore:
         migrate_artifact_db(settings)
 
     def apply_batch(self, batch: ParsedArtifactBatch) -> ArtifactIngestReceipt:
+        batch, prepared_objects = self._prepare_objects(batch)
         manifest = batch.manifest
         counters = {
             "accepted": 0,
@@ -151,6 +157,19 @@ class ArtifactStore:
                     disposition, event_value, artifact_value, material_changed = result
                     if disposition == "accepted":
                         counters["accepted"] += 1
+                        connection.execute(
+                            "DELETE FROM artifact_object_links "
+                            "WHERE artifact_id = ?",
+                            (artifact_value,),
+                        )
+                        prepared = prepared_objects.get(ordinal)
+                        if prepared is not None:
+                            self._link_object(
+                                connection,
+                                artifact_value,
+                                prepared[0],
+                                prepared[1],
+                            )
                     elif disposition == "unchanged":
                         counters["unchanged"] += 1
                     elif disposition == "stale":
@@ -229,6 +248,80 @@ class ArtifactStore:
             batch_id=manifest.batch_id,
             artifacts_changed=changed,
             **counters,
+        )
+
+    def _prepare_objects(
+        self,
+        batch: ParsedArtifactBatch,
+    ) -> tuple[ParsedArtifactBatch, dict[int, tuple[StoredObject, str]]]:
+        from .objects import store_object
+
+        prepared_batch = batch.model_copy(deep=True)
+        prepared: dict[int, tuple[StoredObject, str]] = {}
+        for ordinal, event in enumerate(prepared_batch.events):
+            payload = event.payload
+            if not isinstance(payload, ArtifactPayload) or payload.object is None:
+                continue
+            object_input = payload.object
+            source_path = object_input.local_source_path
+            if source_path is None:
+                continue
+            stored = store_object(
+                self.settings,
+                source_path,
+                expected_sha256=object_input.expected_sha256,
+            )
+            media_type = object_input.media_type or stored.media_type
+            if media_type != stored.media_type:
+                stored = stored.model_copy(update={"media_type": media_type})
+            original_name = object_input.original_name or source_path.name
+            payload.object = object_input.model_copy(
+                update={
+                    "local_source_path": None,
+                    "expected_sha256": stored.sha256,
+                    "media_type": media_type or None,
+                    "original_name": original_name,
+                }
+            )
+            prepared[ordinal] = (stored, original_name)
+        return prepared_batch, prepared
+
+    @staticmethod
+    def _link_object(
+        connection: sqlite3.Connection,
+        artifact_value: str,
+        stored: StoredObject,
+        original_name: str,
+    ) -> None:
+        verified_at = _utc_now()
+        connection.execute(
+            """
+            INSERT INTO artifact_objects(
+                sha256, byte_count, media_type, relative_path,
+                first_observed_at, last_verified_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sha256) DO UPDATE SET
+                byte_count = excluded.byte_count,
+                media_type = excluded.media_type,
+                relative_path = excluded.relative_path,
+                last_verified_at = excluded.last_verified_at
+            """,
+            (
+                stored.sha256,
+                stored.byte_count,
+                stored.media_type,
+                stored.relative_path,
+                verified_at,
+                verified_at,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO artifact_object_links(
+                artifact_id, sha256, relation, original_name
+            ) VALUES (?, ?, 'content', ?)
+            """,
+            (artifact_value, stored.sha256, original_name),
         )
 
     def _apply_event(
