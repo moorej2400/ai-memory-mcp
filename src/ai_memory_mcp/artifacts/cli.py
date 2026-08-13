@@ -105,8 +105,16 @@ def _parser() -> argparse.ArgumentParser:
         "migrate-legacy",
         help="Import legacy local artifact data.",
     )
-    legacy.add_argument("--database")
-    legacy.add_argument("--markdown-root")
+    legacy.add_argument("--source", required=True)
+    legacy.add_argument("--source-instance", required=True)
+    legacy.add_argument("--sync-db", required=True)
+    legacy.add_argument("--chat-notes")
+    legacy.add_argument("--meeting-notes")
+    legacy.add_argument(
+        "--immutable",
+        action="store_true",
+        help="Read a copied database that has no active WAL file.",
+    )
     legacy.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -292,14 +300,19 @@ def _restore(settings: Settings, args: argparse.Namespace) -> Any:
 
 
 def _migrate_legacy(settings: Settings, args: argparse.Namespace) -> Any:
-    from .legacy import migrate_legacy_artifacts
+    from .migrate_legacy import plan_legacy_migration, run_legacy_migration
 
-    return migrate_legacy_artifacts(
-        settings,
-        database=Path(args.database) if args.database else None,
-        markdown_root=Path(args.markdown_root) if args.markdown_root else None,
-        dry_run=args.dry_run,
-    )
+    arguments = {
+        "source": args.source,
+        "source_instance": args.source_instance,
+        "sync_db": Path(args.sync_db),
+        "chat_notes": Path(args.chat_notes) if args.chat_notes else None,
+        "meeting_notes": Path(args.meeting_notes) if args.meeting_notes else None,
+        "immutable": args.immutable,
+    }
+    if args.dry_run:
+        return plan_legacy_migration(**arguments)
+    return run_legacy_migration(settings, **arguments)
 
 
 HANDLERS = {

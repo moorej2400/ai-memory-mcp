@@ -130,6 +130,52 @@ The restore command does not replace the active database.
 Stop all writers before an operator-controlled cutover.
 Keep the source backup until the restored database passes operational checks.
 
+## Import legacy artifacts
+
+Keep each legacy source active until all verification checks pass.
+The migration opens the legacy SQLite database in read-only mode.
+The migration does not change the database or Markdown notes.
+
+Run a dry-run check on Windows:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe migrate-legacy --source chat-source --source-instance workspace --sync-db <sync-database> --chat-notes <chat-notes> --meeting-notes <meeting-notes> --dry-run
+```
+
+Run a dry-run check on macOS or Linux:
+
+```bash
+./.venv/bin/ai-memory-artifact migrate-legacy --source chat-source --source-instance workspace --sync-db <sync-database> --chat-notes <chat-notes> --meeting-notes <meeting-notes> --dry-run
+```
+
+Check the reported counts and unresolved identities.
+Stop the import if a required count is incorrect.
+
+Import the checked sources on Windows:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe migrate-legacy --source chat-source --source-instance workspace --sync-db <sync-database> --chat-notes <chat-notes> --meeting-notes <meeting-notes>
+```
+
+Import the checked sources on macOS or Linux:
+
+```bash
+./.venv/bin/ai-memory-artifact migrate-legacy --source chat-source --source-instance workspace --sync-db <sync-database> --chat-notes <chat-notes> --meeting-notes <meeting-notes>
+```
+
+Use `--immutable` only with a closed database copy that has no active WAL file.
+Do not use `--immutable` with the active provider database.
+
+The import keeps manual summaries as distillation candidates.
+The canonical database stores raw messages, meetings, transcripts, and transcript cues.
+The migration does not create transcript-heavy Markdown notes.
+
+Compare the receipt with the dry-run counts after the import.
+Keep the legacy sources in backup coverage during the transition.
+After approval, move obsolete outputs to a recoverable archive.
+Do not automate the archive move.
+Do not delete the legacy database or notes.
+
 ## Run the MCP server
 
 Use the standard input and output transport for local agents:

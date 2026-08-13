@@ -321,3 +321,27 @@ class ArtifactRestoreResult(StrictModel):
     byte_count: int = Field(ge=0)
     artifacts: int = Field(ge=0)
     batches: int = Field(ge=0)
+
+
+class LegacyMigrationPlan(StrictModel):
+    source: str
+    source_instance: str
+    database_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    note_manifest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    conversations: int = Field(ge=0)
+    messages: int = Field(ge=0)
+    attachments: int = Field(ge=0)
+    meetings: int = Field(ge=0)
+    meeting_notes: int = Field(ge=0)
+    chat_notes: int = Field(ge=0)
+    transcript_cues: int = Field(ge=0)
+    unresolved_identities: int = Field(ge=0)
+    duplicate_natural_keys: int = Field(ge=0)
+
+
+class LegacyMigrationReceipt(LegacyMigrationPlan):
+    batch_id: str
+    accepted_events: int = Field(ge=0)
+    unchanged_events: int = Field(ge=0)
+    source_files_changed: int = Field(ge=0)
+    verified: bool
