@@ -15,7 +15,7 @@ Status: satisfactory
 
 ## Automated tests
 
-All 206 automated tests passed.
+All 247 automated tests passed.
 The tests covered artifact intake, retrieval, distillation, migration, recovery, MCP tools, client merging, and repository privacy.
 
 ## Frozen benchmark
@@ -45,16 +45,16 @@ The fixture contained 100 conversations, 100,000 messages, 100 meetings, 100 tra
 
 | Metric | Result |
 |---|---:|
-| Batch validation | 7.020 s |
-| SQLite intake | 39.884 s |
-| Active SQLite files | 768,210,064 bytes |
-| Warm FTS median | 0.769 ms |
-| Warm FTS 95th percentile | 0.870 ms |
-| Ordered-read median | 3.068 ms |
-| Ordered-read 95th percentile | 3.448 ms |
-| Burst-index build | 23.418 s |
-| Warm fused-recall median | 190.789 ms |
-| Warm fused-recall 95th percentile | 254.792 ms |
+| Batch validation | 8.531 s |
+| SQLite intake | 38.639 s |
+| Active SQLite files | 809,499,920 bytes |
+| Warm FTS median | 1.275 ms |
+| Warm FTS 95th percentile | 1.311 ms |
+| Ordered-read median | 3.521 ms |
+| Ordered-read 95th percentile | 3.825 ms |
+| Burst-index build | 23.252 s |
+| Warm fused-recall median | 194.069 ms |
+| Warm fused-recall 95th percentile | 258.923 ms |
 
 The burst index contained 18,800 deterministic bursts.
 All 18,800 bursts had hashed vectors.
@@ -65,6 +65,8 @@ The JSONL fixture SHA-256 value is:
 
 The measurements came from one local validation run.
 The measurements do not define performance limits.
+The database passed quick-check and foreign-key validation.
+A verified backup restored to a new path with the same SHA-256 value.
 
 ## Transport tests
 
