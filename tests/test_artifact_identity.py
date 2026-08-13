@@ -49,3 +49,22 @@ def test_event_id_ignores_batch_observation_data() -> None:
         "work",
         {**fields, "batch_id": "another-batch", "observed_at": "tomorrow"},
     )
+
+
+def test_event_id_changes_for_a_parent_only_correction() -> None:
+    fields = {
+        "entity": "message",
+        "external_id": "message-17",
+        "operation": "upsert",
+        "source_updated_at": "2026-01-02T10:00:00+00:00",
+        "payload_sha256": "a" * 64,
+    }
+    assert event_id(
+        "teams",
+        "work",
+        {**fields, "parent_artifact_id": "art_" + "a" * 32},
+    ) != event_id(
+        "teams",
+        "work",
+        {**fields, "parent_artifact_id": "art_" + "b" * 32},
+    )

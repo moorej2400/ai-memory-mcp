@@ -544,7 +544,7 @@ git commit -m "feat: define artifact identity and configuration"
 
 **Interfaces:**
 
-- `ARTIFACT_SCHEMA_VERSION = 1`
+- `ARTIFACT_SCHEMA_VERSION = 2`
 - `connect_artifact_db(path, *, read_only=False) -> sqlite3.Connection`
 - `migrate_artifact_db(settings) -> MigrationResult`
 - `artifact_database_status(settings) -> ArtifactDatabaseStatus`
@@ -557,7 +557,8 @@ Create tests for these behaviors:
 def test_migration_creates_schema_and_fts(artifact_settings: Settings) -> None:
     result = migrate_artifact_db(artifact_settings)
     assert result.from_version == 0
-    assert result.to_version == 1
+    assert result.to_version == 2
+    assert result.applied == [1, 2]
     with connect_artifact_db(artifact_settings.artifact_db) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
@@ -573,8 +574,8 @@ def test_migration_creates_schema_and_fts(artifact_settings: Settings) -> None:
 def test_repeated_migration_is_a_no_op(artifact_settings: Settings) -> None:
     migrate_artifact_db(artifact_settings)
     result = migrate_artifact_db(artifact_settings)
-    assert result.from_version == 1
-    assert result.to_version == 1
+    assert result.from_version == 2
+    assert result.to_version == 2
     assert result.applied == []
 ```
 
@@ -780,7 +781,23 @@ Exclude tombstoned and redacted rows from current FTS results.
 Initialize `artifact_metadata.change_counter` to `0`.
 Increase it once after each transaction that changes materialized artifact state.
 
-- [ ] **Step 5: Make migrations recoverable**
+- [ ] **Step 5: Add migration 2**
+
+Migration 2 adds `artifact_events.parent_artifact_id`.
+The parent is part of the event identity.
+
+Migration 2 also adds this reverse-link index:
+
+```sql
+CREATE INDEX artifact_links_target_idx
+    ON artifact_links(target_artifact_id, relation, source_artifact_id);
+```
+
+Read tools must open the database with `mode=ro`.
+Read tools must reject an old schema without changing the database.
+All database paths must reject a known network filesystem.
+
+- [ ] **Step 6: Make migrations recoverable**
 
 Before a non-empty database migration, create a timestamped SQLite backup.
 Use `sqlite3.Connection.backup()`.
@@ -790,7 +807,7 @@ Apply each migration inside one transaction.
 Record the migration only after every statement succeeds.
 On POSIX systems, set new private directories to mode `0700` and new database files to `0600`.
 
-- [ ] **Step 6: Verify Task 3**
+- [ ] **Step 7: Verify Task 3**
 
 Run:
 
@@ -801,7 +818,7 @@ Run:
 
 Expected: all tests pass.
 
-- [ ] **Step 7: Commit Task 3**
+- [ ] **Step 8: Commit Task 3**
 
 ```bash
 git add src/ai_memory_mcp/artifacts/schema.py tests/test_artifact_schema.py
@@ -929,6 +946,7 @@ source
 source_instance
 entity
 external_id
+parent_artifact_id or empty
 operation
 source_sequence or source_updated_at or source_version or payload_sha256
 payload_sha256
@@ -940,6 +958,7 @@ A replay from another batch must remain idempotent.
 When a batch ID already exists, compare its exact input hash.
 Return the stored receipt when the hash matches.
 Reject the batch ID when the hash differs.
+Perform this replay check before reading any local object handoff path.
 
 - [ ] **Step 5: Apply one batch in one transaction**
 
@@ -957,6 +976,7 @@ An omitted value is not a patch instruction.
 
 Use `source_sequence` as the primary ordering value when both events have one.
 Use `source_updated_at` when a comparable source sequence is not available.
+Normalize all comparable timestamps to UTC before storage and comparison.
 When ordering values match, require the same payload hash or record a conflict.
 When source times are absent, require matching source versions for an unchanged event.
 When opaque source versions differ without source times, record a conflict for review.
@@ -968,6 +988,8 @@ Insert one `artifact_batch_events` row for each input event.
 For `redact`, clear searchable current text and stored revision payload text.
 Keep event identity, timestamps, payload hashes, and the redaction event.
 This mutation is the explicit privacy exception to immutable revision payloads.
+Reject content restoration through a later `upsert`.
+Store no later event payload for a redacted artifact.
 
 - [ ] **Step 6: Apply complete coverage claims safely**
 
@@ -981,6 +1003,9 @@ After all events apply, tombstone active records that meet all these conditions:
 - The record falls inside the claimed interval.
 - The batch does not contain that external ID.
 
+Create a synthetic delete event for each coverage tombstone.
+Update `last_event_id` and clear current aliases, links, and object links.
+
 Never infer complete coverage from a message count or cursor.
 The provider must make the complete-snapshot claim.
 
@@ -988,10 +1013,13 @@ The provider must make the complete-snapshot claim.
 
 Mark a meeting `pending` after a meeting, recording, transcript, cue, or related-chat change.
 Mark a conversation `pending` after a non-system message change.
+Mark each linked meeting `pending` after a related-chat message change.
 Keep system messages in raw storage.
 Do not use system messages to trigger distillation.
 
-Compute the source digest from the active child artifact IDs and payload hashes.
+Compute each source digest from its permitted active context.
+For meetings, include owned transcript data and related-chat messages.
+Do not include sibling meetings that use the same related chat.
 
 - [ ] **Step 8: Verify Task 4**
 
@@ -1209,9 +1237,11 @@ Return at most 5,000 text characters in one hit.
 
 - [ ] **Step 5: Implement ordered context reads**
 
-For a conversation reference, return active message children.
+For a conversation reference, return active message and attachment children.
 For a transcript reference, return active cue children.
-For a meeting reference, traverse `contains` and `related-chat` links.
+For a meeting reference, traverse its owned `contains` chain.
+Traverse only messages and attachments under the active `related-chat` conversation.
+Do not traverse sibling meetings that use the same conversation.
 For a message or cue reference, return ordered siblings around the focus.
 
 Order by `occurred_at`, then `artifact_id`.
@@ -1297,7 +1327,7 @@ The `status` command reports these fields:
 ```json
 {
   "available": true,
-  "schema_version": 1,
+  "schema_version": 2,
   "database_path": "<configured path>",
   "journal_mode": "wal",
   "artifacts": 0,
@@ -1499,6 +1529,8 @@ include_payload: bool = False
 
 Mark the tool read-only and idempotent.
 Reject an invalid artifact URI before opening SQLite.
+Enforce all requested scope filters for an exact artifact URI.
+Open SQLite with `mode=ro` and reject an old schema without migration.
 
 - [ ] **Step 8: Protect audit logs from raw duplication**
 
@@ -1516,6 +1548,7 @@ text_characters
 
 Do not copy raw artifact text or payload JSON into audit logs.
 Keep existing Markdown audit behavior unchanged.
+Hash an artifact-scoped query for successful, empty, and failed retrievals.
 
 - [ ] **Step 9: Extend `memory_status`**
 
@@ -1682,6 +1715,8 @@ Manual notes can stay here. The agent must not replace them.
 
 Keep quotations short.
 Do not add a `Transcript` section.
+Put every artifact evidence link inside the `Evidence` section.
+Require each evidence link to identify an active artifact in the root context.
 Replace only text between the two managed markers.
 Reject a note with missing, duplicated, nested, or reversed managed markers.
 
@@ -1748,6 +1783,8 @@ Reject a meeting or conversation note when either condition is true:
 
 Quoted evidence lines do not count as transcript lines.
 The validator must allow several short evidence quotations.
+Reject quoted evidence with more than 12 lines or 2,400 characters.
+Reject quoted evidence with at least 12 timestamped speaker turns.
 
 - [ ] **Step 7: Add agent instructions**
 
@@ -1891,6 +1928,8 @@ Embed a burst when one condition is true:
 - A record has a reaction.
 - A record links an attachment.
 
+Treat an active attachment child as a message attachment link.
+
 Keep every burst available through raw FTS.
 Do not create one semantic vector for each message.
 
@@ -1991,6 +2030,8 @@ PRAGMA foreign_key_check;
 
 Return the backup path, byte count, SHA-256 digest, and database counts.
 Do not prune older backups.
+State that this database backup does not contain attachment object files.
+Require a separate filesystem backup for `AI_MEMORY_ARTIFACT_OBJECTS_DIR`.
 
 - [ ] **Step 4: Implement safe restore staging**
 
@@ -2126,7 +2167,9 @@ Do not write during `--dry-run`.
 - [ ] **Step 4: Map legacy records**
 
 Map each source table to a version 1 artifact event.
-Use the original message and conversation IDs as external IDs.
+Use the original conversation ID as its external ID.
+Use a composite conversation and message ID for each message external ID.
+Use a composite message and attachment ID for each attachment external ID.
 Use the source instance supplied by the operator.
 
 Use legacy Markdown only for these values:
@@ -2135,6 +2178,10 @@ Use legacy Markdown only for these values:
 - Participants missing from structured data.
 - Transcript text missing from structured data.
 - Existing links and aliases.
+
+Use an explicit allowlist for every legacy `source_payload`.
+Sanitize signed URLs in normalized text and structured values.
+Reject secrets recursively before intake.
 
 Do not make legacy Markdown the raw authority after import.
 Do not copy a transcript-heavy legacy note into a new Markdown note.
@@ -2157,6 +2204,11 @@ Preserve the original meeting note unchanged.
 
 Write one migration receipt into the canonical artifact database.
 Include source database SHA-256 and source note manifest SHA-256.
+
+Create one stable logical SQLite snapshot before analysis or import.
+Include committed WAL data in that snapshot.
+Hash the stable snapshot for the database receipt.
+Validate every generated identity and graph reference before intake.
 
 After import, compare these values:
 
@@ -2207,11 +2259,13 @@ git commit -m "feat: import legacy chat and meeting artifacts"
 - Create: `src/teams/core/artifact-batch.ts`
 - Create: `tests/artifact-envelope.test.ts`
 - Create: `tests/artifact-batch.test.ts`
+- Create: `tests/messages-sync-command.test.ts`
+- Create: `tests/transcripts-sync-command.test.ts`
 - Modify: `src/teams/messages-sync.ts`
 - Modify: `src/teams/transcripts-sync.ts`
 - Modify: `src/teams/sync/db.ts`
 - Modify: `src/teams/index.ts`
-- Modify: `.env.example`
+- Modify: `.env.template`
 - Modify: `README.md`
 
 **Interfaces:**
@@ -2240,7 +2294,10 @@ const event = messageArtifactEvent({
 assert.equal(event.schema, 'ai-memory/artifact-event@1');
 assert.equal(event.record, 'event');
 assert.equal(event.entity, 'message');
-assert.equal(event.external_id, 'message-17');
+assert.equal(
+  event.external_id,
+  'conversation:conversation-4:message:message-17',
+);
 assert.equal(event.parent?.entity, 'conversation');
 assert.equal(event.parent?.external_id, 'conversation-4');
 assert.equal(event.payload.author?.id_confidence, 'display-name-only');
@@ -2269,7 +2326,7 @@ Map these fields for every message:
 
 | Generic field | Provider value |
 |---|---|
-| `external_id` | Normalized message ID. |
+| `external_id` | Composite conversation and normalized message ID. |
 | `parent` | Conversation external ID. |
 | `source_version` | Provider version when available. |
 | `source_sequence` | Numeric provider version when available. |
@@ -2288,6 +2345,7 @@ Do not drop them from the emitted batch.
 Use an allowlist for `payload.source_payload`.
 Do not emit browser tokens, cookies, authorization headers, signed query values, or temporary download URLs.
 Strip authentication and tracking parameters from stable remote URLs.
+Sanitize nested URLs and Teams recap hash-route parameters recursively.
 
 - [ ] **Step 5: Write complete batches atomically**
 
@@ -2314,7 +2372,7 @@ Set `event_count` to the exact event length.
 
 Write a temporary file beside the destination.
 Flush and synchronize the file.
-Use an atomic rename to publish it.
+Use an exclusive same-directory hard link to publish it.
 Do not overwrite an existing batch file.
 
 - [ ] **Step 6: Add message batch output**
@@ -2337,8 +2395,12 @@ Call a new `recordConversationFetchCoverage()` function instead.
 
 After each successful conversation fetch, add conversation, message, attachment, meeting-link, and delete events to the batch.
 
+Use a composite message identity because provider message IDs can be conversation-scoped.
+Use a composite attachment identity because provider attachment IDs can be reused.
+
 Only add a complete coverage claim after a complete provider fetch.
 Do not add a claim after a page limit, error, or interrupted fetch.
+For channels, do not claim complete coverage without proof for every thread.
 
 - [ ] **Step 7: Correct candidate and reconciliation behavior**
 
@@ -2370,7 +2432,11 @@ export function recordConversationFetchCoverage(
 ```
 
 Update `conversations.local_last_message_at` from `lastMessageAt`.
+Advance it only from an observed message inside the requested range.
 Do not derive provider progress from the AI Memory receipt.
+
+Persist a reconciliation cursor.
+Rotate complete reconciliation across more than 500 conversations.
 
 Add these provider-state tables:
 
@@ -2388,6 +2454,9 @@ CREATE TABLE IF NOT EXISTS recording_candidates (
     recording_key TEXT PRIMARY KEY,
     source_url TEXT NOT NULL,
     conversation_id TEXT,
+    meeting_external_id TEXT,
+    meeting_event_json TEXT,
+    conversation_event_json TEXT,
     discovered_at TEXT NOT NULL,
     transcript_status TEXT NOT NULL,
     last_error TEXT,
@@ -2396,6 +2465,7 @@ CREATE TABLE IF NOT EXISTS recording_candidates (
 ```
 
 Keep stable recording URLs in provider state because transcript fetching needs them.
+Keep canonical conversation and meeting snapshots with each recording candidate.
 Do not keep complete message bodies only to discover recording URLs.
 
 - [ ] **Step 8: Add meeting and transcript batch output**
@@ -2410,13 +2480,24 @@ Add these arguments to `transcripts-sync`:
 Keep the existing `--out-dir` argument for legacy Markdown mode.
 Require `--artifact-out`, `--out-dir`, or both.
 
-Emit one meeting occurrence event.
+Emit one meeting occurrence event with an occurrence-stable identity.
 Emit separate recording and transcript events.
 Emit one cue event for each normalized cue.
 Emit stable aliases for available recording, call, calendar, and conversation IDs.
 
+Use the call ID first for a meeting occurrence identity.
+Use the calendar ID and start time when the call ID is unavailable.
+Use the conversation ID only as an alias, link, or time-qualified fallback.
+
+Use a provider cue ID when available.
+Otherwise, use the cue start and end times.
+Order corrected transcript and cue revisions with one transcript fetch time.
+Emit complete cue coverage so removed cues become tombstones.
+
 Read pending transcript work from `recording_candidates`.
 Do not scan the legacy `messages.content_markdown` table in artifact-output mode.
+Authenticate each recording inside its own error boundary.
+One inaccessible recording must not block later candidates.
 
 When an attachment was downloaded, emit `local_source_path` for the intake handoff.
 Do not put this local path in provider source payload data.
@@ -2448,7 +2529,9 @@ Run:
 node --import "$OPENCLI_DIR/node_modules/tsx/dist/loader.mjs" tests/artifact-envelope.test.ts
 node --import "$OPENCLI_DIR/node_modules/tsx/dist/loader.mjs" tests/artifact-batch.test.ts
 node --import "$OPENCLI_DIR/node_modules/tsx/dist/loader.mjs" tests/messages.test.ts
+node --import "$OPENCLI_DIR/node_modules/tsx/dist/loader.mjs" tests/messages-sync-command.test.ts
 node --import "$OPENCLI_DIR/node_modules/tsx/dist/loader.mjs" tests/sync-db.test.ts
+node --import "$OPENCLI_DIR/node_modules/tsx/dist/loader.mjs" tests/transcripts-sync-command.test.ts
 ```
 
 Expected: all tests pass.

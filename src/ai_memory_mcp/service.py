@@ -4,6 +4,7 @@ import importlib.metadata
 import hashlib
 import json
 import platform
+import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from .artifacts.models import ArtifactReadResponse, ArtifactScope
 from .artifacts.schema import (
     artifact_database_status,
     connect_artifact_db,
+    require_current_artifact_schema,
 )
 from .artifacts.search import ArtifactSearch
 from .audit import append_event, logging_status
@@ -107,6 +109,38 @@ class MemoryService:
             "date_to": date_to,
             "limit": limit,
         }
+        artifact_scope_requested = any(
+            value is not None
+            for value in (
+                source_label,
+                source_instance,
+                artifact_kind,
+                date_from,
+                date_to,
+            )
+        )
+        markdown_scope_requested = any(
+            value is not None
+            for value in (
+                source_id,
+                root_scope,
+                repository,
+                project,
+                ticket,
+                path_prefix,
+            )
+        ) or status != "active"
+        artifact_schema_available = self._artifact_schema_available()
+        # Select privacy from the requested route. A failed or empty artifact
+        # search has no returned raw evidence from which to infer this policy.
+        artifact_audit_route = bool(
+            query.strip().startswith("artifact://")
+            or artifact_scope_requested
+            or (
+                not markdown_scope_requested
+                and artifact_schema_available
+            )
+        )
         try:
             response, diagnostics = self._recall(
                 query,
@@ -130,7 +164,7 @@ class MemoryService:
                 "retrieval",
                 "retrieval_failed",
                 {
-                    "query": query,
+                    **self._audit_query_payload(query, artifact_audit_route),
                     "scope": scope_payload,
                     "elapsed_ms": round(
                         (time.perf_counter() - started) * 1000,
@@ -141,7 +175,11 @@ class MemoryService:
                 },
             )
             raise
-        audit_query, audit_response = self._audit_recall_payload(query, response)
+        audit_query, audit_response = self._audit_recall_payload(
+            query,
+            response,
+            protect_query=artifact_audit_route,
+        )
         append_event(
             self.settings,
             "retrieval",
@@ -211,11 +249,20 @@ class MemoryService:
                 path_prefix,
             )
         ) or status != "active"
-        artifact_available = self.settings.artifact_db.is_file()
+        artifact_available = self._artifact_schema_available()
         index_available = current_index_path(self.settings) is not None
+
+        if artifact_filters and markdown_filters:
+            raise ValueError(
+                "Markdown filters and artifact filters cannot be combined."
+            )
 
         if query.startswith("artifact://"):
             parse_artifact_uri(query)
+            if markdown_filters:
+                raise ValueError(
+                    "Markdown filters cannot be used with an artifact reference."
+                )
             if not artifact_available:
                 return (
                     RecallResponse(
@@ -226,7 +273,14 @@ class MemoryService:
                     ),
                     {"route": "artifact-missing"},
                 )
-            exact_hit = ArtifactSearch(self.settings).get(query)
+            artifact_scope = ArtifactScope(
+                source=source_label,
+                source_instance=source_instance,
+                entities=(artifact_kind,) if artifact_kind else (),
+                date_from=date_from,
+                date_to=date_to,
+            )
+            exact_hit = ArtifactSearch(self.settings).get(query, artifact_scope)
             packet = merge_artifact_evidence(
                 query,
                 None,
@@ -235,13 +289,15 @@ class MemoryService:
                 now=datetime.now(timezone.utc),
                 limit=1,
             )
-            return self._packet_response(
+            response, diagnostics = self._packet_response(
                 query,
                 packet,
                 scope,
                 intent="exact",
                 markdown_used=False,
             )
+            diagnostics["artifact_searched"] = True
+            return response, diagnostics
 
         artifact_hits = []
         artifact_warning: str | None = None
@@ -295,7 +351,10 @@ class MemoryService:
                     query=query,
                     warnings=warnings,
                 ),
-                {"route": "no-provider"},
+                {
+                    "route": "no-provider",
+                    "artifact_searched": bool(use_artifacts and artifact_available),
+                },
             )
 
         if use_markdown:
@@ -354,6 +413,9 @@ class MemoryService:
             response.warnings.append(artifact_warning)
         if artifact_semantic_warning:
             response.warnings.append(artifact_semantic_warning)
+        diagnostics["artifact_searched"] = bool(
+            use_artifacts and artifact_available
+        )
         return response, diagnostics
 
     def _packet_response(
@@ -454,10 +516,21 @@ class MemoryService:
             include_payload=include_payload,
         )
 
+    def _artifact_schema_available(self) -> bool:
+        if not self.settings.artifact_db.is_file():
+            return False
+        try:
+            require_current_artifact_schema(self.settings)
+        except (FileNotFoundError, OSError, RuntimeError, sqlite3.DatabaseError):
+            return False
+        return True
+
     @staticmethod
     def _audit_recall_payload(
         query: str,
         response: RecallResponse,
+        *,
+        protect_query: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         payload = response.model_dump(mode="json")
         raw_paths: set[str] = set()
@@ -483,7 +556,7 @@ class MemoryService:
                 }
             )
         payload["evidence"] = sanitized
-        if not contains_raw:
+        if not contains_raw and not protect_query:
             return {"query": query}, payload
         payload.pop("query", None)
         payload["query_sha256"] = hashlib.sha256(query.encode("utf-8")).hexdigest()
@@ -494,13 +567,16 @@ class MemoryService:
              else citation.model_dump(mode="json"))
             for citation in response.citations
         ]
-        return (
-            {
-                "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
-                "query_characters": len(query),
-            },
-            payload,
-        )
+        return MemoryService._audit_query_payload(query, True), payload
+
+    @staticmethod
+    def _audit_query_payload(query: str, protect: bool) -> dict[str, Any]:
+        if not protect:
+            return {"query": query}
+        return {
+            "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+            "query_characters": len(query),
+        }
 
     def sync(self) -> SyncResponse:
         from .artifacts.vector_index import build_artifact_vector_index

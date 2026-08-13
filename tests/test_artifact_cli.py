@@ -101,7 +101,7 @@ def test_ingest_status_search_and_read_write_json_objects(
     assert main(["status"]) == 0
     status = _one_json(capsys)
     assert status["available"] is True
-    assert status["schema_version"] == 1
+    assert status["schema_version"] == 2
     assert status["artifacts"] == 2
     assert status["active_artifacts"] == 2
     assert status["batches"] == 1

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -8,6 +9,7 @@ from typing import Any, Literal
 
 from ai_memory_mcp.config import Settings
 
+from .context import active_context_rows
 from .identity import artifact_id, canonical_json, event_id, sha256_text
 from .models import (
     ArtifactEvent,
@@ -52,7 +54,11 @@ def _utc_now() -> str:
 
 
 def _iso(value: datetime | None) -> str | None:
-    return None if value is None else value.isoformat()
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
 
 
 def _payload_document(
@@ -98,6 +104,9 @@ class ArtifactStore:
         migrate_artifact_db(settings)
 
     def apply_batch(self, batch: ParsedArtifactBatch) -> ArtifactIngestReceipt:
+        replayed = self._replayed_batch_receipt(batch)
+        if replayed is not None:
+            return replayed
         batch, prepared_objects = self._prepare_objects(batch)
         manifest = batch.manifest
         counters = {
@@ -154,7 +163,13 @@ class ArtifactStore:
                         event,
                         ordinal,
                     )
-                    disposition, event_value, artifact_value, material_changed = result
+                    (
+                        disposition,
+                        event_value,
+                        artifact_value,
+                        material_changed,
+                        distillation_relevant,
+                    ) = result
                     if disposition == "accepted":
                         counters["accepted"] += 1
                         connection.execute(
@@ -182,6 +197,7 @@ class ArtifactStore:
                         counters["redactions"] += 1
                     if material_changed:
                         changed += 1
+                    if material_changed and distillation_relevant:
                         self._remember_distillation_root(
                             connection,
                             event,
@@ -249,6 +265,26 @@ class ArtifactStore:
             artifacts_changed=changed,
             **counters,
         )
+
+    def _replayed_batch_receipt(
+        self,
+        batch: ParsedArtifactBatch,
+    ) -> ArtifactIngestReceipt | None:
+        # Receipt lookup must precede object handoff reads. Producers may move
+        # a handoff file after the first accepted intake.
+        with connect_artifact_db(
+            self.settings.artifact_db,
+            read_only=True,
+        ) as connection:
+            prior = connection.execute(
+                "SELECT * FROM artifact_batches WHERE batch_id = ?",
+                (batch.manifest.batch_id,),
+            ).fetchone()
+        if prior is None:
+            return None
+        if prior["input_sha256"] != batch.input_sha256:
+            raise ValueError("The artifact batch ID already has different input.")
+        return self._receipt_from_batch(prior)
 
     def _prepare_objects(
         self,
@@ -342,6 +378,7 @@ class ArtifactStore:
         str,
         str,
         bool,
+        bool,
     ]:
         manifest = batch.manifest
         artifact_value = artifact_id(
@@ -350,6 +387,7 @@ class ArtifactStore:
             event.entity,
             event.external_id,
         )
+        parent_value = self._resolve_parent(connection, manifest, event)
         payload_document = _payload_document(event.payload)
         payload_json = canonical_json(payload_document)
         payload_sha256 = sha256_text(payload_json)
@@ -359,6 +397,7 @@ class ArtifactStore:
             {
                 "entity": event.entity,
                 "external_id": event.external_id,
+                "parent_artifact_id": parent_value,
                 "operation": event.operation,
                 "source_sequence": event.source_sequence,
                 "source_updated_at": _iso(event.source_updated_at),
@@ -379,13 +418,39 @@ class ArtifactStore:
                 """,
                 (manifest.batch_id, ordinal, event_value),
             )
-            return "unchanged", event_value, str(existing_event[0]), False
+            return "unchanged", event_value, str(existing_event[0]), False, False
 
-        parent_value = self._resolve_parent(connection, manifest, event)
         current = connection.execute(
             "SELECT * FROM artifacts WHERE artifact_id = ?",
             (artifact_value,),
         ).fetchone()
+        distillation_relevant = not self._is_system_message(current, event)
+        if (
+            current is not None
+            and current["redacted_at"] is not None
+            and event.operation != "redact"
+        ):
+            # Redaction is durable. Later provider replays retain ordering and
+            # hashes for audit, but they cannot restore raw revision payloads.
+            self._insert_event(
+                connection,
+                batch,
+                event,
+                artifact_value,
+                parent_value,
+                event_value,
+                None,
+                payload_sha256,
+            )
+            connection.execute(
+                """
+                INSERT INTO artifact_batch_events(
+                    batch_id, ordinal, event_id, disposition
+                ) VALUES (?, ?, ?, 'redacted')
+                """,
+                (manifest.batch_id, ordinal, event_value),
+            )
+            return "redacted", event_value, artifact_value, True, False
         if current is not None:
             ordering = self._compare_ordering(current, event, payload_sha256)
             if ordering in {"stale", "conflict"}:
@@ -394,6 +459,7 @@ class ArtifactStore:
                     batch,
                     event,
                     artifact_value,
+                    parent_value,
                     event_value,
                     payload_json,
                     payload_sha256,
@@ -406,7 +472,7 @@ class ArtifactStore:
                     """,
                     (manifest.batch_id, ordinal, event_value, ordering),
                 )
-                return ordering, event_value, artifact_value, False
+                return ordering, event_value, artifact_value, False, False
 
         observed_at = _iso(manifest.observed_at)
         if event.operation == "upsert":
@@ -583,6 +649,7 @@ class ArtifactStore:
             batch,
             event,
             artifact_value,
+            parent_value,
             event_value,
             payload_json,
             payload_sha256,
@@ -595,7 +662,37 @@ class ArtifactStore:
             """,
             (manifest.batch_id, ordinal, event_value, disposition),
         )
-        return disposition, event_value, artifact_value, True
+        return (
+            disposition,
+            event_value,
+            artifact_value,
+            True,
+            distillation_relevant,
+        )
+
+    @staticmethod
+    def _is_system_message(
+        current: sqlite3.Row | None,
+        event: ArtifactEvent,
+    ) -> bool:
+        if event.entity != "message":
+            return False
+        if isinstance(event.payload, ArtifactPayload):
+            return (event.payload.classification or "").casefold() == "system"
+        if current is None:
+            return False
+        return ArtifactStore._payload_is_system(str(current["payload_json"]))
+
+    @staticmethod
+    def _payload_is_system(payload_json: str) -> bool:
+        try:
+            payload = json.loads(payload_json)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        return (
+            isinstance(payload, dict)
+            and str(payload.get("classification") or "").casefold() == "system"
+        )
 
     @staticmethod
     def _resolve_parent(
@@ -670,8 +767,9 @@ class ArtifactStore:
         batch: ParsedArtifactBatch,
         event: ArtifactEvent,
         artifact_value: str,
+        parent_value: str | None,
         event_value: str,
-        payload_json: str,
+        payload_json: str | None,
         payload_sha256: str,
     ) -> None:
         manifest = batch.manifest
@@ -681,8 +779,9 @@ class ArtifactStore:
                 event_id, first_batch_id, artifact_id, source,
                 source_instance, entity, external_id, operation,
                 source_version, source_sequence, source_updated_at,
-                observed_at, payload_json, payload_sha256
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                observed_at, payload_json, payload_sha256,
+                parent_artifact_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_value,
@@ -699,6 +798,7 @@ class ArtifactStore:
                 _iso(manifest.observed_at),
                 payload_json,
                 payload_sha256,
+                parent_value,
             ),
         )
 
@@ -885,7 +985,8 @@ class ArtifactStore:
                 conditions.append("occurred_at <= ?")
                 parameters.append(_iso(claim.covered_to))
             rows = connection.execute(
-                "SELECT artifact_id, last_event_id FROM artifacts WHERE "
+                "SELECT artifact_id, external_id, last_event_id, payload_json "
+                "FROM artifacts WHERE "
                 + " AND ".join(conditions),
                 parameters,
             ).fetchall()
@@ -893,20 +994,64 @@ class ArtifactStore:
             for row in rows:
                 if row["artifact_id"] in present:
                     continue
-                connection.execute(
-                    "UPDATE artifacts SET deleted_at = ?, last_observed_at = ? "
-                    "WHERE artifact_id = ?",
-                    (tombstoned_at, tombstoned_at, row["artifact_id"]),
+                # Coverage is provider evidence, not an input event. Materialize
+                # its delete revision without adding a false input ordinal.
+                coverage_event = ArtifactEvent.model_validate(
+                    {
+                        "schema": "ai-memory/artifact-event@1",
+                        "record": "event",
+                        "entity": claim.entity,
+                        "operation": "delete",
+                        "external_id": row["external_id"],
+                        "parent": claim.parent,
+                        "source_version": f"coverage:{manifest.batch_id}",
+                    }
                 )
+                payload_sha256 = sha256_text(canonical_json(None))
+                tombstone_event = event_id(
+                    manifest.source,
+                    manifest.source_instance,
+                    {
+                        "entity": claim.entity,
+                        "external_id": row["external_id"],
+                        "parent_artifact_id": parent_value,
+                        "operation": "delete",
+                        "source_version": coverage_event.source_version,
+                        "payload_sha256": payload_sha256,
+                    },
+                )
+                self._insert_event(
+                    connection,
+                    batch,
+                    coverage_event,
+                    str(row["artifact_id"]),
+                    parent_value,
+                    tombstone_event,
+                    None,
+                    payload_sha256,
+                )
+                connection.execute(
+                    "UPDATE artifacts SET deleted_at = ?, last_observed_at = ?, "
+                    "last_event_id = ? "
+                    "WHERE artifact_id = ?",
+                    (
+                        tombstoned_at,
+                        tombstoned_at,
+                        tombstone_event,
+                        row["artifact_id"],
+                    ),
+                )
+                self._clear_current_relations(connection, str(row["artifact_id"]))
                 counters["tombstones"] += 1
                 changed += 1
-                self._remember_root_for_covered_child(
-                    connection,
-                    parent_value,
-                    claim.entity,
-                    str(row["last_event_id"]),
-                    distillation_roots,
-                )
+                if not self._payload_is_system(str(row["payload_json"])):
+                    self._remember_root_for_covered_child(
+                        connection,
+                        parent_value,
+                        claim.entity,
+                        tombstone_event,
+                        distillation_roots,
+                    )
 
             connection.execute(
                 """
@@ -949,7 +1094,22 @@ class ArtifactStore:
                     (row[0],),
                 ).fetchone()
                 if parent is not None and parent[0] == "conversation":
-                    roots[str(row[0])] = event_value
+                    conversation = str(row[0])
+                    roots[conversation] = event_value
+                    self._remember_related_meetings(
+                        connection,
+                        conversation,
+                        event_value,
+                        roots,
+                    )
+            return
+        if event.entity == "conversation":
+            self._remember_related_meetings(
+                connection,
+                artifact_value,
+                event_value,
+                roots,
+            )
             return
         if event.entity == "meeting":
             roots[artifact_value] = event_value
@@ -975,12 +1135,42 @@ class ArtifactStore:
             return
         if entity == "message" and parent[0] == "conversation":
             roots[parent_value] = event_value
+            self._remember_related_meetings(
+                connection,
+                parent_value,
+                event_value,
+                roots,
+            )
         elif entity in {"recording", "transcript", "transcript-cue"}:
             root = self._meeting_ancestor(connection, parent_value)
             if parent[0] == "meeting":
                 root = parent_value
             if root is not None:
                 roots[root] = event_value
+
+    @staticmethod
+    def _remember_related_meetings(
+        connection: sqlite3.Connection,
+        conversation_value: str,
+        event_value: str,
+        roots: dict[str, str],
+    ) -> None:
+        rows = connection.execute(
+            """
+            SELECT link.source_artifact_id
+            FROM artifact_links AS link
+            JOIN artifacts AS meeting
+              ON meeting.artifact_id = link.source_artifact_id
+            WHERE link.relation = 'related-chat'
+              AND link.target_artifact_id = ?
+              AND meeting.entity = 'meeting'
+              AND meeting.deleted_at IS NULL
+              AND meeting.redacted_at IS NULL
+            """,
+            (conversation_value,),
+        ).fetchall()
+        for row in rows:
+            roots[str(row[0])] = event_value
 
     @staticmethod
     def _meeting_ancestor(
@@ -1008,26 +1198,16 @@ class ArtifactStore:
         connection: sqlite3.Connection,
         root: str,
     ) -> str:
-        rows = connection.execute(
-            """
-            WITH RECURSIVE descendants(artifact_id, payload_sha256) AS (
-                SELECT artifact_id, payload_sha256
-                FROM artifacts
-                WHERE parent_artifact_id = ?
-                  AND deleted_at IS NULL AND redacted_at IS NULL
-                UNION ALL
-                SELECT child.artifact_id, child.payload_sha256
-                FROM artifacts AS child
-                JOIN descendants AS parent
-                  ON child.parent_artifact_id = parent.artifact_id
-                WHERE child.deleted_at IS NULL AND child.redacted_at IS NULL
-            )
-            SELECT artifact_id, payload_sha256
-            FROM descendants
-            ORDER BY artifact_id
-            """,
+        root_row = connection.execute(
+            "SELECT entity FROM artifacts WHERE artifact_id = ?",
             (root,),
-        ).fetchall()
+        ).fetchone()
+        if root_row is None:
+            raise ValueError("The distillation root does not exist.")
+        rows = sorted(
+            active_context_rows(connection, root, str(root_row["entity"])),
+            key=lambda row: str(row["artifact_id"]),
+        )
         digest = hashlib.sha256()
         for row in rows:
             digest.update(str(row["artifact_id"]).encode("utf-8"))

@@ -104,6 +104,8 @@ Create a consistent database backup:
 The command uses the SQLite backup API.
 The command checks database integrity and foreign keys before publication.
 The command does not remove an older backup.
+The database backup does not contain attachment object files.
+Back up `AI_MEMORY_ARTIFACT_OBJECTS_DIR` with the applicable filesystem backup.
 
 Check the active artifact database:
 

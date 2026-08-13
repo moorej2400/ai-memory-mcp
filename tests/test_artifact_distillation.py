@@ -304,6 +304,120 @@ def test_note_validation_rejects_transcript_like_content_and_missing_evidence(
         )
 
 
+def test_note_validation_rejects_a_fully_blockquoted_transcript(
+    artifact_settings: Settings,
+) -> None:
+    candidate = _pending_meeting(artifact_settings)
+    relative = Path("References/Meetings/Quoted Transcript.md")
+    path = artifact_settings.memory_root / relative
+    path.parent.mkdir(parents=True)
+    cue_uri = artifact_uri(
+        "transcript-cue",
+        artifact_id(
+            "chat-source", "workspace", "transcript-cue", "cue-1"
+        ),
+    )
+    quoted_turns = "\n".join(
+        f"> 09:{index:02d} Person: Full transcript turn {index}."
+        for index in range(12)
+    )
+    note = _meeting_note(candidate, cue_uri).replace(
+        '> “Use the green setting for new deployments.”',
+        quoted_turns,
+    )
+    path.write_text(note, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="quotation|transcript"):
+        mark_distilled(
+            artifact_settings,
+            artifact_uri=candidate.artifact_uri,
+            memory_id="mem-review-meeting",
+            memory_source_id="core",
+            memory_path=relative.as_posix(),
+            event_id=candidate.latest_event_id,
+            source_digest=candidate.source_digest,
+        )
+
+
+def test_meeting_evidence_link_must_be_inside_the_evidence_section(
+    artifact_settings: Settings,
+) -> None:
+    candidate = _pending_meeting(artifact_settings)
+    relative = Path("References/Meetings/Misplaced Evidence.md")
+    path = artifact_settings.memory_root / relative
+    path.parent.mkdir(parents=True)
+    cue_uri = artifact_uri(
+        "transcript-cue",
+        artifact_id(
+            "chat-source", "workspace", "transcript-cue", "cue-1"
+        ),
+    )
+    note = _meeting_note(candidate, cue_uri).replace(
+        "## Decisions\n\n- Use the green setting for new deployments.",
+        "## Decisions\n\n"
+        f"- Use the green setting. [Source]({cue_uri})",
+    ).replace(f"> Source: [transcript cue]({cue_uri})", "> Source unavailable")
+    path.write_text(note, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="[Ee]vidence"):
+        mark_distilled(
+            artifact_settings,
+            artifact_uri=candidate.artifact_uri,
+            memory_id="mem-review-meeting",
+            memory_source_id="core",
+            memory_path=relative.as_posix(),
+            event_id=candidate.latest_event_id,
+            source_digest=candidate.source_digest,
+        )
+
+
+def test_meeting_evidence_link_must_belong_to_the_meeting_context(
+    artifact_settings: Settings,
+) -> None:
+    candidate = _pending_meeting(artifact_settings)
+    ArtifactStore(artifact_settings).apply_batch(
+        _batch(
+            "unrelated-batch",
+            [
+                _event(
+                    "conversation",
+                    "conversation-unrelated",
+                    "Unrelated conversation",
+                    occurred_at="2026-01-03T10:00:00Z",
+                ),
+                _event(
+                    "message",
+                    "message-unrelated",
+                    "Unrelated message",
+                    occurred_at="2026-01-03T10:01:00Z",
+                    parent=("conversation", "conversation-unrelated"),
+                ),
+            ],
+        )
+    )
+    unrelated_uri = artifact_uri(
+        "message",
+        artifact_id(
+            "chat-source", "workspace", "message", "message-unrelated"
+        ),
+    )
+    relative = Path("References/Meetings/Unrelated Evidence.md")
+    path = artifact_settings.memory_root / relative
+    path.parent.mkdir(parents=True)
+    path.write_text(_meeting_note(candidate, unrelated_uri), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="context|evidence"):
+        mark_distilled(
+            artifact_settings,
+            artifact_uri=candidate.artifact_uri,
+            memory_id="mem-review-meeting",
+            memory_source_id="core",
+            memory_path=relative.as_posix(),
+            event_id=candidate.latest_event_id,
+            source_digest=candidate.source_digest,
+        )
+
+
 @pytest.mark.parametrize(
     "memory_path",
     [

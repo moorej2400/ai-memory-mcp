@@ -201,6 +201,39 @@ def test_burst_semantic_hit_uses_the_raw_answer_gate(
     assert any("Raw artifact" in warning for warning in response.warnings)
 
 
+def test_short_message_with_an_attachment_child_is_embedded(
+    artifact_settings: Settings,
+) -> None:
+    events = [
+        _event(
+            "conversation",
+            "conversation-attachment",
+            "Attachment discussion",
+            "2026-01-02T10:00:00Z",
+        ),
+        _event(
+            "message",
+            "message-attachment",
+            "See file.",
+            "2026-01-02T10:01:00Z",
+            parent=("conversation", "conversation-attachment"),
+        ),
+        _event(
+            "attachment",
+            "attachment-1",
+            "example.txt",
+            "2026-01-02T10:01:00Z",
+            parent=("message", "message-attachment"),
+        ),
+    ]
+    ArtifactStore(artifact_settings).apply_batch(
+        _batch("attachment-vector-batch", events)
+    )
+    result = build_artifact_vector_index(artifact_settings)
+    assert result.bursts == 1
+    assert result.embedded_bursts == 1
+
+
 def test_sync_preserves_an_exact_external_id_raw_match(
     artifact_settings: Settings,
 ) -> None:

@@ -11,6 +11,7 @@ import yaml
 
 from ai_memory_mcp.config import Settings
 
+from .context import active_context_ids
 from .identity import artifact_uri as make_artifact_uri
 from .identity import parse_artifact_uri
 from .models import ArtifactScope, DistillationCandidate
@@ -23,6 +24,14 @@ TIMESTAMP_SPEAKER_RE = re.compile(
 )
 SPEAKER_TURN_RE = re.compile(r"^\s*[^#>\-\d\s][^:\n]{0,60}:\s+\S")
 ARTIFACT_LINK_RE = re.compile(r"\]\((artifact://[^)\s]+)\)")
+MAX_QUOTED_EVIDENCE_LINES = 12
+MAX_QUOTED_EVIDENCE_CHARACTERS = 2400
+
+
+def _utc_iso(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
 
 
 def _managed_region(markdown: str) -> tuple[int, int, str]:
@@ -103,10 +112,10 @@ def list_pending_distillations(
         parameters.extend(selected.entities)
     if selected.date_from is not None:
         conditions.append("a.occurred_at >= ?")
-        parameters.append(selected.date_from.isoformat())
+        parameters.append(_utc_iso(selected.date_from))
     if selected.date_to is not None:
         conditions.append("a.occurred_at <= ?")
-        parameters.append(selected.date_to.isoformat())
+        parameters.append(_utc_iso(selected.date_to))
     parameters.append(min(limit, 200))
     with connect_artifact_db(
         settings.artifact_db,
@@ -200,7 +209,25 @@ def _looks_like_transcript(body: str) -> bool:
         return False
     timestamp_turns = sum(bool(TIMESTAMP_SPEAKER_RE.match(line)) for line in lines)
     speaker_turns = sum(bool(SPEAKER_TURN_RE.match(line)) for line in lines)
-    return timestamp_turns >= 12 or speaker_turns / len(lines) >= 0.30
+    if timestamp_turns >= 12 or speaker_turns / len(lines) >= 0.30:
+        return True
+
+    quoted = [
+        line.lstrip()[1:].lstrip()
+        for line in body.splitlines()
+        if line.lstrip().startswith(">") and line.lstrip()[1:].strip()
+    ]
+    quoted_characters = sum(len(line) for line in quoted)
+    quoted_timestamp_turns = sum(
+        bool(TIMESTAMP_SPEAKER_RE.match(line)) for line in quoted
+    )
+    # Quoted evidence stays concise. This separate bound prevents a complete
+    # transcript from bypassing detection through Markdown blockquotes.
+    return bool(
+        len(quoted) > MAX_QUOTED_EVIDENCE_LINES
+        or quoted_characters > MAX_QUOTED_EVIDENCE_CHARACTERS
+        or quoted_timestamp_turns >= 12
+    )
 
 
 def _validate_note(
@@ -211,6 +238,7 @@ def _validate_note(
     memory_id: str,
     event_id: str,
     source_digest: str,
+    allowed_references: set[str],
 ) -> None:
     metadata, body = _frontmatter(markdown)
     expected = {
@@ -233,9 +261,19 @@ def _validate_note(
     if not summary_lines:
         raise ValueError("The Markdown note needs a summary paragraph.")
     evidence_heading = re.search(r"(?m)^## Evidence\s*$", managed)
-    links = ARTIFACT_LINK_RE.findall(managed)
+    evidence_region = ""
+    if evidence_heading is not None:
+        evidence_region = managed[evidence_heading.end() :]
+        next_heading = re.search(r"(?m)^##\s+", evidence_region)
+        if next_heading is not None:
+            evidence_region = evidence_region[: next_heading.start()]
+    links = ARTIFACT_LINK_RE.findall(evidence_region)
     for link in links:
         parse_artifact_uri(link)
+        if link not in allowed_references:
+            raise ValueError(
+                "The Markdown evidence link is outside the artifact context."
+            )
     if entity == "meeting" and evidence_heading is None:
         raise ValueError("A meeting Markdown note needs an Evidence section.")
     if entity == "meeting" and not links:
@@ -296,20 +334,38 @@ def mark_distilled(
     if not target.is_file():
         raise ValueError("The Markdown note does not exist under the memory root.")
     markdown = target.read_text(encoding="utf-8-sig")
-    _validate_note(
-        markdown,
-        entity=entity,
-        artifact_reference=artifact_uri,
-        memory_id=memory_id,
-        event_id=event_id,
-        source_digest=source_digest,
-    )
     migrate_artifact_db(settings)
     with connect_artifact_db(settings.artifact_db) as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             state = _current_state(connection, artifact_id, entity)
             _require_current(state, event_id, source_digest)
+            context_ids = active_context_ids(
+                connection,
+                artifact_id,
+                entity,
+            )
+            placeholders = ",".join("?" for _ in context_ids)
+            allowed_references = {
+                make_artifact_uri(
+                    str(row["entity"]),
+                    str(row["artifact_id"]),
+                )
+                for row in connection.execute(
+                    "SELECT artifact_id, entity FROM artifacts "
+                    f"WHERE artifact_id IN ({placeholders})",
+                    sorted(context_ids),
+                ).fetchall()
+            }
+            _validate_note(
+                markdown,
+                entity=entity,
+                artifact_reference=artifact_uri,
+                memory_id=memory_id,
+                event_id=event_id,
+                source_digest=source_digest,
+                allowed_references=allowed_references,
+            )
             connection.execute(
                 """
                 UPDATE distillation_state

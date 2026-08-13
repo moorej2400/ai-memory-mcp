@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 from ai_memory_mcp.config import Settings
@@ -15,13 +15,14 @@ from .identity import (
     canonical_json,
     parse_artifact_uri,
 )
+from .context import MEETING_CONTEXT_SQL
 from .models import (
     ArtifactReadRecord,
     ArtifactReadResponse,
     ArtifactScope,
     ArtifactSearchHit,
 )
-from .schema import connect_artifact_db, migrate_artifact_db
+from .schema import connect_artifact_db, require_current_artifact_schema
 
 ReadDirection = Literal["around", "before", "after"]
 
@@ -72,12 +73,18 @@ def _comparison(
     )
 
 
+def _utc_iso(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
 class ArtifactSearch:
     """Search and read canonical raw artifacts without using Markdown state."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        migrate_artifact_db(settings)
+        require_current_artifact_schema(settings)
 
     def search(
         self,
@@ -112,10 +119,10 @@ class ArtifactSearch:
             parameters.append(_parent_id(selected_scope.parent))
         if selected_scope.date_from is not None:
             conditions.append("a.occurred_at >= ?")
-            parameters.append(selected_scope.date_from.isoformat())
+            parameters.append(_utc_iso(selected_scope.date_from))
         if selected_scope.date_to is not None:
             conditions.append("a.occurred_at <= ?")
-            parameters.append(selected_scope.date_to.isoformat())
+            parameters.append(_utc_iso(selected_scope.date_to))
         parameters.append(limit)
 
         with connect_artifact_db(
@@ -137,23 +144,52 @@ class ArtifactSearch:
             ).fetchall()
         return [self._search_hit(row) for row in rows]
 
-    def get(self, reference: str) -> ArtifactSearchHit:
+    def get(
+        self,
+        reference: str,
+        scope: ArtifactScope | None = None,
+    ) -> ArtifactSearchHit:
         """Return one exact active artifact for internal identity routing."""
         entity, artifact_value = parse_artifact_uri(reference)
+        selected_scope = scope or ArtifactScope()
+        conditions = [
+            "artifact_id = ?",
+            "entity = ?",
+            "deleted_at IS NULL",
+            "redacted_at IS NULL",
+        ]
+        parameters: list[object] = [artifact_value, entity]
+        if selected_scope.source is not None:
+            conditions.append("source = ?")
+            parameters.append(selected_scope.source)
+        if selected_scope.source_instance is not None:
+            conditions.append("source_instance = ?")
+            parameters.append(selected_scope.source_instance)
+        if selected_scope.entities:
+            placeholders = ", ".join("?" for _ in selected_scope.entities)
+            conditions.append(f"entity IN ({placeholders})")
+            parameters.extend(selected_scope.entities)
+        if selected_scope.parent is not None:
+            conditions.append("parent_artifact_id = ?")
+            parameters.append(_parent_id(selected_scope.parent))
+        if selected_scope.date_from is not None:
+            conditions.append("occurred_at >= ?")
+            parameters.append(_utc_iso(selected_scope.date_from))
+        if selected_scope.date_to is not None:
+            conditions.append("occurred_at <= ?")
+            parameters.append(_utc_iso(selected_scope.date_to))
         with connect_artifact_db(
             self.settings.artifact_db,
             read_only=True,
         ) as connection:
             row = connection.execute(
-                """
-                SELECT * FROM artifacts
-                WHERE artifact_id = ? AND entity = ?
-                  AND deleted_at IS NULL AND redacted_at IS NULL
-                """,
-                (artifact_value, entity),
+                "SELECT * FROM artifacts WHERE " + " AND ".join(conditions),
+                parameters,
             ).fetchone()
         if row is None:
-            raise KeyError("The artifact reference does not exist or is inactive.")
+            raise KeyError(
+                "The artifact reference does not exist, is inactive, or is out of scope."
+            )
         return self._search_hit(row, score=1.0)
 
     @staticmethod
@@ -265,25 +301,8 @@ class ArtifactSearch:
             )
         if entity == "meeting":
             return (
-                f"""
-                WITH RECURSIVE context(artifact_id) AS (
-                    SELECT target_artifact_id
-                    FROM artifact_links
-                    WHERE source_artifact_id = ?
-                      AND relation IN ('contains', 'related-chat')
-                    UNION
-                    SELECT child.artifact_id
-                    FROM artifacts AS child
-                    JOIN context AS parent
-                      ON child.parent_artifact_id = parent.artifact_id
-                    WHERE child.deleted_at IS NULL
-                      AND child.redacted_at IS NULL
-                )
-                SELECT a.* FROM context
-                JOIN artifacts AS a USING(artifact_id)
-                WHERE {active}
-                """,
-                [focus["artifact_id"]],
+                MEETING_CONTEXT_SQL,
+                [focus["artifact_id"]] * 3,
                 False,
             )
         return (

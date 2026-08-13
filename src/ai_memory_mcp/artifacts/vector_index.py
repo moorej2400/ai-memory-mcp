@@ -29,6 +29,12 @@ from .schema import connect_artifact_db
 ARTIFACT_VECTOR_SCHEMA_VERSION = 1
 
 
+def _utc_iso(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
 def _connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     if read_only:
         connection = sqlite3.connect(
@@ -151,12 +157,21 @@ def _load_records(settings: Settings) -> tuple[int, list[ArtifactBurstRecord]]:
                    EXISTS(
                        SELECT 1 FROM artifact_object_links AS object_link
                        WHERE object_link.artifact_id = child.artifact_id
-                   ) AS has_object
+                   ) AS has_object,
+                   EXISTS(
+                       SELECT 1
+                       FROM artifacts AS attachment
+                       WHERE attachment.parent_artifact_id = child.artifact_id
+                         AND attachment.entity = 'attachment'
+                         AND attachment.deleted_at IS NULL
+                         AND attachment.redacted_at IS NULL
+                   ) AS has_attachment_child
             FROM artifacts AS child
             JOIN artifacts AS parent
               ON parent.artifact_id = child.parent_artifact_id
             WHERE child.entity IN ('message', 'transcript-cue')
               AND child.deleted_at IS NULL AND child.redacted_at IS NULL
+              AND parent.deleted_at IS NULL AND parent.redacted_at IS NULL
               AND child.occurred_at IS NOT NULL
             ORDER BY child.parent_artifact_id, child.occurred_at,
                      child.artifact_id
@@ -187,7 +202,11 @@ def _load_records(settings: Settings) -> tuple[int, list[ArtifactBurstRecord]]:
                     text=str(row["text_content"]),
                     classification=classification,
                     reactions=reactions,
-                    attachment_link=bool(row["has_object"]) or attachment,
+                    attachment_link=(
+                        bool(row["has_object"])
+                        or bool(row["has_attachment_child"])
+                        or attachment
+                    ),
                 )
             )
         connection.rollback()
@@ -247,8 +266,8 @@ def _insert_burst(
             burst.author_name,
             burst.first_artifact_uri,
             burst.last_artifact_uri,
-            burst.started_at.isoformat(),
-            burst.ended_at.isoformat(),
+            _utc_iso(burst.started_at),
+            _utc_iso(burst.ended_at),
             burst.record_count,
             burst.text,
             int(burst.embed),
@@ -421,10 +440,10 @@ def search_artifact_vectors(
         parameters.append(parent)
     if scope.date_from is not None:
         conditions.append("started_at >= ?")
-        parameters.append(scope.date_from.isoformat())
+        parameters.append(_utc_iso(scope.date_from))
     if scope.date_to is not None:
         conditions.append("started_at <= ?")
-        parameters.append(scope.date_to.isoformat())
+        parameters.append(_utc_iso(scope.date_to))
     with _connect(current, read_only=True) as connection:
         rows = connection.execute(
             "SELECT * FROM bursts WHERE " + " AND ".join(conditions),

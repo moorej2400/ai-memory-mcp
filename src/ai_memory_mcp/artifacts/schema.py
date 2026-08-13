@@ -2,15 +2,28 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
 
 from ai_memory_mcp import __version__
 from ai_memory_mcp.config import Settings
 
-ARTIFACT_SCHEMA_VERSION = 1
+ARTIFACT_SCHEMA_VERSION = 2
+NETWORK_FILESYSTEM_TYPES = {
+    "9p",
+    "afpfs",
+    "cifs",
+    "fuse.sshfs",
+    "nfs",
+    "nfs4",
+    "smbfs",
+    "webdav",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +55,71 @@ def _private_file(path: Path) -> None:
         path.chmod(0o600)
 
 
+def _decode_mount_path(value: str) -> Path:
+    for encoded, decoded in (
+        ("\\040", " "),
+        ("\\011", "\t"),
+        ("\\012", "\n"),
+        ("\\134", "\\"),
+    ):
+        value = value.replace(encoded, decoded)
+    return Path(value).resolve()
+
+
+@lru_cache(maxsize=1)
+def _mounted_filesystems() -> tuple[tuple[Path, str], ...]:
+    entries: list[tuple[Path, str]] = []
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["/sbin/mount"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ()
+        for line in result.stdout.splitlines():
+            if " on " not in line or " (" not in line:
+                continue
+            _, mounted = line.split(" on ", 1)
+            mount_value, options = mounted.rsplit(" (", 1)
+            filesystem = options.removesuffix(")").split(",", 1)[0]
+            entries.append((_decode_mount_path(mount_value), filesystem))
+    elif sys.platform.startswith("linux"):
+        try:
+            lines = Path("/proc/self/mountinfo").read_text(
+                encoding="utf-8"
+            ).splitlines()
+        except OSError:
+            return ()
+        for line in lines:
+            fields = line.split()
+            try:
+                separator = fields.index("-")
+                mount_value = fields[4]
+                filesystem = fields[separator + 1]
+            except (IndexError, ValueError):
+                continue
+            entries.append((_decode_mount_path(mount_value), filesystem))
+    return tuple(entries)
+
+
+def _network_filesystem_type(path: Path) -> str | None:
+    if os.name == "nt" and str(path).startswith("\\\\"):
+        return "unc"
+    resolved = path.expanduser().resolve()
+    matches = [
+        (mount, filesystem)
+        for mount, filesystem in _mounted_filesystems()
+        if resolved == mount or resolved.is_relative_to(mount)
+    ]
+    if not matches:
+        return None
+    _, filesystem = max(matches, key=lambda item: len(item[0].parts))
+    return filesystem if filesystem.casefold() in NETWORK_FILESYSTEM_TYPES else None
+
+
 def connect_artifact_db(
     path: Path,
     *,
@@ -49,6 +127,11 @@ def connect_artifact_db(
 ) -> sqlite3.Connection:
     """Open the artifact database with its durability and isolation rules."""
     path = path.expanduser().resolve()
+    network_type = _network_filesystem_type(path)
+    if network_type is not None:
+        raise ValueError(
+            f"The artifact database cannot use the {network_type} network filesystem."
+        )
     if read_only:
         uri = f"file:{quote(path.as_posix(), safe='/')}?mode=ro"
         connection = sqlite3.connect(uri, uri=True, timeout=10.0)
@@ -347,6 +430,18 @@ MIGRATION_1_STATEMENTS = (
 )
 
 
+MIGRATION_2_STATEMENTS = (
+    """
+    ALTER TABLE artifact_events
+    ADD COLUMN parent_artifact_id TEXT REFERENCES artifacts(artifact_id)
+    """,
+    """
+    CREATE INDEX artifact_links_target_idx
+        ON artifact_links(target_artifact_id, relation, source_artifact_id)
+    """,
+)
+
+
 def _backup_database(
     connection: sqlite3.Connection,
     settings: Settings,
@@ -384,6 +479,29 @@ def _apply_migration_1(connection: sqlite3.Connection) -> None:
         connection.commit()
 
 
+def _apply_migration_2(connection: sqlite3.Connection) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        # The version row makes this ALTER rerun-safe. Reapplying the column
+        # would otherwise stop startup after a completed migration.
+        for statement in MIGRATION_2_STATEMENTS:
+            connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO artifact_schema_migrations(
+                version, applied_at, application_version
+            ) VALUES (?, ?, ?)
+            """,
+            (2, now, __version__),
+        )
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
 def migrate_artifact_db(settings: Settings) -> MigrationResult:
     """Move the canonical artifact database to the current schema."""
     path = settings.artifact_db.expanduser()
@@ -408,6 +526,9 @@ def migrate_artifact_db(settings: Settings) -> MigrationResult:
         if from_version < 1:
             _apply_migration_1(connection)
             applied.append(1)
+        if from_version < 2:
+            _apply_migration_2(connection)
+            applied.append(2)
 
     _private_file(path)
     return MigrationResult(
@@ -416,6 +537,21 @@ def migrate_artifact_db(settings: Settings) -> MigrationResult:
         applied=applied,
         backup_path=backup_path,
     )
+
+
+def require_current_artifact_schema(settings: Settings) -> int:
+    """Validate the canonical schema without applying a migration."""
+    path = settings.artifact_db.expanduser()
+    if not path.is_file():
+        raise FileNotFoundError("Artifact database is not available.")
+    with connect_artifact_db(path, read_only=True) as connection:
+        version = _migration_version(connection)
+    if version != ARTIFACT_SCHEMA_VERSION:
+        raise RuntimeError(
+            "The artifact database schema is not current. "
+            "Run the artifact migration command."
+        )
+    return version
 
 
 def artifact_database_status(settings: Settings) -> ArtifactDatabaseStatus:

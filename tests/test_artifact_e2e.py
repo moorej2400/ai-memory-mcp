@@ -233,7 +233,6 @@ def test_batch_to_distilled_markdown_recall_is_idempotent(
     meeting_context = search.read(meeting_reference, limit=30)
     assert {record.entity for record in meeting_context.records} == {
         "conversation",
-        "meeting",
         "message",
         "transcript",
         "transcript-cue",

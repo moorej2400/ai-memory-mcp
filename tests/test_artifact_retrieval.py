@@ -4,6 +4,8 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from ai_memory_mcp.artifacts.identity import artifact_id, artifact_uri
 from ai_memory_mcp.artifacts.models import (
     ArtifactBatchManifest,
@@ -111,6 +113,33 @@ def test_exact_artifact_uri_routes_to_the_focus(
     assert response.status == "answered"
     assert response.intent == "exact"
     assert response.citations[0].path == reference
+
+
+def test_exact_artifact_uri_enforces_artifact_scope(
+    artifact_settings: Settings,
+) -> None:
+    ArtifactStore(artifact_settings).apply_batch(_raw_batch())
+    reference = artifact_uri(
+        "message",
+        artifact_id("chat-source", "workspace", "message", "message-1"),
+    )
+    with pytest.raises(KeyError, match="scope|inactive|exist"):
+        MemoryService(artifact_settings).recall(
+            reference,
+            source_label="different-source",
+        )
+
+
+def test_recall_rejects_mixed_markdown_and_artifact_filters(
+    artifact_settings: Settings,
+) -> None:
+    ArtifactStore(artifact_settings).apply_batch(_raw_batch())
+    with pytest.raises(ValueError, match="Markdown|artifact"):
+        MemoryService(artifact_settings).recall(
+            "rotation",
+            repository="example/repository",
+            source_label="chat-source",
+        )
 
 
 def test_recent_raw_near_tie_ranks_above_old_raw(
@@ -226,6 +255,59 @@ def test_raw_audit_log_contains_digests_instead_of_text(
     }
 
 
+def test_artifact_no_hit_audit_hashes_the_query(
+    artifact_settings: Settings,
+    tmp_path: Path,
+) -> None:
+    settings = replace(artifact_settings, log_dir=tmp_path / "logs")
+    ArtifactStore(settings).apply_batch(_raw_batch())
+    sensitive_marker = "absent-private-artifact-query"
+    response = MemoryService(settings).recall(
+        sensitive_marker,
+        source_label="chat-source",
+    )
+    assert response.status == "no_answer"
+    record = json.loads(
+        (settings.resolved_log_dir / "retrieval.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[-1]
+    )
+    assert sensitive_marker not in json.dumps(record)
+    assert record["query_sha256"]
+    assert record["query_characters"] == len(sensitive_marker)
+
+
+def test_artifact_failure_audit_hashes_the_query(
+    artifact_settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(artifact_settings, log_dir=tmp_path / "logs")
+    ArtifactStore(settings).apply_batch(_raw_batch())
+    sensitive_marker = "failed-private-artifact-query"
+
+    def fail_search(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("Synthetic artifact search failure")
+
+    monkeypatch.setattr(
+        "ai_memory_mcp.service.ArtifactSearch.search",
+        fail_search,
+    )
+    with pytest.raises(RuntimeError, match="Synthetic"):
+        MemoryService(settings).recall(
+            sensitive_marker,
+            source_label="chat-source",
+        )
+    record = json.loads(
+        (settings.resolved_log_dir / "retrieval.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[-1]
+    )
+    assert sensitive_marker not in json.dumps(record)
+    assert record["query_sha256"]
+    assert record["query_characters"] == len(sensitive_marker)
+
+
 def test_status_and_ordered_read_include_artifact_state(
     artifact_settings: Settings,
 ) -> None:
@@ -233,7 +315,7 @@ def test_status_and_ordered_read_include_artifact_state(
     service = MemoryService(artifact_settings)
     status = service.status()
     assert status.artifact_database.available is True
-    assert status.artifact_database.schema_version == 1
+    assert status.artifact_database.schema_version == 2
     assert status.artifact_database.artifacts == 1
 
     reference = artifact_uri(

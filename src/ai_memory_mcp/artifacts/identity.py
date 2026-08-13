@@ -72,6 +72,7 @@ def event_id(
         source_instance,
         str(event["entity"]),
         str(event["external_id"]),
+        str(event.get("parent_artifact_id") or ""),
         str(event["operation"]),
         str(ordering),
         str(event["payload_sha256"]),

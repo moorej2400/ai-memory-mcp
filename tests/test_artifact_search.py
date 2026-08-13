@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
+from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +18,7 @@ from ai_memory_mcp.artifacts.models import (
     ParsedArtifactBatch,
 )
 from ai_memory_mcp.artifacts.search import ArtifactSearch
+from ai_memory_mcp.artifacts.schema import connect_artifact_db
 from ai_memory_mcp.artifacts.store import ArtifactStore
 from ai_memory_mcp.config import Settings
 from ai_memory_mcp.text import fts_expression
@@ -309,6 +313,190 @@ def test_meeting_read_traverses_contains_and_related_chat_links(
         "Related conversation",
         "Follow-up from the meeting.",
     }
+
+
+def test_meeting_read_excludes_sibling_meetings_and_their_descendants(
+    artifact_settings: Settings,
+) -> None:
+    related = ArtifactLink(
+        relation="related-chat",
+        target=ArtifactReference(
+            entity="conversation",
+            external_id="conversation-shared",
+        ),
+    )
+    events = [
+        _event(
+            "conversation",
+            "conversation-shared",
+            "Shared conversation",
+            "2026-01-02T09:00:00Z",
+        ),
+        _event(
+            "message",
+            "message-shared",
+            "Shared follow-up",
+            "2026-01-02T09:05:00Z",
+            parent=("conversation", "conversation-shared"),
+        ),
+        _event(
+            "meeting",
+            "meeting-one",
+            "Meeting one",
+            "2026-01-02T10:00:00Z",
+            parent=("conversation", "conversation-shared"),
+            links=[related],
+        ),
+        _event(
+            "transcript",
+            "transcript-one",
+            "Transcript one",
+            "2026-01-02T10:00:00Z",
+            parent=("meeting", "meeting-one"),
+        ),
+        _event(
+            "transcript-cue",
+            "cue-one",
+            "Decision for meeting one",
+            "2026-01-02T10:10:00Z",
+            parent=("transcript", "transcript-one"),
+        ),
+        _event(
+            "meeting",
+            "meeting-two",
+            "Meeting two",
+            "2026-01-03T10:00:00Z",
+            parent=("conversation", "conversation-shared"),
+            links=[related],
+        ),
+        _event(
+            "transcript",
+            "transcript-two",
+            "Transcript two",
+            "2026-01-03T10:00:00Z",
+            parent=("meeting", "meeting-two"),
+        ),
+        _event(
+            "transcript-cue",
+            "cue-two",
+            "Decision for meeting two",
+            "2026-01-03T10:10:00Z",
+            parent=("transcript", "transcript-two"),
+        ),
+    ]
+    ArtifactStore(artifact_settings).apply_batch(
+        _batch("chat-source", "workspace", "shared-meetings", events)
+    )
+    reference = artifact_uri(
+        "meeting",
+        artifact_id("chat-source", "workspace", "meeting", "meeting-one"),
+    )
+    texts = {
+        record.text
+        for record in ArtifactSearch(artifact_settings)
+        .read(reference, direction="after", limit=20)
+        .records
+    }
+    assert {
+        "Shared conversation",
+        "Shared follow-up",
+        "Transcript one",
+        "Decision for meeting one",
+    } <= texts
+    assert texts.isdisjoint(
+        {"Meeting two", "Transcript two", "Decision for meeting two"}
+    )
+
+
+def test_meeting_read_does_not_traverse_an_inactive_related_chat(
+    artifact_settings: Settings,
+) -> None:
+    related = ArtifactLink(
+        relation="related-chat",
+        target=ArtifactReference(
+            entity="conversation",
+            external_id="conversation-inactive",
+        ),
+    )
+    events = [
+        _event(
+            "conversation",
+            "conversation-inactive",
+            "Inactive conversation",
+            "2026-01-02T09:00:00Z",
+        ),
+        _event(
+            "message",
+            "message-inactive",
+            "Message under inactive conversation",
+            "2026-01-02T09:05:00Z",
+            parent=("conversation", "conversation-inactive"),
+        ),
+        _event(
+            "meeting",
+            "meeting-inactive-chat",
+            "Meeting",
+            "2026-01-02T10:00:00Z",
+            links=[related],
+        ),
+    ]
+    store = ArtifactStore(artifact_settings)
+    store.apply_batch(_batch("chat-source", "workspace", "inactive-base", events))
+    delete = ArtifactEvent.model_validate(
+        {
+            "schema": "ai-memory/artifact-event@1",
+            "record": "event",
+            "entity": "conversation",
+            "operation": "delete",
+            "external_id": "conversation-inactive",
+            "source_updated_at": "2026-01-02T11:00:00Z",
+        }
+    )
+    store.apply_batch(
+        _batch("chat-source", "workspace", "inactive-delete", [delete])
+    )
+    reference = artifact_uri(
+        "meeting",
+        artifact_id(
+            "chat-source", "workspace", "meeting", "meeting-inactive-chat"
+        ),
+    )
+    result = ArtifactSearch(artifact_settings).read(
+        reference,
+        direction="after",
+        limit=20,
+    )
+    assert result.records == []
+
+
+def test_search_rejects_an_old_schema_without_migrating_it(
+    artifact_settings: Settings,
+    tmp_path: Path,
+) -> None:
+    old_db = tmp_path / "old-artifacts.sqlite3"
+    with sqlite3.connect(old_db) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE artifact_schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL,
+                application_version TEXT NOT NULL
+            );
+            CREATE TABLE sentinel(value TEXT NOT NULL);
+            INSERT INTO sentinel VALUES ('unchanged');
+            """
+        )
+    settings = replace(artifact_settings, artifact_db=old_db)
+    before = old_db.read_bytes()
+
+    with pytest.raises(RuntimeError, match="schema|migrate"):
+        ArtifactSearch(settings)
+
+    assert old_db.read_bytes() == before
+    with connect_artifact_db(old_db, read_only=True) as connection:
+        assert connection.execute("SELECT value FROM sentinel").fetchone()[0] == (
+            "unchanged"
+        )
 
 
 def test_fts_expression_quotes_unique_tokens_and_limits_count() -> None:
