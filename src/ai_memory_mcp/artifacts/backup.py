@@ -31,6 +31,46 @@ def _private_file(path: Path) -> None:
         path.chmod(0o600)
 
 
+def _discard_generated_partial(path: Path) -> None:
+    # SQLite can leave generated WAL sidecars after a backup connection closes.
+    for candidate in (
+        Path(f"{path}-wal"),
+        Path(f"{path}-shm"),
+        Path(f"{path}-journal"),
+        path,
+    ):
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _sync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _publish_no_overwrite(temporary: Path, destination: Path) -> None:
+    # A same-directory hard link gives POSIX and Windows an exclusive final name.
+    try:
+        os.link(temporary, destination)
+    except FileExistsError as exc:
+        _discard_generated_partial(temporary)
+        raise RuntimeError(
+            "The artifact destination appeared during publication."
+        ) from exc
+    except BaseException:
+        _discard_generated_partial(temporary)
+        raise
+    _discard_generated_partial(temporary)
+    _sync_directory(destination.parent)
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -97,20 +137,25 @@ def backup_artifact_db(settings: Settings) -> ArtifactBackupResult:
     temporary = backup_dir / (
         f".{destination.name}.partial-{os.getpid()}-{time.time_ns()}"
     )
-    with connect_artifact_db(
-        settings.artifact_db,
-        read_only=True,
-    ) as source, sqlite3.connect(temporary) as target:
-        source.backup(target)
-    _private_file(temporary)
-    integrity = _inspect(temporary)
-    if not integrity.ok:
-        raise RuntimeError(
-            "Artifact backup failed integrity or foreign-key validation."
-        )
-    if destination.exists():
-        raise RuntimeError("The generated artifact backup path already exists.")
-    os.replace(temporary, destination)
+    try:
+        with (
+            connect_artifact_db(
+                settings.artifact_db,
+                read_only=True,
+            ) as source,
+            sqlite3.connect(temporary) as target,
+        ):
+            source.backup(target)
+        _private_file(temporary)
+        integrity = _inspect(temporary)
+        if not integrity.ok:
+            raise RuntimeError(
+                "Artifact backup failed integrity or foreign-key validation."
+            )
+        _publish_no_overwrite(temporary, destination)
+    except BaseException:
+        _discard_generated_partial(temporary)
+        raise
     _private_file(destination)
     return ArtifactBackupResult(
         path=destination,
@@ -143,17 +188,19 @@ def restore_artifact_db(
     temporary = target.parent / (
         f".{target.name}.partial-{os.getpid()}-{time.time_ns()}"
     )
-    with _read_only(source) as backup, sqlite3.connect(temporary) as restored:
-        backup.backup(restored)
-    _private_file(temporary)
-    restored_integrity = _inspect(temporary)
-    if not restored_integrity.ok:
-        raise RuntimeError("The restored database failed integrity validation.")
-    if _sha256_file(source) != source_digest:
-        raise RuntimeError("The source backup changed during restore.")
-    if target.exists():
-        raise RuntimeError("The artifact restore destination appeared during restore.")
-    os.replace(temporary, target)
+    try:
+        with _read_only(source) as backup, sqlite3.connect(temporary) as restored:
+            backup.backup(restored)
+        _private_file(temporary)
+        restored_integrity = _inspect(temporary)
+        if not restored_integrity.ok:
+            raise RuntimeError("The restored database failed integrity validation.")
+        if _sha256_file(source) != source_digest:
+            raise RuntimeError("The source backup changed during restore.")
+        _publish_no_overwrite(temporary, target)
+    except BaseException:
+        _discard_generated_partial(temporary)
+        raise
     _private_file(target)
     return ArtifactRestoreResult(
         source=source,

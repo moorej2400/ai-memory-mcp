@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
-from io import TextIOBase
 from typing import Any, TextIO
 from urllib.parse import parse_qsl, urlsplit
 
@@ -21,10 +21,23 @@ from .models import (
 SECRET_KEYS = frozenset(
     {
         "access_token",
+        "api_key",
         "authorization",
+        "bearer_token",
+        "client_secret",
         "cookie",
         "cookies",
+        "credential",
+        "credentials",
+        "encrypted_token",
+        "id_token",
+        "password",
+        "private_key",
         "refresh_token",
+        "sas_token",
+        "secret",
+        "session_token",
+        "shared_access_signature",
         "tempauth",
         "temporarydownloadurl",
     }
@@ -34,43 +47,108 @@ AUTH_QUERY_KEYS = frozenset(
         "access_token",
         "auth",
         "authorization",
+        "client_secret",
+        "code",
+        "credential",
         "key",
+        "password",
         "sig",
         "signature",
         "tempauth",
         "token",
+        "x_amz_credential",
+        "x_amz_security_token",
+        "x_amz_signature",
+        "x_goog_credential",
+        "x_goog_signature",
     }
 )
+HTTP_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+MAX_NESTED_URL_DEPTH = 8
+
+
+def _normalize_security_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+
+# Connector envelopes are untrusted. Normalize key spelling before comparison.
+SECRET_KEY_TOKENS = frozenset(_normalize_security_key(key) for key in SECRET_KEYS)
+AUTH_QUERY_KEY_TOKENS = frozenset(
+    _normalize_security_key(key) for key in AUTH_QUERY_KEYS
+)
+
+
+def _reject_url_credentials(value: str, path: str, *, depth: int) -> None:
+    if depth > MAX_NESTED_URL_DEPTH:
+        raise ValueError("Artifact input contains excessive nested URLs.")
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return
+    if parsed.scheme.casefold() not in {"http", "https"}:
+        return
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"Artifact input contains URL credentials at {path}.")
+    for key, child in parse_qsl(parsed.query, keep_blank_values=True):
+        if _normalize_security_key(key) in AUTH_QUERY_KEY_TOKENS:
+            raise ValueError(
+                f"Artifact input contains an authentication query parameter: {key}."
+            )
+        _reject_nested_query_material(child, path, depth=depth + 1)
+    fragment_query = parsed.fragment.partition("?")[2]
+    for key, child in parse_qsl(fragment_query, keep_blank_values=True):
+        if _normalize_security_key(key) in AUTH_QUERY_KEY_TOKENS:
+            raise ValueError(
+                f"Artifact input contains an authentication query parameter: {key}."
+            )
+        _reject_nested_query_material(child, path, depth=depth + 1)
+    _reject_secret_text(parsed.fragment, path, depth=depth + 1)
+
+
+def _reject_nested_query_material(value: str, path: str, *, depth: int) -> None:
+    if depth > MAX_NESTED_URL_DEPTH:
+        raise ValueError("Artifact input contains excessive nested URLs.")
+    # Redirect parameters can hide encoded absolute or relative signed URLs.
+    _reject_secret_text(value, path, depth=depth)
+    _, marker, query_text = value.partition("?")
+    if (
+        not marker
+        and "=" in value
+        and not any(character.isspace() for character in value)
+    ):
+        query_text = value
+    if not query_text:
+        return
+    for key, child in parse_qsl(query_text, keep_blank_values=True):
+        if _normalize_security_key(key) in AUTH_QUERY_KEY_TOKENS:
+            raise ValueError(
+                f"Artifact input contains an authentication query parameter: {key}."
+            )
+        _reject_nested_query_material(child, path, depth=depth + 1)
+
+
+def _reject_secret_text(value: str, path: str, *, depth: int = 0) -> None:
+    for match in HTTP_URL_RE.finditer(value):
+        candidate = match.group(0).rstrip(".,;!)]}")
+        _reject_url_credentials(candidate, path, depth=depth)
 
 
 def _reject_secret_material(value: Any, path: str = "payload") -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
-            normalized = str(key).replace("-", "_").casefold()
-            if normalized in SECRET_KEYS:
+            if _normalize_security_key(str(key)) in SECRET_KEY_TOKENS:
                 raise ValueError(
                     f"Artifact input contains a secret field at {path}.{key}."
                 )
             _reject_secret_material(child, f"{path}.{key}")
         return
-    if isinstance(value, Sequence) and not isinstance(
-        value, (str, bytes, bytearray)
-    ):
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for index, child in enumerate(value):
             _reject_secret_material(child, f"{path}[{index}]")
         return
     if not isinstance(value, str):
         return
-    parsed = urlsplit(value)
-    if parsed.scheme.casefold() not in {"http", "https"}:
-        return
-    query_keys = {key.casefold() for key, _ in parse_qsl(parsed.query)}
-    prohibited = sorted(query_keys & AUTH_QUERY_KEYS)
-    if prohibited:
-        raise ValueError(
-            "Artifact input contains an authentication query parameter: "
-            f"{prohibited[0]}."
-        )
+    _reject_secret_text(value, path)
 
 
 def read_artifact_batch(
@@ -110,9 +188,7 @@ def read_artifact_batch(
         raise ValueError("Artifact batch input does not contain a manifest.")
     first_line, first = records[0]
     if first.get("record") != "batch":
-        raise ValueError(
-            f"Artifact batch line {first_line} must contain the manifest."
-        )
+        raise ValueError(f"Artifact batch line {first_line} must contain the manifest.")
     try:
         manifest = ArtifactBatchManifest.model_validate(first)
     except ValidationError as exc:
@@ -136,9 +212,7 @@ def read_artifact_batch(
             ) from exc
 
     if len(events) != manifest.event_count:
-        raise ValueError(
-            "Artifact batch event count does not match the manifest."
-        )
+        raise ValueError("Artifact batch event count does not match the manifest.")
     return ParsedArtifactBatch(
         manifest=manifest,
         events=events,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -82,9 +83,7 @@ def test_backup_is_consistent_while_another_batch_commits(
 
 
 def test_check_reports_counts_and_integrity(artifact_settings: Settings) -> None:
-    ArtifactStore(artifact_settings).apply_batch(
-        _batch("backup-batch-1", "message-1")
-    )
+    ArtifactStore(artifact_settings).apply_batch(_batch("backup-batch-1", "message-1"))
     result = check_artifact_db(artifact_settings)
     assert result.ok is True
     assert result.quick_check == "ok"
@@ -97,9 +96,7 @@ def test_restore_uses_a_new_destination_and_preserves_the_backup(
     artifact_settings: Settings,
     tmp_path: Path,
 ) -> None:
-    ArtifactStore(artifact_settings).apply_batch(
-        _batch("backup-batch-1", "message-1")
-    )
+    ArtifactStore(artifact_settings).apply_batch(_batch("backup-batch-1", "message-1"))
     backup = backup_artifact_db(artifact_settings)
     source_digest = hashlib.sha256(backup.path.read_bytes()).hexdigest()
     destination = tmp_path / "restore" / "artifacts.sqlite3"
@@ -119,12 +116,33 @@ def test_restore_rejects_an_existing_destination(
     artifact_settings: Settings,
     tmp_path: Path,
 ) -> None:
-    ArtifactStore(artifact_settings).apply_batch(
-        _batch("backup-batch-1", "message-1")
-    )
+    ArtifactStore(artifact_settings).apply_batch(_batch("backup-batch-1", "message-1"))
     backup = backup_artifact_db(artifact_settings)
     destination = tmp_path / "existing.sqlite3"
     destination.write_bytes(b"keep")
     with pytest.raises(ValueError, match="exists"):
         restore_artifact_db(backup.path, destination)
     assert destination.read_bytes() == b"keep"
+
+
+def test_restore_does_not_overwrite_a_destination_created_during_publication(
+    artifact_settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ArtifactStore(artifact_settings).apply_batch(_batch("backup-batch-1", "message-1"))
+    backup = backup_artifact_db(artifact_settings)
+    destination = tmp_path / "restore-race" / "artifacts.sqlite3"
+    real_link = os.link
+
+    def racing_link(source: Path, target: Path) -> None:
+        target.write_bytes(b"racing writer")
+        real_link(source, target)
+
+    monkeypatch.setattr(os, "link", racing_link)
+
+    with pytest.raises(RuntimeError, match="appeared|exists"):
+        restore_artifact_db(backup.path, destination)
+
+    assert destination.read_bytes() == b"racing writer"
+    assert not list(destination.parent.glob("*.partial-*"))

@@ -26,6 +26,23 @@ def _private_file(path: Path) -> None:
         path.chmod(0o600)
 
 
+def _discard_generated_partial(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _sync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _hash_file(path: Path) -> tuple[str, int]:
     digest = hashlib.sha256()
     byte_count = 0
@@ -67,9 +84,7 @@ def store_object(
     object_root = settings.artifact_objects_dir.expanduser().resolve()
     if source.is_relative_to(object_root):
         raise ValueError("The object source cannot be inside the object directory.")
-    if expected_sha256 is not None and not SHA256_PATTERN.fullmatch(
-        expected_sha256
-    ):
+    if expected_sha256 is not None and not SHA256_PATTERN.fullmatch(expected_sha256):
         raise ValueError("The expected object hash has an invalid format.")
 
     digest, byte_count = _hash_file(source)
@@ -98,35 +113,33 @@ def store_object(
     temporary = destination.parent / (
         f".{digest}.partial-{os.getpid()}-{uuid.uuid4().hex}"
     )
-    copied_digest = hashlib.sha256()
-    copied_bytes = 0
-    with source.open("rb") as incoming, temporary.open("xb") as outgoing:
-        while chunk := incoming.read(COPY_CHUNK_BYTES):
-            outgoing.write(chunk)
-            copied_digest.update(chunk)
-            copied_bytes += len(chunk)
-        outgoing.flush()
-        os.fsync(outgoing.fileno())
-    _private_file(temporary)
-    if copied_digest.hexdigest() != digest or copied_bytes != byte_count:
-        raise ValueError("The staged object hash does not match the source hash.")
-    if destination.exists():
-        verification = verify_object(settings, digest)
-        if not verification.ok:
-            raise ValueError(
-                "The existing object path contains data with a different hash."
-            )
-        raise RuntimeError(
-            f"A verified object appeared during publication. Staged file: {temporary}"
-        )
-    os.replace(temporary, destination)
-    _private_file(destination)
-    if os.name != "nt":
-        directory_fd = os.open(destination.parent, os.O_RDONLY)
+    try:
+        copied_digest = hashlib.sha256()
+        copied_bytes = 0
+        with source.open("rb") as incoming, temporary.open("xb") as outgoing:
+            while chunk := incoming.read(COPY_CHUNK_BYTES):
+                outgoing.write(chunk)
+                copied_digest.update(chunk)
+                copied_bytes += len(chunk)
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+        _private_file(temporary)
+        if copied_digest.hexdigest() != digest or copied_bytes != byte_count:
+            raise ValueError("The staged object hash does not match the source hash.")
+
+        # Only one writer can claim the digest path. Losers verify and reuse it.
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            os.link(temporary, destination)
+        except FileExistsError:
+            verification = verify_object(settings, digest)
+            if not verification.ok or verification.byte_count != byte_count:
+                raise ValueError(
+                    "The existing object path contains data with a different hash."
+                )
+        _private_file(destination)
+    finally:
+        _discard_generated_partial(temporary)
+    _sync_directory(destination.parent)
 
     return StoredObject(
         sha256=digest,

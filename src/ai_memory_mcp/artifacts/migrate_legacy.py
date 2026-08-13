@@ -5,10 +5,11 @@ import json
 import re
 import sqlite3
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, time, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import yaml
@@ -16,7 +17,13 @@ import yaml
 from ai_memory_mcp.config import Settings
 
 from .identity import artifact_id, canonical_json, sha256_text
-from .ingest import AUTH_QUERY_KEYS, SECRET_KEYS
+from .ingest import (
+    AUTH_QUERY_KEY_TOKENS,
+    HTTP_URL_RE,
+    SECRET_KEY_TOKENS,
+    _normalize_security_key,
+    _reject_secret_material,
+)
 from .models import (
     ArtifactActor,
     ArtifactBatchManifest,
@@ -69,6 +76,7 @@ class LegacyData:
     chat_mapping: dict[str, LegacyNote]
     meeting_mapping: dict[str, LegacyNote]
     cues: dict[str, list[LegacyCue]]
+    source_database_fingerprint: tuple[tuple[str, int, int, str], ...]
 
 
 def _sha256_file(path: Path) -> str:
@@ -77,6 +85,41 @@ def _sha256_file(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _source_database_paths(path: Path) -> tuple[Path, ...]:
+    # SHM bytes describe reader locks, not logical rows, and can change on inspection.
+    return (
+        path,
+        Path(f"{path}-wal"),
+        Path(f"{path}-journal"),
+    )
+
+
+def _source_database_fingerprint(
+    path: Path,
+) -> tuple[tuple[str, int, int, str], ...]:
+    values: list[tuple[str, int, int, str]] = []
+    for candidate in _source_database_paths(path):
+        try:
+            before = candidate.stat()
+            digest = _sha256_file(candidate)
+            after = candidate.stat()
+        except FileNotFoundError:
+            continue
+        if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+            raise RuntimeError("The legacy database changed during inspection.")
+        values.append(
+            (
+                candidate.name,
+                after.st_size,
+                after.st_mtime_ns,
+                digest,
+            )
+        )
+    if not values or values[0][0] != path.name:
+        raise FileNotFoundError("The legacy database is not available.")
+    return tuple(values)
 
 
 def _legacy_connection(path: Path, *, immutable: bool) -> sqlite3.Connection:
@@ -89,17 +132,52 @@ def _legacy_connection(path: Path, *, immutable: bool) -> sqlite3.Connection:
     return connection
 
 
+def _logical_snapshot(
+    path: Path,
+    *,
+    immutable: bool,
+) -> tuple[sqlite3.Connection, str, tuple[tuple[str, int, int, str], ...]]:
+    before = _source_database_fingerprint(path)
+    has_wal = Path(f"{path}-wal").is_file()
+    # SQLite immutable mode ignores WAL files. Use read-only mode when a WAL exists.
+    source = _legacy_connection(path, immutable=immutable and not has_wal)
+    snapshot = sqlite3.connect(":memory:")
+    try:
+        source.backup(snapshot)
+    except BaseException:
+        snapshot.close()
+        raise
+    finally:
+        source.close()
+    after = _source_database_fingerprint(path)
+    if before != after:
+        snapshot.close()
+        raise RuntimeError("The legacy database changed during snapshot creation.")
+    snapshot.row_factory = sqlite3.Row
+    snapshot.execute("PRAGMA foreign_keys = ON")
+    snapshot.execute("PRAGMA query_only = ON")
+    return snapshot, hashlib.sha256(snapshot.serialize()).hexdigest(), after
+
+
 def _note_paths(value: Path | Iterable[Path] | None) -> list[Path]:
     if value is None:
         return []
     if isinstance(value, Path):
+        if not value.exists():
+            raise FileNotFoundError(f"The legacy note path does not exist: {value}")
         if value.is_dir():
             return sorted(value.rglob("*.md"), key=lambda path: path.as_posix())
-        return [value] if value.is_file() else []
-    return sorted(
-        (path for path in value if path.is_file()),
-        key=lambda path: path.as_posix(),
-    )
+        if value.is_file():
+            return [value]
+        raise ValueError(f"The legacy note path is not a file or directory: {value}")
+    paths = list(value)
+    missing = next((path for path in paths if not path.exists()), None)
+    if missing is not None:
+        raise FileNotFoundError(f"The legacy note path does not exist: {missing}")
+    invalid = next((path for path in paths if not path.is_file()), None)
+    if invalid is not None:
+        raise ValueError(f"The legacy note path is not a file: {invalid}")
+    return sorted(paths, key=lambda path: path.as_posix())
 
 
 def _read_note(path: Path) -> LegacyNote:
@@ -153,7 +231,10 @@ def _map_notes(
     *,
     title_key: str,
 ) -> tuple[dict[str, LegacyNote], int, int]:
-    valid_ids = {str(row["conversation_id"] if "conversation_id" in row else row["id"]) for row in rows}
+    valid_ids = {
+        str(row["conversation_id"] if "conversation_id" in row else row["id"])
+        for row in rows
+    }
     mapping: dict[str, LegacyNote] = {}
     unresolved = 0
     duplicates = 0
@@ -198,8 +279,7 @@ def _summary(note: LegacyNote) -> str:
     lines = [
         line.strip()
         for line in preface.splitlines()
-        if line.strip()
-        and not line.lstrip().startswith(("#", "<!--", "-"))
+        if line.strip() and not line.lstrip().startswith(("#", "<!--", "-"))
     ]
     return "\n".join(lines).strip()
 
@@ -279,8 +359,13 @@ def _load_legacy(
     immutable: bool,
 ) -> LegacyData:
     database = sync_db.expanduser().resolve(strict=True)
-    database_sha256 = _sha256_file(database)
-    with _legacy_connection(database, immutable=immutable) as connection:
+    if not database.is_file():
+        raise ValueError("The legacy database must be a regular file.")
+    connection, database_sha256, source_database_fingerprint = _logical_snapshot(
+        database,
+        immutable=immutable,
+    )
+    try:
         names = {
             str(row[0])
             for row in connection.execute(
@@ -292,19 +377,40 @@ def _load_legacy(
             raise ValueError(
                 f"The legacy database is missing a required table: {missing[0]}."
             )
-        conversations = [dict(row) for row in connection.execute("SELECT * FROM conversations ORDER BY id")]
-        messages = [dict(row) for row in connection.execute("SELECT * FROM messages ORDER BY conversation_id, timestamp, message_id")]
-        attachments = [dict(row) for row in connection.execute("SELECT * FROM attachments ORDER BY conversation_id, message_id, attachment_index")]
-        meetings = [dict(row) for row in connection.execute("SELECT * FROM meetings ORDER BY conversation_id")]
+        conversations = [
+            dict(row)
+            for row in connection.execute("SELECT * FROM conversations ORDER BY id")
+        ]
+        messages = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM messages ORDER BY conversation_id, timestamp, message_id"
+            )
+        ]
+        attachments = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM attachments ORDER BY conversation_id, message_id, attachment_index"
+            )
+        ]
+        meetings = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM meetings ORDER BY conversation_id"
+            )
+        ]
         duplicate_natural_keys = sum(
             int(row[0])
             for query in (
                 "SELECT count(*) FROM (SELECT id FROM conversations GROUP BY id HAVING count(*) > 1)",
                 "SELECT count(*) FROM (SELECT conversation_id, message_id FROM messages GROUP BY conversation_id, message_id HAVING count(*) > 1)",
+                "SELECT count(*) FROM (SELECT conversation_id, message_id, attachment_index FROM attachments GROUP BY conversation_id, message_id, attachment_index HAVING count(*) > 1)",
                 "SELECT count(*) FROM (SELECT conversation_id FROM meetings GROUP BY conversation_id HAVING count(*) > 1)",
             )
             for row in [connection.execute(query).fetchone()]
         )
+    finally:
+        connection.close()
     chat_values = [_read_note(path) for path in _note_paths(chat_notes)]
     meeting_values = [_read_note(path) for path in _note_paths(meeting_notes)]
     chat_mapping, unresolved_chat, duplicate_chat = _map_notes(
@@ -351,6 +457,7 @@ def _load_legacy(
         chat_mapping=chat_mapping,
         meeting_mapping=meeting_mapping,
         cues=cues,
+        source_database_fingerprint=source_database_fingerprint,
     )
 
 
@@ -373,28 +480,97 @@ def plan_legacy_migration(
     ).plan
 
 
+SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(?:access[-_]?token|api[-_]?key|authorization|bearer[-_]?token|"
+    r"client[-_]?secret|encrypted[-_]?token|id[-_]?token|password|"
+    r"private[-_]?key|refresh[-_]?token|sas[-_]?token|session[-_]?token|"
+    r"temp(?:orary)?auth|signature|sig|token)"
+    r"\s*([=:])\s*[^\s,;&#]+"
+)
+
+
+def _sanitize_fragment(value: str, *, depth: int) -> str:
+    route, marker, query_text = value.partition("?")
+    safe_route = _sanitize_text(route, depth=depth + 1)
+    if not marker:
+        return safe_route
+    safe_query = [
+        (key, _sanitize_text(child, depth=depth + 1))
+        for key, child in parse_qsl(query_text, keep_blank_values=True)
+        if _normalize_security_key(key) not in AUTH_QUERY_KEY_TOKENS
+    ]
+    encoded = urlencode(safe_query)
+    return f"{safe_route}?{encoded}" if encoded else safe_route
+
+
+def _sanitize_url(value: str, *, depth: int) -> str:
+    if depth > 8:
+        return "[redacted-url]"
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname or ""
+        port = parsed.port
+    except ValueError:
+        return "[redacted-url]"
+    if parsed.scheme.casefold() not in {"http", "https"}:
+        return value
+    # Rebuild the authority from the host and port so URL userinfo cannot survive.
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
+    safe_query = [
+        (key, _sanitize_text(child, depth=depth + 1))
+        for key, child in parse_qsl(parsed.query, keep_blank_values=True)
+        if _normalize_security_key(key) not in AUTH_QUERY_KEY_TOKENS
+    ]
+    return urlunsplit(
+        (
+            parsed.scheme,
+            netloc,
+            parsed.path,
+            urlencode(safe_query),
+            _sanitize_fragment(parsed.fragment, depth=depth + 1),
+        )
+    )
+
+
+def _sanitize_text(value: str, *, depth: int = 0) -> str:
+    if depth > 8:
+        return "[redacted]"
+
+    def replace_url(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        candidate = raw.rstrip(".,;!)]}")
+        suffix = raw[len(candidate) :]
+        return f"{_sanitize_url(candidate, depth=depth + 1)}{suffix}"
+
+    without_capability_urls = HTTP_URL_RE.sub(replace_url, value)
+    return SECRET_ASSIGNMENT_RE.sub("[redacted]", without_capability_urls)
+
+
 def _sanitize(value: Any) -> Any:
     if isinstance(value, dict):
         return {
             str(key): _sanitize(child)
             for key, child in value.items()
-            if str(key).replace("-", "_").casefold() not in SECRET_KEYS
+            if _normalize_security_key(str(key)) not in SECRET_KEY_TOKENS
         }
     if isinstance(value, list):
         return [_sanitize(child) for child in value]
     if not isinstance(value, str):
         return value
-    parsed = urlsplit(value)
-    if parsed.scheme.casefold() not in {"http", "https"}:
-        return value
-    query = [
-        (key, item)
-        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
-        if key.casefold() not in AUTH_QUERY_KEYS
-    ]
-    return urlunsplit(
-        (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
-    )
+    return _sanitize_text(value)
+
+
+def _safe_text(value: Any) -> str:
+    return _sanitize_text(str(value or ""))
+
+
+def _legacy_source_payload(
+    row: dict[str, Any],
+    keys: tuple[str, ...],
+) -> dict[str, Any]:
+    return {key: _sanitize(row.get(key)) for key in keys if row.get(key) is not None}
 
 
 def _raw_json(value: Any) -> Any:
@@ -409,10 +585,10 @@ def _raw_json(value: Any) -> Any:
 def _actor(row: dict[str, Any]) -> ArtifactActor | None:
     raw = _raw_json(row.get("raw_json"))
     stable_id = raw.get("authorId") if isinstance(raw, dict) else None
-    name = str(row.get("author") or "").strip()
+    name = _safe_text(row.get("author")).strip()
     if stable_id:
         return ArtifactActor(
-            id=str(stable_id),
+            id=_safe_text(stable_id),
             name=name or None,
             id_confidence="stable",
         )
@@ -428,10 +604,26 @@ def _participants(note: LegacyNote | None) -> list[ArtifactActor]:
     if not isinstance(raw, list):
         return []
     return [
-        ArtifactActor(name=str(value), id_confidence="display-name-only")
+        ArtifactActor(name=_safe_text(value), id_confidence="display-name-only")
         for value in raw
-        if str(value).strip()
+        if _safe_text(value).strip()
     ]
+
+
+def _reactions(raw: Any) -> list[str]:
+    if not isinstance(raw, dict) or not isinstance(raw.get("reactions"), list):
+        return []
+    values: list[str] = []
+    for reaction in raw["reactions"]:
+        if isinstance(reaction, str):
+            value = reaction
+        elif isinstance(reaction, dict):
+            value = reaction.get("type") or reaction.get("reactionType") or ""
+        else:
+            value = ""
+        if safe := _safe_text(value).strip():
+            values.append(safe)
+    return values
 
 
 def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
@@ -444,15 +636,11 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
     for row in data.conversations:
         conversation_id = str(row["id"])
         note = data.chat_mapping.get(conversation_id)
-        summary = _summary(note) if note else ""
+        summary = _safe_text(_summary(note)) if note else ""
         source_payload = {
-            "legacy": _sanitize(
-                {
-                    "kind": row.get("kind"),
-                    "thread_type": row.get("thread_type"),
-                    "chat_sub_type": row.get("chat_sub_type"),
-                    "raw": _raw_json(row.get("raw_json")),
-                }
+            "legacy": _legacy_source_payload(
+                row,
+                ("kind", "thread_type", "chat_sub_type"),
             )
         }
         if summary:
@@ -467,7 +655,7 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
                     "external_id": conversation_id,
                     "source_updated_at": row.get("updated_at"),
                     "payload": ArtifactPayload(
-                        title=str(row.get("name") or "") or None,
+                        title=_safe_text(row.get("name")) or None,
                         occurred_at=row.get("first_seen_at"),
                         content_format="plain",
                         participants=_participants(note),
@@ -493,11 +681,7 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
             )
         ]
         raw = _raw_json(row.get("raw_json"))
-        reactions = (
-            [str(value) for value in raw.get("reactions", [])]
-            if isinstance(raw, dict) and isinstance(raw.get("reactions"), list)
-            else []
-        )
+        reactions = _reactions(raw)
         events.append(
             ArtifactEvent.model_validate(
                 {
@@ -505,7 +689,10 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
                     "record": "event",
                     "entity": "message",
                     "operation": "upsert",
-                    "external_id": message_id,
+                    "external_id": _message_external_id(
+                        conversation_id,
+                        message_id,
+                    ),
                     "parent": {
                         "entity": "conversation",
                         "external_id": conversation_id,
@@ -514,25 +701,20 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
                     "source_updated_at": row.get("updated_at"),
                     "payload": ArtifactPayload(
                         occurred_at=row.get("timestamp"),
-                        text=str(row.get("content_markdown") or ""),
+                        text=_safe_text(row.get("content_markdown")),
                         content_format="markdown",
                         author=_actor(row),
                         links=attachment_links,
                         reactions=reactions,
                         classification=(
                             "system"
-                            if str(row.get("message_type") or "").casefold()
-                            == "system"
+                            if str(row.get("message_type") or "").casefold() == "system"
                             else None
                         ),
                         source_payload={
-                            "legacy": _sanitize(
-                                {
-                                    "kind": row.get("kind"),
-                                    "message_type": row.get("message_type"),
-                                    "parent_id": row.get("parent_id"),
-                                    "raw": raw,
-                                }
+                            "legacy": _legacy_source_payload(
+                                row,
+                                ("kind", "message_type", "parent_id"),
                             )
                         },
                     ),
@@ -559,24 +741,23 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
                     "external_id": _attachment_external_id(row),
                     "parent": {
                         "entity": "message",
-                        "external_id": str(row["message_id"]),
+                        "external_id": _message_external_id(
+                            str(row["conversation_id"]),
+                            str(row["message_id"]),
+                        ),
                     },
                     "source_updated_at": row.get("updated_at"),
                     "payload": ArtifactPayload(
-                        title=str(row.get("name") or "") or None,
+                        title=_safe_text(row.get("name")) or None,
                         object=ArtifactObjectInput(
                             local_source_path=source_path,
-                            media_type=str(row.get("content_type") or "") or None,
-                            original_name=str(row.get("name") or "") or None,
+                            media_type=_safe_text(row.get("content_type")) or None,
+                            original_name=_safe_text(row.get("name")) or None,
                         ),
                         source_payload={
-                            "legacy": _sanitize(
-                                {
-                                    "kind": row.get("kind"),
-                                    "remote_url": row.get("remote_url"),
-                                    "status": row.get("status"),
-                                    "raw": _raw_json(row.get("raw_json")),
-                                }
+                            "legacy": _legacy_source_payload(
+                                row,
+                                ("kind", "remote_url", "status"),
                             )
                         },
                     ),
@@ -608,16 +789,12 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
                 )
             )
         source_payload = {
-            "legacy": _sanitize(
-                {
-                    "end_time": row.get("end_time"),
-                    "join_url": row.get("join_url"),
-                    "meeting_type": row.get("meeting_type"),
-                    "raw": _raw_json(row.get("raw_json")),
-                }
+            "legacy": _legacy_source_payload(
+                row,
+                ("end_time", "join_url", "meeting_type"),
             )
         }
-        if note is not None and (summary := _summary(note)):
+        if note is not None and (summary := _safe_text(_summary(note))):
             source_payload["legacy_summary_candidate"] = summary
         events.append(
             ArtifactEvent.model_validate(
@@ -633,13 +810,13 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
                     },
                     "source_updated_at": row.get("updated_at"),
                     "payload": ArtifactPayload(
-                        title=str(row.get("subject") or "") or None,
+                        title=_safe_text(row.get("subject")) or None,
                         occurred_at=row.get("start_time"),
-                        text=str(row.get("subject") or "") or None,
+                        text=_safe_text(row.get("subject")) or None,
                         content_format="plain",
                         author=(
                             ArtifactActor(
-                                id=str(row["organizer_id"]),
+                                id=_safe_text(row["organizer_id"]),
                                 id_confidence="stable",
                             )
                             if row.get("organizer_id")
@@ -654,7 +831,7 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
         )
         if note is None:
             continue
-        transcript_text = _section(note.body, "Transcript")
+        transcript_text = _safe_text(_section(note.body, "Transcript"))
         events.append(
             ArtifactEvent.model_validate(
                 {
@@ -670,13 +847,15 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
                     "source_version": note.sha256,
                     "source_updated_at": row.get("updated_at"),
                     "payload": ArtifactPayload(
-                        title=f"{str(row.get('subject') or 'Meeting')} transcript",
+                        title=(
+                            f"{_safe_text(row.get('subject') or 'Meeting')} transcript"
+                        ),
                         occurred_at=row.get("start_time"),
                         text=transcript_text,
                         content_format="plain",
                         participants=_participants(note),
                         source_payload={
-                            "legacy_note_name": note.name,
+                            "legacy_note_name": _safe_text(note.name),
                             "legacy_note_sha256": note.sha256,
                         },
                     ),
@@ -701,11 +880,11 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
                         "source_updated_at": row.get("updated_at"),
                         "payload": ArtifactPayload(
                             occurred_at=cue.occurred_at,
-                            text=cue.text,
+                            text=_safe_text(cue.text),
                             content_format="plain",
                             author=(
                                 ArtifactActor(
-                                    name=cue.speaker,
+                                    name=_safe_text(cue.speaker),
                                     id_confidence="display-name-only",
                                 )
                                 if cue.speaker
@@ -718,14 +897,25 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
     return events
 
 
+def _message_external_id(conversation_id: str, message_id: str) -> str:
+    # The legacy schema scopes message IDs to a conversation.
+    digest = sha256_text(canonical_json([conversation_id, message_id]))
+    return f"legacy-message:{digest}"
+
+
 def _attachment_external_id(row: dict[str, Any]) -> str:
-    return str(
-        row.get("attachment_id")
-        or (
-            f"{row['conversation_id']}:{row['message_id']}:"
-            f"{row['attachment_index']}"
+    # Providers can reuse attachment IDs, so the full legacy natural key is required.
+    digest = sha256_text(
+        canonical_json(
+            [
+                str(row["conversation_id"]),
+                str(row["message_id"]),
+                int(row["attachment_index"]),
+                str(row.get("attachment_id") or ""),
+            ]
         )
     )
+    return f"legacy-attachment:{digest}"
 
 
 def _transcript_external_id(conversation_id: str) -> str:
@@ -745,19 +935,54 @@ def _observed_at(data: LegacyData) -> datetime:
         if row.get("updated_at")
     ]
     parsed = [
-        datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        for value in values
+        datetime.fromisoformat(str(value).replace("Z", "+00:00")) for value in values
     ]
     return max(parsed) if parsed else datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def _source_files_unchanged(database: Path, data: LegacyData) -> bool:
-    if _sha256_file(database) != data.plan.database_sha256:
+    if _source_database_fingerprint(database) != data.source_database_fingerprint:
         return False
-    notes = [
-        _read_note(note.path) for note in [*data.chat_notes, *data.meeting_notes]
-    ]
+    notes = [_read_note(note.path) for note in [*data.chat_notes, *data.meeting_notes]]
     return _note_manifest(notes) == data.plan.note_manifest_sha256
+
+
+def _validate_migration_events(
+    data: LegacyData,
+    events: list[ArtifactEvent],
+) -> None:
+    artifact_ids: dict[str, ArtifactEvent] = {}
+    for event in events:
+        value = artifact_id(
+            data.plan.source,
+            data.plan.source_instance,
+            event.entity,
+            event.external_id,
+        )
+        if value in artifact_ids:
+            raise ValueError("Legacy records map to duplicate artifact identities.")
+        artifact_ids[value] = event
+        # Migration is a trust-boundary adapter. Validate the final envelope too.
+        _reject_secret_material(event.model_dump(mode="json", by_alias=True))
+
+    for value, event in artifact_ids.items():
+        references: list[ArtifactReference] = []
+        if event.parent is not None:
+            references.append(event.parent)
+        if isinstance(event.payload, ArtifactPayload):
+            references.extend(link.target for link in event.payload.links)
+        for reference in references:
+            target = artifact_id(
+                data.plan.source,
+                data.plan.source_instance,
+                reference.entity,
+                reference.external_id,
+            )
+            if target not in artifact_ids:
+                raise ValueError(
+                    "A legacy artifact references an identity outside the import: "
+                    f"{value}."
+                )
 
 
 def _verify_import(
@@ -897,6 +1122,7 @@ def run_legacy_migration(
     if data.plan.duplicate_natural_keys:
         raise ValueError("Resolve duplicate legacy identities before import.")
     events = _events(data, database)
+    _validate_migration_events(data, events)
     input_sha256 = sha256_text(
         canonical_json(
             {
@@ -905,13 +1131,14 @@ def run_legacy_migration(
                 "database_sha256": data.plan.database_sha256,
                 "note_manifest_sha256": data.plan.note_manifest_sha256,
                 "events": [
-                    event.model_dump(mode="json", by_alias=True)
-                    for event in events
+                    event.model_dump(mode="json", by_alias=True) for event in events
                 ],
             }
         )
     )
     batch_id = f"legacy-{input_sha256[:32]}"
+    if not _source_files_unchanged(database, data):
+        raise RuntimeError("A legacy migration source changed before import.")
     store = ArtifactStore(settings)
     with connect_artifact_db(
         settings.artifact_db,
@@ -960,7 +1187,12 @@ def run_legacy_migration(
             "database_sha256": data.plan.database_sha256,
             "note_manifest_sha256": data.plan.note_manifest_sha256,
             "counts": data.plan.model_dump(
-                exclude={"source", "source_instance", "database_sha256", "note_manifest_sha256"}
+                exclude={
+                    "source",
+                    "source_instance",
+                    "database_sha256",
+                    "note_manifest_sha256",
+                }
             ),
             "verification": verification,
         }

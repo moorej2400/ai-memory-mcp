@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -71,6 +73,37 @@ def test_existing_object_is_verified_and_reused(
     stored_first = store_object(artifact_settings, first)
     stored_second = store_object(artifact_settings, second)
     assert stored_second == stored_first
+
+
+def test_concurrent_object_publication_reuses_the_verified_winner(
+    artifact_settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "first.bin"
+    second = tmp_path / "second.bin"
+    first.write_bytes(b"same concurrent bytes")
+    second.write_bytes(b"same concurrent bytes")
+    publication_barrier = Barrier(2)
+    real_link = os.link
+
+    def synchronized_link(source: Path, destination: Path) -> None:
+        publication_barrier.wait(timeout=5)
+        real_link(source, destination)
+
+    monkeypatch.setattr(os, "link", synchronized_link)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(store_object, artifact_settings, source)
+            for source in (first, second)
+        ]
+        stored = [future.result(timeout=10) for future in futures]
+
+    assert stored[0] == stored[1]
+    assert verify_object(artifact_settings, stored[0].sha256).ok is True
+    assert not list(
+        (artifact_settings.artifact_objects_dir / "sha256").rglob("*.partial-*")
+    )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode test")
@@ -193,6 +226,7 @@ def test_object_failure_happens_before_database_state(
         artifact_settings.artifact_db,
         read_only=True,
     ) as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM artifact_batches"
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT count(*) FROM artifact_batches").fetchone()[0]
+            == 0
+        )
