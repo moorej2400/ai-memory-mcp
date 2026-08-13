@@ -288,3 +288,36 @@ class ArtifactVectorSearchResult(StrictModel):
     hits: list[ArtifactSearchHit] = Field(default_factory=list)
     available: bool = False
     stale: bool = False
+
+
+class ArtifactIntegrityResult(StrictModel):
+    path: Path
+    ok: bool
+    quick_check: str
+    foreign_key_violations: int = Field(ge=0)
+    artifacts: int = Field(ge=0)
+    active_artifacts: int = Field(ge=0)
+    batches: int = Field(ge=0)
+    events: int = Field(ge=0)
+    objects: int = Field(ge=0)
+
+
+class ArtifactBackupResult(StrictModel):
+    path: Path
+    byte_count: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    artifacts: int = Field(ge=0)
+    active_artifacts: int = Field(ge=0)
+    batches: int = Field(ge=0)
+    events: int = Field(ge=0)
+    objects: int = Field(ge=0)
+
+
+class ArtifactRestoreResult(StrictModel):
+    source: Path
+    destination: Path
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    destination_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    byte_count: int = Field(ge=0)
+    artifacts: int = Field(ge=0)
+    batches: int = Field(ge=0)

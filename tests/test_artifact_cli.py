@@ -195,3 +195,35 @@ def test_pending_and_no_durable_memory_commands(
 
     assert main(["pending", "--limit", "10"]) == 0
     assert _one_json(capsys)["candidates"] == []
+
+
+def test_backup_check_and_restore_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    assert main(["ingest", "--input", str(_batch_file(tmp_path))]) == 0
+    capsys.readouterr()
+
+    assert main(["check"]) == 0
+    checked = _one_json(capsys)
+    assert checked["ok"] is True
+    assert checked["artifacts"] == 2
+
+    assert main(["backup"]) == 0
+    backup = _one_json(capsys)
+    backup_path = backup["path"]
+    destination = tmp_path / "restored" / "artifacts.sqlite3"
+    assert main(
+        [
+            "restore",
+            "--backup",
+            backup_path,
+            "--destination",
+            str(destination),
+        ]
+    ) == 0
+    restored = _one_json(capsys)
+    assert restored["destination"] == str(destination)
+    assert destination.is_file()

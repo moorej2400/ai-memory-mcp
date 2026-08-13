@@ -82,8 +82,53 @@ Read ordered context from one stable citation:
 Use `pending` to list artifacts that need Markdown distillation.
 Use `mark-distilled` after you validate the current Markdown note.
 Use `mark-no-durable-memory` only for a reviewed conversation.
-Use `backup` to create a consistent SQLite and object manifest backup.
+Use `backup` to create a consistent SQLite database backup.
 Use `migrate-legacy` to stage a supported legacy import.
+
+## Back up and check raw artifacts
+
+Treat the active database file and its WAL files as one database unit.
+Do not copy an active SQLite file with a normal file-copy command.
+The copy can omit committed WAL data or contain an inconsistent page set.
+
+Create a consistent database backup:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe backup
+```
+
+```bash
+./.venv/bin/ai-memory-artifact backup
+```
+
+The command uses the SQLite backup API.
+The command checks database integrity and foreign keys before publication.
+The command does not remove an older backup.
+
+Check the active artifact database:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe check
+```
+
+```bash
+./.venv/bin/ai-memory-artifact check
+```
+
+Restore a verified backup to a new staging path:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe restore --backup <backup-file> --destination <new-database-file>
+```
+
+```bash
+./.venv/bin/ai-memory-artifact restore --backup <backup-file> --destination <new-database-file>
+```
+
+The restore command rejects an existing destination.
+The restore command does not replace the active database.
+Stop all writers before an operator-controlled cutover.
+Keep the source backup until the restored database passes operational checks.
 
 ## Run the MCP server
 

@@ -92,8 +92,14 @@ def _parser() -> argparse.ArgumentParser:
     no_memory.add_argument("--source-digest", required=True)
     no_memory.add_argument("--reason", required=True)
 
-    backup = commands.add_parser("backup", help="Create an artifact backup.")
-    backup.add_argument("--output")
+    commands.add_parser("backup", help="Create an artifact database backup.")
+    commands.add_parser("check", help="Check artifact database integrity.")
+    restore = commands.add_parser(
+        "restore",
+        help="Restore a backup to a new database path.",
+    )
+    restore.add_argument("--backup", required=True)
+    restore.add_argument("--destination", required=True)
 
     legacy = commands.add_parser(
         "migrate-legacy",
@@ -265,10 +271,24 @@ def _mark_no_memory(settings: Settings, args: argparse.Namespace) -> dict[str, A
 
 
 def _backup(settings: Settings, args: argparse.Namespace) -> Any:
-    from .maintenance import create_artifact_backup
+    from .backup import backup_artifact_db
 
-    output = Path(args.output) if args.output else None
-    return create_artifact_backup(settings, output=output)
+    return backup_artifact_db(settings)
+
+
+def _check(settings: Settings, args: argparse.Namespace) -> Any:
+    from .backup import check_artifact_db
+
+    return check_artifact_db(settings)
+
+
+def _restore(settings: Settings, args: argparse.Namespace) -> Any:
+    from .backup import restore_artifact_db
+
+    return restore_artifact_db(
+        Path(args.backup),
+        Path(args.destination),
+    )
 
 
 def _migrate_legacy(settings: Settings, args: argparse.Namespace) -> Any:
@@ -291,6 +311,8 @@ HANDLERS = {
     "mark-distilled": _mark_distilled,
     "mark-no-durable-memory": _mark_no_memory,
     "backup": _backup,
+    "check": _check,
+    "restore": _restore,
     "migrate-legacy": _migrate_legacy,
 }
 
