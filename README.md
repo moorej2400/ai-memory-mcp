@@ -3,9 +3,10 @@
 AI Memory MCP gives agents one stable interface for durable memory.
 The server combines exact, lexical, semantic, and graph search results.
 
-The primary Markdown vault is the only write authority.
+The primary Markdown vault is the write authority for distilled durable memory.
 Additional Markdown vaults are retrieval-only sources.
-The system derives SQLite indexes and Graphify graphs from Markdown.
+The canonical artifact database is the write authority for raw external artifacts.
+The system derives retrieval indexes from both canonical data classes.
 
 ## Architecture decision
 

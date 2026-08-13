@@ -12,6 +12,7 @@ Return to the [project overview](../README.md) for the quick-start procedure.
 ## Design and quality
 
 - [Architecture](architecture.md) describes the system design.
+- [Artifact storage](artifact-storage.md) defines raw and distilled authority.
 - [Development](development.md) gives the development and test procedures.
 - [Validation](validation-report.md) gives the current validation evidence.
 - [Writing standard](writing-standard.md) gives the documentation rules.

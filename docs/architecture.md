@@ -10,13 +10,18 @@ The MCP server owns scope, ranking, freshness, evidence, health, and refresh con
 
 ## Source authority
 
-Markdown files in all configured vaults are source data.
-The primary vault is the only write authority.
+Markdown files in all configured vaults are durable-memory source data.
+The primary vault is the only Markdown write authority.
 Additional vaults are retrieval-only sources.
-The system can rebuild all indexes from the Markdown files.
+The canonical artifact database is the write authority for raw external artifacts.
 
-The system derives the SQLite index and Graphify graph from Markdown.
-A failed refresh does not change the Markdown authority.
+The system derives memory indexes from Markdown.
+The system derives artifact search and burst indexes from the canonical artifact database.
+
+Raw artifacts never make a Markdown file authoritative for a transcript or chat log.
+Distilled Markdown never makes the artifact database authoritative for an agent summary.
+
+A failed refresh does not change either authority.
 
 ## System flow
 
@@ -24,10 +29,17 @@ A failed refresh does not change the Markdown authority.
 flowchart LR
     P[Primary writable vault] --> I[Memory indexer]
     A[Retrieval-only vaults] --> I
+    C[Provider adapter] --> D[Canonical artifact database]
+    D --> X[Raw artifact FTS]
+    D --> B[Derived burst index]
+    D --> M[Agent distillation]
+    M --> P
     I --> L[Exact and lexical index]
     I --> V[Semantic index]
     I --> G[Graphify graph]
     Q[Agent query] --> S[AI Memory MCP]
+    S --> X
+    S --> B
     S --> L
     S --> V
     S --> G
