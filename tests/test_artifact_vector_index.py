@@ -201,6 +201,51 @@ def test_burst_semantic_hit_uses_the_raw_answer_gate(
     assert any("Raw artifact" in warning for warning in response.warnings)
 
 
+def test_sync_preserves_an_exact_external_id_raw_match(
+    artifact_settings: Settings,
+) -> None:
+    ArtifactStore(artifact_settings).apply_batch(
+        _batch(
+            "exact-id-vector-batch",
+            [
+                _event(
+                    "conversation",
+                    "conversation-exact",
+                    "Operations",
+                    "2026-01-02T10:00:00Z",
+                ),
+                _event(
+                    "message",
+                    "deployment-credential",
+                    (
+                        "The deployment credential requires a neutral review. "
+                        * 5
+                    ),
+                    "2026-01-02T10:01:00Z",
+                    parent=("conversation", "conversation-exact"),
+                ),
+            ],
+        )
+    )
+    service = MemoryService(artifact_settings)
+    before = service.recall(
+        "deployment-credential",
+        source_label="chat-source",
+    )
+    assert before.status == "answered"
+    assert before.evidence[0].evidence_class == "raw"
+
+    sync = service.sync()
+    assert sync.artifact_index is not None
+    after = service.recall(
+        "deployment-credential",
+        source_label="chat-source",
+    )
+    assert after.status == "answered"
+    assert after.evidence[0].evidence_class == "raw"
+    assert after.evidence[0].reasons == ["exact identifier"]
+
+
 def test_sync_reports_artifact_index_independently(
     artifact_settings: Settings,
 ) -> None:

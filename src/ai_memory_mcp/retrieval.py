@@ -127,6 +127,11 @@ def merge_artifact_evidence(
                 else RAW_FRESHNESS_CAP * 0.5 ** (age_days / half_life)
             )
             score += freshness
+        ranking = (
+            "artifact-fts"
+            if raw.evidence_class == "raw"
+            else "artifact-vector"
+        )
         hit = SearchHit(
             memory_id=raw.artifact_id,
             source_id=f"artifact-{raw.source}",
@@ -135,8 +140,8 @@ def merge_artifact_evidence(
             heading=raw.entity,
             text=raw.text,
             score=score,
-            ranks={"artifact": rank},
-            signals={"artifact": raw.score},
+            ranks={ranking: rank},
+            signals={ranking: raw.score},
             reasons=[reason] if reason else [],
             evidence_class=raw.evidence_class,
             artifact_uri=raw.artifact_uri,
@@ -148,7 +153,29 @@ def merge_artifact_evidence(
             artifact_kind=raw.entity,
             external_id=raw.external_id,
         )
-        combined[raw.artifact_uri] = hit
+        existing = combined.get(raw.artifact_uri)
+        if existing is None:
+            combined[raw.artifact_uri] = hit
+            continue
+        # A burst can start at the same artifact as a raw FTS hit. Preserve
+        # the raw record because only it carries the external ID answer gate.
+        winner, secondary = (
+            (existing, hit)
+            if (
+                bool(existing.reasons),
+                existing.evidence_class == "raw",
+                existing.score,
+            )
+            >= (
+                bool(hit.reasons),
+                hit.evidence_class == "raw",
+                hit.score,
+            )
+            else (hit, existing)
+        )
+        winner.ranks.update(secondary.ranks)
+        winner.signals.update(secondary.signals)
+        combined[raw.artifact_uri] = winner
 
     ranked = sorted(
         combined.values(),
