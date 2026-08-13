@@ -12,7 +12,7 @@ from .embedding import EmbeddingProvider, EmbeddingUnavailable, resolve_provider
 from .graphify import GraphifyAdapter
 from .index import MemoryIndex, scope_sql
 from .models import EvidencePacket, ScopeFilter, SearchHit
-from .text import cosine_sparse, query_identifiers, tokenize
+from .text import cosine_sparse, fts_expression, query_identifiers, tokenize
 
 TICKET_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,12}-\d+\b", re.IGNORECASE)
 STOPWORDS = {
@@ -68,13 +68,6 @@ def _lexical_score(bm25: float) -> float:
     """
     relevance = max(0.0, -bm25)
     return relevance / (1.0 + relevance)
-
-
-def _fts_expression(query: str) -> str:
-    terms = list(dict.fromkeys(tokenize(query)))
-    if not terms:
-        return '""'
-    return " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms[:24])
 
 
 def _intent_expansions(tokens: set[str]) -> set[str]:
@@ -171,7 +164,7 @@ class RetrievalEngine:
                 ORDER BY lexical_score
                 LIMIT ?
                 """,
-                [_fts_expression(query), *parameters, limit],
+                [fts_expression(query), *parameters, limit],
             ).fetchall()
         return [
             _row_hit(row, _lexical_score(row["lexical_score"]), "lexical", rank)
