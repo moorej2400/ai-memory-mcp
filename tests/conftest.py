@@ -27,3 +27,19 @@ def benchmark_settings(project_root: Path) -> Settings:
     )
     build_index(settings, force=True)
     return settings
+
+
+@pytest.fixture
+def artifact_settings(tmp_path: Path) -> Settings:
+    memory_root = tmp_path / "vault"
+    memory_root.mkdir()
+    return Settings(
+        memory_root=memory_root,
+        state_dir=tmp_path / "state",
+        graph_path=tmp_path / "graph.json",
+        graphify_mcp_url="",
+        embedding_provider="hashed",
+        artifact_db=tmp_path / "artifact-state" / "artifacts.sqlite3",
+        artifact_objects_dir=tmp_path / "artifact-state" / "objects",
+        artifact_backup_dir=tmp_path / "artifact-state" / "backups",
+    )
