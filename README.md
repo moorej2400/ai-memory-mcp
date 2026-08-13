@@ -32,7 +32,7 @@ flowchart LR
     end
 
     subgraph Repository["AI Memory MCP repository"]
-        MCP["MCP facade<br/>Three public tools"]
+        MCP["MCP facade<br/>Four public tools"]
         Service["MemoryService<br/>Policy and orchestration"]
         Retrieval["RetrievalEngine<br/>Scope, fusion, and reranking"]
         Indexer["Memory indexer<br/>Validation and snapshots"]

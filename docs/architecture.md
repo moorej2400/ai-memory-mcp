@@ -109,7 +109,7 @@ The adapter keeps Graphify replaceable.
 
 ### MCP facade
 
-The MCP facade gives agents three public tools.
+The MCP facade gives agents four public tools.
 The facade applies scope rules before retrieval.
 The facade returns source paths and retrieval evidence.
 
