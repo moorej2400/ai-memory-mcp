@@ -149,6 +149,18 @@ For recall requests:
 
 Do not treat a Graphify node as authority for a write target until the canonical Markdown exists and has been inspected.
 
+Raw artifact evidence is a lead unless recall reports an exact match.
+Use `memory_artifact_read` to inspect ordered context from an `artifact://` citation.
+
+## Distill Raw Artifacts
+
+Read [artifact-distillation.md](references/artifact-distillation.md) before you process a pending meeting or conversation.
+
+Keep the complete source material in SQLite.
+Put only durable summaries, decisions, actions, open questions, context, and short evidence in Markdown.
+Preserve manual Markdown outside the managed distillation markers.
+Mark the current event and source digest only after the note passes validation and recall verification.
+
 ## Write and Reconcile Memory
 
 - Give every new durable note a globally unique `memory_id`.

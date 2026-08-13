@@ -160,3 +160,38 @@ def test_intake_failure_uses_stderr_and_exit_code_one(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "batch ID" in captured.err
+
+
+def test_pending_and_no_durable_memory_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    batch_path = _batch_file(tmp_path)
+    assert main(["ingest", "--input", str(batch_path)]) == 0
+    capsys.readouterr()
+
+    assert main(["pending", "--entity", "conversation", "--limit", "10"]) == 0
+    pending = _one_json(capsys)
+    candidate = pending["candidates"][0]
+    assert candidate["entity"] == "conversation"
+
+    assert main(
+        [
+            "mark-no-durable-memory",
+            "--reference",
+            candidate["artifact_uri"],
+            "--event-id",
+            candidate["latest_event_id"],
+            "--source-digest",
+            candidate["source_digest"],
+            "--reason",
+            "Only scheduling messages were present.",
+        ]
+    ) == 0
+    result = _one_json(capsys)
+    assert result["status"] == "no-durable-memory"
+
+    assert main(["pending", "--limit", "10"]) == 0
+    assert _one_json(capsys)["candidates"] == []

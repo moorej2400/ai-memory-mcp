@@ -27,6 +27,12 @@ ArtifactDisposition = Literal[
     "tombstone",
     "redacted",
 ]
+DistillationStatus = Literal[
+    "pending",
+    "distilled",
+    "no-durable-memory",
+    "needs-review",
+]
 
 
 class StrictModel(BaseModel):
@@ -225,3 +231,16 @@ class ObjectVerification(StrictModel):
     sha256: str
     ok: bool
     byte_count: int = Field(ge=0)
+
+
+class DistillationCandidate(StrictModel):
+    artifact_id: str
+    artifact_uri: str
+    entity: Literal["meeting", "conversation"]
+    source: str
+    source_instance: str
+    title: str
+    occurred_at: datetime | None = None
+    latest_event_id: str
+    source_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    status: DistillationStatus = "pending"
