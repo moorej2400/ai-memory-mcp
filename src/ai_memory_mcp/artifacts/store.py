@@ -1479,9 +1479,20 @@ class ArtifactStore:
     ) -> int:
         changed = 0
         manifest = batch.manifest
+        seen_claims: set[tuple[str, str, str, str, str]] = set()
         for claim in manifest.coverage:
             if not claim.complete:
                 continue
+            claim_key = (
+                claim.parent.entity,
+                claim.parent.external_id,
+                claim.entity,
+                _iso(claim.covered_from) or "",
+                _iso(claim.covered_to) or "",
+            )
+            if claim_key in seen_claims:
+                continue
+            seen_claims.add(claim_key)
             parent_value = artifact_id(
                 manifest.source,
                 manifest.source_instance,

@@ -981,6 +981,33 @@ def test_complete_coverage_tombstones_an_omitted_child(
     assert artifact_store.count("message") == 0
 
 
+def test_duplicate_complete_coverage_is_applied_once(
+    artifact_store: ArtifactStore,
+    artifact_settings: Settings,
+) -> None:
+    artifact_store.apply_batch(message_batch())
+    claim = CoverageClaim(
+        parent=ArtifactReference(
+            entity="conversation",
+            external_id="conversation-1",
+        ),
+        entity="message",
+        complete=True,
+    )
+
+    receipt = artifact_store.apply_batch(
+        _batch([], batch_id="batch-duplicate-coverage", coverage=[claim, claim])
+    )
+
+    assert receipt.tombstones == 1
+    with connect_artifact_db(artifact_settings.artifact_db, read_only=True) as connection:
+        coverage_rows = connection.execute(
+            "SELECT count(*) FROM artifact_coverage WHERE batch_id = ?",
+            ("batch-duplicate-coverage",),
+        ).fetchone()[0]
+    assert coverage_rows == 1
+
+
 def test_authoritative_replay_restores_a_coverage_tombstone(
     artifact_store: ArtifactStore,
     artifact_settings: Settings,
