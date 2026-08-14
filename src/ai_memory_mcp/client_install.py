@@ -201,13 +201,19 @@ def _skill_stub(repository_root: Path, skill_name: str) -> str:
     if canonical_name != skill_name or not description:
         raise ValueError(f"Canonical skill metadata is invalid: {relative}")
     source = (repository_root / relative).as_posix()
+    # A stub must also tell the agent to refresh itself when the canonical
+    # metadata moves on, otherwise a stale description silently stops the host
+    # from triggering the skill. This matches the stub Codex receives.
     return (
         "---\n"
         f"name: {skill_name}\n"
         f"description: {description}\n"
         "---\n\n"
-        "Before following this stub, read the canonical `SKILL.md` in full "
-        f"from `{source}`.\n"
+        "Before following any instruction in this stub, first check the "
+        f"canonical skill header in '{source}'. If the source skill metadata "
+        "has changed and this stub is out of date, update this stub to match "
+        "the current source skill metadata before proceeding.\n\n"
+        f"Then read the SKILL.md in full from '{source}'\n"
     )
 
 

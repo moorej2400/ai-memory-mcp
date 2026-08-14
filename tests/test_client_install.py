@@ -185,6 +185,39 @@ def test_new_shared_skill_reports_a_change(
     assert graphify.is_file()
 
 
+def test_skill_stub_follows_the_documented_contract(
+    tmp_path: Path,
+    portable_repository: Path,
+) -> None:
+    """A stub must carry discovery metadata and keep itself current.
+
+    A stub whose description drifts from the canonical skill stops the host
+    triggering it, so the self-update instruction is part of the contract
+    rather than a nicety.
+    """
+    home = tmp_path / "home"
+    install_client(
+        "agent-skills", portable_repository, home, home / "AppData" / "Roaming"
+    )
+    stub = (home / ".agents" / "skills" / "ai-memory" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    canonical = portable_repository / "skill" / "ai-memory" / "SKILL.md"
+
+    # Discovery metadata, copied exactly from the canonical skill.
+    assert stub.startswith("---\n")
+    assert "name: ai-memory\n" in stub
+    assert "description: Test AI Memory skill.\n" in stub
+
+    # Redirects to the canonical source rather than copying its body.
+    assert canonical.as_posix() in stub
+    assert "read the SKILL.md in full" in stub
+
+    # Tells the agent to refresh the stub when the canonical metadata moves on.
+    assert "check the canonical skill header" in stub
+    assert "update this stub" in stub
+
+
 def test_jsonc_parser_keeps_comment_markers_inside_strings() -> None:
     parsed = json.loads(
         _strip_jsonc(
