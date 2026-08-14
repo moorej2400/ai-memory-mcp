@@ -1,83 +1,86 @@
 # AI Memory MCP
 
 AI Memory MCP gives agents one stable interface for durable memory.
-The server combines exact, lexical, semantic, and graph search results.
+The server combines exact, lexical, semantic, and graph results into cited evidence.
 
-The primary Markdown vault is the write authority for distilled durable memory.
+## Two canonical stores
+
+The system keeps two classes of data, and each class has one authority.
+
+| Data class | Authority | Contents |
+|---|---|---|
+| Distilled memory | Markdown vaults | Summaries, decisions, resolutions, and durable facts |
+| Raw artifacts | Artifact database | Chats, meetings, transcripts, revisions, and tombstones |
+
+The primary Markdown vault is the only Markdown write authority.
 Additional Markdown vaults are retrieval-only sources.
-The canonical artifact database is the write authority for raw external artifacts.
-The system derives retrieval indexes from both canonical data classes.
+A provider adapter supplies raw artifacts through validated batches.
 
-## Architecture decision
+Each authority stays inside its own class.
+A Markdown file never becomes authoritative for a transcript.
+The artifact database never becomes authoritative for an agent summary.
 
-The system is built around Graphify.
-Graphify remains a replaceable provider behind the stable AI Memory MCP interface.
+All retrieval indexes are derived data.
+The system rebuilds each index from its own canonical store.
 
-The MCP facade owns scope, ranking, evidence, health, and refresh control.
-Clients do not depend on Graphify commands, files, or response formats.
-
-This boundary permits a future graph-provider change without a client configuration change.
-Read the complete [architecture guide](docs/architecture.md) for the design rules.
+Read the [architecture guide](docs/architecture.md) for the complete design rules.
 
 ## System architecture
 
 ```mermaid
-flowchart LR
-    subgraph Clients["MCP clients"]
-        Codex[Codex]
-        Claude[Claude]
-        Copilot[Copilot]
-        OpenCode[OpenCode]
-        VSCode[VS Code]
+flowchart TB
+    Clients["MCP clients<br/>Claude, Codex, Copilot, VS Code, OpenCode"]
+    Facade["MCP facade<br/>four public tools"]
+    Service["MemoryService<br/>policy and orchestration"]
+    Engine["RetrievalEngine<br/>scope, fusion, and reranking"]
+
+    subgraph Derived["Derived indexes"]
+        direction LR
+        MdIndex["Markdown index<br/>FTS5 and vectors"]
+        ArtIndex["Artifact index<br/>raw FTS and bursts"]
+        Graph["Graphify graph<br/>nodes and paths"]
     end
 
-    subgraph Repository["AI Memory MCP repository"]
-        MCP["MCP facade<br/>Four public tools"]
-        Service["MemoryService<br/>Policy and orchestration"]
-        Retrieval["RetrievalEngine<br/>Scope, fusion, and reranking"]
-        Indexer["Memory indexer<br/>Validation and snapshots"]
-        Adapter["GraphifyAdapter<br/>Replaceable provider boundary"]
-        Skill["Canonical ai-memory skill"]
+    subgraph Canonical["Canonical stores"]
+        direction LR
+        Vaults["Markdown vaults"]
+        Store["Artifact database"]
     end
 
-    subgraph Authority["Markdown sources"]
-        Primary["Primary vault<br/>Only write authority"]
-        Additional["Additional vaults<br/>Retrieval-only"]
-    end
+    Provider["Provider adapter<br/>outside this repository"]
 
-    subgraph Derived["Derived state"]
-        SQLite["Versioned SQLite<br/>FTS5 and semantic vectors"]
-        Graph["Graphify graph<br/>Nodes, edges, and paths"]
-    end
-
-    Clients --> MCP
-    MCP --> Service
-    Service --> Retrieval
-    Retrieval --> SQLite
-    Retrieval --> Adapter
-    Adapter --> Graph
-    Primary --> Indexer
-    Additional --> Indexer
-    Indexer --> SQLite
-    Primary --> Graph
-    Additional --> Graph
-    Skill -. guides .-> Clients
+    Clients --> Facade
+    Facade --> Service
+    Service --> Engine
+    Engine --> MdIndex
+    Engine --> ArtIndex
+    Engine --> Graph
+    Vaults --> MdIndex
+    Vaults --> Graph
+    Store --> ArtIndex
+    Provider --> Store
+    Store -. agent distillation .-> Vaults
 ```
+
+The provider adapter owns authentication, paging, and remote cursors.
+AI Memory owns validation, storage, search, and citations.
 
 ## Main components
 
 | Component | Responsibility |
 |---|---|
-| Primary Markdown vault | Stores all new durable records. |
-| Retrieval-only vaults | Supply additional records without receiving writes. |
+| Primary Markdown vault | Stores all new distilled records. |
+| Retrieval-only vaults | Supply extra records without receiving writes. |
+| Artifact database | Stores each raw message and transcript cue as one record. |
+| Object storage | Holds attachment bytes by content hash, outside SQLite. |
 | Memory indexer | Validates records and publishes versioned SQLite snapshots. |
-| SQLite FTS5 | Supplies exact and lexical candidates. |
-| Local semantic index | Supplies paraphrase candidates with Model2Vec embeddings or a hashed fallback, without an external API. |
-| Graphify adapter | Supplies relationships, neighbors, and paths. |
+| Artifact search | Supplies raw candidates from a full-text index. |
+| Burst index | Supplies paraphrase candidates from same-author message runs. |
+| Local semantic index | Supplies paraphrase candidates with Model2Vec embeddings or a hashed fallback. |
+| Graphify adapter | Supplies relationships, neighbors, and paths behind a replaceable boundary. |
 | Retrieval engine | Applies scope, RRF fusion, reranking, and context expansion. |
 | MCP facade | Supplies the stable public tools and evidence packets. |
 | Canonical skill | Gives agents the memory workflow and safety rules. |
-| Client installer | Registers the MCP server and repository-linked skill stubs. |
 
 ## Query architecture
 
@@ -86,62 +89,79 @@ The service selects exact, search, neighbor, or relationship behavior.
 The retrieval engine combines all provider work internally.
 
 ```mermaid
-sequenceDiagram
-    participant Agent
-    participant MCP as MCP facade
-    participant Service as MemoryService
-    participant Engine as RetrievalEngine
-    participant SQLite as SQLite index
-    participant Graphify as GraphifyAdapter
+flowchart TB
+    Query["memory_recall<br/>query and scope"]
+    Scope["Apply scope filters"]
+    Md["Markdown retrieval<br/>lexical, semantic, graph"]
+    Art["Artifact retrieval<br/>raw text and bursts"]
+    Fuse["Fuse with RRF<br/>one rank sequence for each producer"]
+    Rank["Rerank, apply decay, and expand context"]
+    Gate{"Distilled evidence<br/>ranks first?"}
+    Answer["Answered<br/>with citations"]
+    Lead["Raw evidence returns as a lead"]
 
-    Agent->>MCP: memory_recall query and scope
-    MCP->>Service: Validate tool input
-    Service->>Service: Select recall intent
-    Service->>Engine: Recall request
-    Engine->>Engine: Resolve scope and ticket identifiers
-    Engine->>SQLite: Get scoped lexical candidates
-    SQLite-->>Engine: Ranked lexical hits
-    Engine->>SQLite: Get scoped semantic vectors
-    SQLite-->>Engine: Ranked semantic hits
-    Engine->>Graphify: Rank scoped candidate paths
-    Graphify-->>Engine: Relationship signals
-    Engine->>Engine: Fuse results with RRF
-    Engine->>Engine: Deduplicate and rerank
-    Engine->>SQLite: Expand bounded context
-    Engine-->>Service: Evidence and relationships
-    Service-->>MCP: Structured result
-    MCP-->>Agent: Cited memory evidence
+    Query --> Scope
+    Scope --> Md
+    Scope --> Art
+    Md --> Fuse
+    Art --> Fuse
+    Fuse --> Rank
+    Rank --> Gate
+    Gate -->|yes| Answer
+    Gate -->|no| Lead
 ```
 
 The engine applies scope before it ranks each provider result.
+Each producer owns its own rank sequence, so no producer loses weight through list order.
 Exact identifiers receive bounded bonuses during reranking.
 
-Graph traversal contributes one retrieval signal.
-It does not replace lexical or semantic retrieval.
+Raw artifact evidence answers a question only on an exact identifier or an exact quoted phrase.
+Every other raw result returns as a lead with a caution to verify or distill it first.
+Raw evidence also decays with age, and chat decays faster than a meeting.
+
+Use `memory_artifact_read` to read ordered source context around an `artifact://` citation.
 
 ## Refresh architecture
 
-`memory_sync` updates the derived indexes after canonical Markdown or artifact data changes.
-The maintenance script rebuilds the Graphify graph.
+`memory_sync` updates the derived indexes after a canonical change.
 
 ```mermaid
-flowchart TD
-    Change[Canonical Markdown change] --> Sync[memory_sync]
-    ArtifactChange[Canonical artifact data change] --> Sync
-    Sync --> IndexStage[Build staged derived indexes]
-    Maintenance[Graphify maintenance script] --> GraphStage[Build staged Graphify data]
-    GraphStage --> GraphValidate{Graph validation}
-    GraphValidate -->|pass| GraphPublish[Publish Graphify graph]
-    GraphValidate -->|fail| GraphKeep[Keep the last satisfactory graph]
-    GraphPublish --> Sync
-    IndexStage --> IndexValidate{Index validation}
-    IndexValidate -->|pass| Pointer[Publish the current-index pointer]
-    IndexValidate -->|fail| IndexKeep[Keep the last satisfactory index]
-    Pointer --> Health[Run health and retrieval checks]
+flowchart TB
+    MdChange["Markdown change"] --> Sync["memory_sync"]
+    ArtChange["Artifact batch ingest"] --> Sync
+    Sync --> Stage["Build staged indexes"]
+    Stage --> Validate{"Validation"}
+    Validate -->|pass| Publish["Publish the index pointer"]
+    Validate -->|fail| Keep["Keep the last satisfactory index"]
+    Publish --> Health["Run health and retrieval checks"]
 ```
 
-The maintenance script uses staging, validation, publication, health checks, and rollback.
-A failed rebuild does not change the Markdown authority.
+The Graphify maintenance script rebuilds the graph on the same staged pattern.
+It validates staged data, publishes it, and keeps the last satisfactory graph after a failure.
+
+A failed refresh never changes either canonical store.
+
+## Command-line tools
+
+| Command | Function |
+|---|---|
+| `ai-memory-mcp` | Runs the MCP server. |
+| `ai-memory-index` | Builds the derived Markdown index. |
+| `ai-memory-artifact` | Manages the canonical artifact database. |
+| `ai-memory-benchmark` | Runs the frozen retrieval benchmark. |
+
+`ai-memory-artifact` is the only write path for raw artifacts.
+It supplies `ingest`, `search`, `read`, `pending`, `backup`, `check`, and `restore`.
+The MCP facade never exposes an artifact write operation.
+
+## MCP tools
+
+| Tool | Function |
+|---|---|
+| `memory_recall` | Returns cited Markdown and artifact evidence. |
+| `memory_artifact_read` | Returns ordered raw context for one artifact reference. |
+| `memory_sync` | Updates the derived indexes after a canonical change. |
+| `memory_status` | Reports source, index, artifact, Graphify, and runtime status. |
 
 ## Reliability and performance
 
@@ -153,8 +173,10 @@ A failed rebuild does not change the Markdown authority.
 - Recall results omit internal provider diagnostics.
 - Incremental indexing skips unchanged Markdown files.
 - Versioned snapshots preserve the last satisfactory index.
-- Full graph refreshes validate staged data before publication.
-- Evidence packets include canonical source paths.
+- Artifact intake validates a complete batch before it changes SQLite.
+- Artifact backups verify a restored copy against the same digest.
+- A redaction moves object bytes to quarantine, because the project never deletes a file.
+- Evidence packets include canonical source paths and artifact references.
 - Source IDs keep identical vault paths separate.
 
 ## Quick start
@@ -193,20 +215,12 @@ Restart each configured client after the setup procedure is complete.
 For more setup information, read the [installation guide](docs/installation.md).
 For agent setup, read the [AI agent setup guide](docs/agent-new-system-setup.md).
 
-## MCP tools
-
-| Tool | Function |
-|---|---|
-| `memory_recall` | Returns cited evidence and applicable relationships. |
-| `memory_artifact_read` | Returns ordered raw context for one artifact reference. |
-| `memory_sync` | Updates the derived indexes after canonical Markdown or artifact data changes. |
-| `memory_status` | Reports source, index, Graphify, and runtime status. |
-
 ## Repository layout
 
 | Path | Contents |
 |---|---|
 | `src/ai_memory_mcp/` | MCP server, retrieval engine, indexer, and adapters |
+| `src/ai_memory_mcp/artifacts/` | Artifact schema, intake, search, bursts, and backup |
 | `scripts/` | Setup, client installation, and Graphify operations |
 | `skill/ai-memory/` | Canonical AI Memory skill |
 | `graphify-codebase/` | Independent codebase-indexing skill and wrapper |
@@ -222,6 +236,7 @@ The [documentation index](docs/README.md) gives links to all project guides.
 - [Configuration](docs/configuration.md)
 - [Operations](docs/operations.md)
 - [Architecture](docs/architecture.md)
+- [Artifact storage](docs/artifact-storage.md)
 - [Development](docs/development.md)
 - [Validation](docs/validation-report.md)
 - [Writing standard](docs/writing-standard.md)

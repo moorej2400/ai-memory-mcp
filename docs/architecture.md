@@ -26,29 +26,24 @@ A failed refresh does not change either authority.
 ## System flow
 
 ```mermaid
-flowchart LR
-    P[Primary writable vault] --> I[Memory indexer]
-    A[Retrieval-only vaults] --> I
-    C[Provider adapter] --> D[Canonical artifact database]
-    D --> X[Raw artifact FTS]
-    D --> B[Derived burst index]
-    D --> M[Agent distillation]
-    M --> P
-    I --> L[Exact and lexical index]
-    I --> V[Semantic index]
-    I --> G[Graphify graph]
-    Q[Agent query] --> S[AI Memory MCP]
-    S --> X
-    S --> B
-    S --> L
-    S --> V
-    S --> G
-    L --> F[RRF fusion]
-    V --> F
-    G --> F
-    F --> R[Rerank and context]
-    R --> E[Evidence with citations]
+flowchart TB
+    C["Provider adapter"] --> D["Canonical artifact database"]
+    P["Primary writable vault"] --> I["Memory indexer"]
+    A["Retrieval-only vaults"] --> I
+    I --> MdSignals["Markdown signals<br/>exact, lexical, semantic, graph"]
+    D --> ArtSignals["Artifact signals<br/>raw FTS and bursts"]
+    Q["Agent query"] --> S["AI Memory MCP"]
+    S --> MdSignals
+    S --> ArtSignals
+    MdSignals --> F["RRF fusion"]
+    ArtSignals --> F
+    F --> R["Rerank, decay, and context"]
+    R --> E["Evidence with citations"]
+    E -. agent distillation .-> P
 ```
+
+Each signal group supplies its own ranked view.
+Fusion combines those views, and no group receives a rank penalty from list order.
 
 ## Components
 
