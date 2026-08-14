@@ -6,6 +6,7 @@ Return to the [project overview](../README.md) for the quick-start procedure.
 ## Setup and use
 
 - [Installation](installation.md) gives the setup procedure.
+- [AI agent setup](agent-new-system-setup.md) gives the complete new-system procedure.
 - [Configuration](configuration.md) describes each configuration group.
 - [Operations](operations.md) gives common operating procedures.
 

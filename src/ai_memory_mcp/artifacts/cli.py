@@ -37,6 +37,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
+    commands.add_parser("init", help="Initialize the artifact database.")
+
     ingest = commands.add_parser("ingest", help="Ingest one JSONL batch.")
     ingest.add_argument("--input", required=True, help="JSONL file or -.")
 
@@ -306,6 +308,12 @@ def _backup(settings: Settings, args: argparse.Namespace) -> Any:
     return backup_artifact_db(settings)
 
 
+def _init(settings: Settings, args: argparse.Namespace) -> Any:
+    from .schema import migrate_artifact_db
+
+    return migrate_artifact_db(settings)
+
+
 def _check(settings: Settings, args: argparse.Namespace) -> Any:
     from .backup import check_artifact_db
 
@@ -338,6 +346,7 @@ def _migrate_legacy(settings: Settings, args: argparse.Namespace) -> Any:
 
 
 HANDLERS = {
+    "init": _init,
     "ingest": _ingest,
     "status": lambda settings, args: _status(settings),
     "search": _search,

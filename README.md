@@ -191,6 +191,7 @@ Python implementation, so either shell produces the same result.
 Restart each configured client after the setup procedure is complete.
 
 For more setup information, read the [installation guide](docs/installation.md).
+For agent setup, read the [AI agent setup guide](docs/agent-new-system-setup.md).
 
 ## MCP tools
 

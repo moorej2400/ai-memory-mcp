@@ -146,6 +146,24 @@ def test_status_reports_a_missing_database_without_creating_it(
     assert database.exists() is False
 
 
+def test_init_creates_current_artifact_database_and_is_repeatable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _configure(monkeypatch, tmp_path)
+
+    assert main(["init"]) == 0
+    first = _one_json(capsys)
+    assert first["to_version"] == 3
+    assert first["applied"] == [1, 2, 3]
+
+    assert main(["init"]) == 0
+    second = _one_json(capsys)
+    assert second["to_version"] == 3
+    assert second["applied"] == []
+
+
 def test_status_reports_an_old_schema_without_changing_it(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

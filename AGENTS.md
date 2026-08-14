@@ -72,6 +72,7 @@ Read [docs/writing-standard.md](docs/writing-standard.md) before you change tech
 - Keep the canonical skill in `skill/ai-memory/`.
 - Keep the canonical Graphify skill in `graphify-codebase/skill/graphify/`.
 - Keep harness-local skill files as discovery stubs.
+- For a new system, follow `docs/agent-new-system-setup.md`.
 - Keep Graphify Codebase independent from AI Memory.
 - Do not add memory storage, recall, feedback, or learning behavior to the Graphify skill.
 

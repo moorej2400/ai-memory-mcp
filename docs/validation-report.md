@@ -15,7 +15,7 @@ Status: satisfactory
 
 ## Automated tests
 
-All 354 automated tests passed.
+All 357 automated tests passed.
 One platform-specific test was skipped.
 The tests covered artifact intake, retrieval, distillation, migration, recovery, MCP tools, client merging, and repository privacy.
 All eight provider TypeScript test files passed.

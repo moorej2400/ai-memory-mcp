@@ -34,6 +34,18 @@ The default wait limit is 300 seconds.
 Put the artifact database and object directory on local storage.
 Do not put the active SQLite database on a network file system.
 
+Initialize a new artifact database:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe init
+```
+
+```bash
+./.venv/bin/ai-memory-artifact init
+```
+
+The command applies each required schema migration once.
+
 Ingest one complete JSONL batch:
 
 ```powershell
