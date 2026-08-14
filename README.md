@@ -3,9 +3,10 @@
 AI Memory MCP gives agents one stable interface for durable memory.
 The server combines exact, lexical, semantic, and graph search results.
 
-The primary Markdown vault is the only write authority.
+The primary Markdown vault is the write authority for distilled durable memory.
 Additional Markdown vaults are retrieval-only sources.
-The system derives SQLite indexes and Graphify graphs from Markdown.
+The canonical artifact database is the write authority for raw external artifacts.
+The system derives retrieval indexes from both canonical data classes.
 
 ## Architecture decision
 
@@ -31,7 +32,7 @@ flowchart LR
     end
 
     subgraph Repository["AI Memory MCP repository"]
-        MCP["MCP facade<br/>Three public tools"]
+        MCP["MCP facade<br/>Four public tools"]
         Service["MemoryService<br/>Policy and orchestration"]
         Retrieval["RetrievalEngine<br/>Scope, fusion, and reranking"]
         Indexer["Memory indexer<br/>Validation and snapshots"]
@@ -120,13 +121,14 @@ It does not replace lexical or semantic retrieval.
 
 ## Refresh architecture
 
-`memory_sync` updates SQLite after a normal Markdown change.
+`memory_sync` updates the derived indexes after canonical Markdown or artifact data changes.
 The maintenance script rebuilds the Graphify graph.
 
 ```mermaid
 flowchart TD
     Change[Canonical Markdown change] --> Sync[memory_sync]
-    Sync --> IndexStage[Build staged SQLite snapshot]
+    ArtifactChange[Canonical artifact data change] --> Sync
+    Sync --> IndexStage[Build staged derived indexes]
     Maintenance[Graphify maintenance script] --> GraphStage[Build staged Graphify data]
     GraphStage --> GraphValidate{Graph validation}
     GraphValidate -->|pass| GraphPublish[Publish Graphify graph]
@@ -189,13 +191,15 @@ Python implementation, so either shell produces the same result.
 Restart each configured client after the setup procedure is complete.
 
 For more setup information, read the [installation guide](docs/installation.md).
+For agent setup, read the [AI agent setup guide](docs/agent-new-system-setup.md).
 
 ## MCP tools
 
 | Tool | Function |
 |---|---|
 | `memory_recall` | Returns cited evidence and applicable relationships. |
-| `memory_sync` | Updates the derived index from canonical Markdown. |
+| `memory_artifact_read` | Returns ordered raw context for one artifact reference. |
+| `memory_sync` | Updates the derived indexes after canonical Markdown or artifact data changes. |
 | `memory_status` | Reports source, index, Graphify, and runtime status. |
 
 ## Repository layout

@@ -29,6 +29,222 @@ The command skips publication when no Markdown file changed.
 Concurrent commands wait for the current index publisher.
 The default wait limit is 300 seconds.
 
+## Manage raw artifacts
+
+Put the artifact database and object directory on local storage.
+Do not put the active SQLite database on a network file system.
+
+Initialize a new artifact database:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe init
+```
+
+```bash
+./.venv/bin/ai-memory-artifact init
+```
+
+The command applies each required schema migration once.
+
+Ingest one complete JSONL batch:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe ingest --input batch.jsonl
+```
+
+```bash
+./.venv/bin/ai-memory-artifact ingest --input batch.jsonl
+```
+
+Use `--input -` to read the complete batch from standard input.
+The command validates the complete batch before it changes SQLite.
+The intake receipt confirms storage only.
+The receipt is not a provider cursor.
+
+Check the database status:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe status
+```
+
+```bash
+./.venv/bin/ai-memory-artifact status
+```
+
+Search active raw artifacts:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe search --query "rotation procedure" --source chat-source
+```
+
+```bash
+./.venv/bin/ai-memory-artifact search --query "rotation procedure" --source chat-source
+```
+
+Read ordered context from one stable citation:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe read --reference artifact://message/<artifact-id> --limit 20
+```
+
+```bash
+./.venv/bin/ai-memory-artifact read --reference artifact://message/<artifact-id> --limit 20
+```
+
+Use `pending` to list artifacts that need Markdown distillation.
+Use `mark-distilled` after you validate the current Markdown note.
+Use `mark-no-durable-memory` only for a reviewed conversation.
+Use `backup` to create a consistent SQLite database backup.
+Use `migrate-legacy` to stage a supported legacy import.
+
+## Back up and check raw artifacts
+
+Treat the active database file and its WAL files as one database unit.
+Do not copy an active SQLite file with a normal file-copy command.
+The copy can omit committed WAL data or contain an inconsistent page set.
+
+Create a consistent database backup:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe backup
+```
+
+```bash
+./.venv/bin/ai-memory-artifact backup
+```
+
+The command uses the SQLite backup API.
+The command checks database integrity and foreign keys before publication.
+The command does not remove an older backup.
+The database backup does not contain attachment object files.
+Back up `AI_MEMORY_ARTIFACT_OBJECTS_DIR` with the applicable filesystem backup.
+
+Check the active artifact database:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe check
+```
+
+```bash
+./.venv/bin/ai-memory-artifact check
+```
+
+Restore a verified backup to a new staging path:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe restore --backup <backup-file> --destination <new-database-file>
+```
+
+```bash
+./.venv/bin/ai-memory-artifact restore --backup <backup-file> --destination <new-database-file>
+```
+
+The restore command rejects an existing destination.
+The restore command does not replace the active database.
+Stop all writers before an operator-controlled cutover.
+Keep the source backup until the restored database passes operational checks.
+
+## Import legacy artifacts
+
+Keep each legacy source active until all verification checks pass.
+The migration opens the legacy SQLite database in read-only mode.
+The migration creates a stable logical snapshot with the SQLite backup API.
+The snapshot includes committed WAL data.
+The migration does not change the database or Markdown notes.
+
+Run a dry-run check on Windows:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe migrate-legacy --source chat-source --source-instance workspace --sync-db <sync-database> --chat-notes <chat-notes> --meeting-notes <meeting-notes> --dry-run
+```
+
+Run a dry-run check on macOS or Linux:
+
+```bash
+./.venv/bin/ai-memory-artifact migrate-legacy --source chat-source --source-instance workspace --sync-db <sync-database> --chat-notes <chat-notes> --meeting-notes <meeting-notes> --dry-run
+```
+
+Check the reported counts and unresolved identities.
+The `database_sha256` value identifies the logical database snapshot.
+Stop the import if a required count is incorrect.
+
+Import the checked sources on Windows:
+
+```powershell
+.\.venv\Scripts\ai-memory-artifact.exe migrate-legacy --source chat-source --source-instance workspace --sync-db <sync-database> --chat-notes <chat-notes> --meeting-notes <meeting-notes>
+```
+
+Import the checked sources on macOS or Linux:
+
+```bash
+./.venv/bin/ai-memory-artifact migrate-legacy --source chat-source --source-instance workspace --sync-db <sync-database> --chat-notes <chat-notes> --meeting-notes <meeting-notes>
+```
+
+Use `--immutable` only with a closed database copy that has no active WAL file.
+Do not use `--immutable` with the active provider database.
+
+The import keeps manual summaries as distillation candidates.
+The canonical database stores raw messages, meetings, transcripts, and transcript cues.
+The migration does not create transcript-heavy Markdown notes.
+
+Compare the receipt with the dry-run counts after the import.
+Keep the legacy sources in backup coverage during the transition.
+After approval, move obsolete outputs to a recoverable archive.
+Do not automate the archive move.
+Do not delete the legacy database or notes.
+
+## Switch a provider pipeline
+
+Use one complete JSONL batch as the handoff boundary.
+Keep provider state separate from the canonical artifact database.
+
+Before the switch, create a verified artifact backup.
+Before the switch, complete the legacy migration dry run.
+
+1. Run the provider fetch.
+2. Publish one complete JSONL batch.
+3. Ingest the batch with `ai-memory-artifact ingest`.
+4. Save the intake receipt outside the repository.
+5. If message or cue data changed, run `memory_sync`.
+6. Queue agent distillation for pending meetings and conversations.
+
+Do not use the intake receipt as a provider cursor.
+Do not point the provider at the canonical artifact database.
+Keep the old scheduled process available for rollback.
+
+Test one provider batch before the scheduled switch.
+Verify that the receipt has no conflict.
+Verify that raw search returns the expected text.
+Verify that artifact read returns ordered context.
+Verify that each new meeting enters the pending queue.
+Verify that Markdown does not contain a full transcript.
+
+Run one bounded reconciliation after the scheduled switch.
+Stop the cutover if the provider reports incomplete coverage as complete.
+Check each expected tombstone and unchanged record.
+
+After all checks pass, request approval for the archive move.
+Move legacy outputs only after approval.
+Keep the archive recoverable.
+
+## Validate artifact performance
+
+Run the synthetic artifact benchmark on macOS or Linux:
+
+```bash
+PYTHONPATH=src ./.venv/bin/python benchmarks/artifacts/generate_fixture.py
+```
+
+Run the frozen retrieval benchmark:
+
+```bash
+./.venv/bin/ai-memory-benchmark --label artifact-store-validation
+```
+
+The artifact benchmark writes generated data under the ignored `benchmarks/runs/` directory.
+The benchmark does not use live messages, meetings, or memory notes.
+Do not use one benchmark run as a strict performance limit.
+
 ## Run the MCP server
 
 Use the standard input and output transport for local agents:
@@ -72,8 +288,8 @@ Restart each configured client after the command finishes.
 
 ## Refresh Graphify
 
-Use `memory_sync` after an ordinary memory update.
-The tool updates only the derived SQLite index.
+Use `memory_sync` after canonical Markdown or artifact data changes.
+The tool updates the independent Markdown and artifact indexes.
 
 Use the maintenance script when the Graphify graph must change.
 The script uses staging and validation.
@@ -113,7 +329,8 @@ The transcript also records failures and rollback operations.
 ## Review local logs
 
 The index log records source counts, changes, errors, lock waits, and elapsed time.
-The retrieval log records each query, result, citation, diagnostic, and elapsed time.
+The retrieval log records Markdown queries, results, citations, diagnostics, and elapsed time.
+Artifact routes record query hashes, evidence digests, and metadata.
 
 Read these files under `AI_MEMORY_LOG_DIR`:
 

@@ -130,6 +130,39 @@ def test_environment_file_does_not_override_explicit_values(
     assert os.environ["AI_MEMORY_SCRIPT_SECOND"] == "from-process"
 
 
+def test_setup_initializes_explicit_artifact_paths(project_root: Path) -> None:
+    setup = _load("setup", "scripts/setup.py", project_root)
+
+    assert "AI_MEMORY_ARTIFACT_DB=" in setup.ENV_TEMPLATE
+    assert "AI_MEMORY_ARTIFACT_OBJECTS_DIR=" in setup.ENV_TEMPLATE
+    assert "AI_MEMORY_ARTIFACT_BACKUP_DIR=" in setup.ENV_TEMPLATE
+
+
+def test_setup_uses_the_installed_artifact_initializer(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    setup = _load("setup_artifacts", "scripts/setup.py", project_root)
+    application_python = tmp_path / "venv" / "bin" / "python"
+    calls: list[tuple[list[str], str]] = []
+    monkeypatch.setattr(
+        setup,
+        "_run",
+        lambda command, failure: calls.append((command, failure)),
+    )
+
+    setup._initialize_artifact_store(application_python, tmp_path / "repo")
+
+    assert calls == [
+        (
+            [
+                str(tmp_path / "repo" / ".venv" / "bin" / "ai-memory-artifact"),
+                "init",
+            ],
+            "Failed to initialize the artifact database.",
+        )
+    ]
+
+
 def test_posix_wrappers_accept_a_python3_only_environment(
     project_root: Path,
 ) -> None:

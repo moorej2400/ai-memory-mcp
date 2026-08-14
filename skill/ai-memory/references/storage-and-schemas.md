@@ -187,3 +187,16 @@ Update only indexes affected by the change:
 - `Conflicts.md` for contradictory active claims
 
 Do not rebuild unrelated indexes for a narrow write.
+
+## Distilled artifact notes
+
+Store distilled meeting notes under `References/Meetings/`.
+Store durable conversation notes under `References/Conversations/`.
+
+Add `artifact_kind`, `source_artifact`, `distilled_through_event`, and `source_digest` to the ordinary note frontmatter.
+Put agent-managed content between one begin marker and one end marker.
+Keep manual content outside this managed region.
+
+Do not put complete chat logs or transcripts in Markdown.
+Use short quotations with `artifact://` links for important evidence.
+Use the stable artifact ID suffix to prevent title and case collisions.

@@ -136,6 +136,10 @@ class Settings:
     index_lock_timeout_seconds: float = 300.0
     embedding_provider: str = "auto"
     embedding_model: str = ""
+    artifact_db: Path = Path.home() / ".ai-memory" / "artifacts.sqlite3"
+    artifact_objects_dir: Path = Path.home() / ".ai-memory" / "objects"
+    artifact_backup_dir: Path = Path.home() / ".ai-memory" / "backups"
+    artifact_batch_max_bytes: int = 268_435_456
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -154,6 +158,13 @@ class Settings:
             / "graphify-out"
             / "graph.json",
         )
+        artifact_batch_max_bytes = int(
+            os.getenv("AI_MEMORY_ARTIFACT_BATCH_MAX_BYTES", "268435456")
+        )
+        if artifact_batch_max_bytes <= 0:
+            raise ValueError(
+                "AI_MEMORY_ARTIFACT_BATCH_MAX_BYTES must be positive."
+            )
         return cls(
             memory_root=root,
             state_dir=state,
@@ -194,11 +205,28 @@ class Settings:
                 "AI_MEMORY_MCP_EMBEDDING_PROVIDER", "auto"
             ),
             embedding_model=os.getenv("AI_MEMORY_MCP_EMBEDDING_MODEL", ""),
+            artifact_db=_configured_path(
+                "AI_MEMORY_ARTIFACT_DB",
+                home / ".ai-memory" / "artifacts.sqlite3",
+            ),
+            artifact_objects_dir=_configured_path(
+                "AI_MEMORY_ARTIFACT_OBJECTS_DIR",
+                home / ".ai-memory" / "objects",
+            ),
+            artifact_backup_dir=_configured_path(
+                "AI_MEMORY_ARTIFACT_BACKUP_DIR",
+                home / ".ai-memory" / "backups",
+            ),
+            artifact_batch_max_bytes=artifact_batch_max_bytes,
         )
 
     @property
     def pointer_path(self) -> Path:
         return self.state_dir / "current-index.json"
+
+    @property
+    def artifact_pointer_path(self) -> Path:
+        return self.state_dir / "current-artifact-index.json"
 
     @property
     def resolved_log_dir(self) -> Path:

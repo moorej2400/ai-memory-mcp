@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import re
 import sqlite3
 import time
@@ -7,12 +8,14 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
 
+from .artifacts.models import ArtifactSearchHit
+
 from .config import Settings
 from .embedding import EmbeddingProvider, EmbeddingUnavailable, resolve_provider
 from .graphify import GraphifyAdapter
 from .index import MemoryIndex, scope_sql
 from .models import EvidencePacket, ScopeFilter, SearchHit
-from .text import cosine_sparse, query_identifiers, tokenize
+from .text import cosine_sparse, fts_expression, query_identifiers, tokenize
 
 TICKET_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,12}-\d+\b", re.IGNORECASE)
 STOPWORDS = {
@@ -44,6 +47,198 @@ SEMANTIC_MARGIN_MIN = 0.35
 FRESHNESS_CAP = 0.03
 FRESHNESS_HALF_LIFE_DAYS = 180.0
 REVIEW_OVERDUE_PENALTY = 0.03
+RAW_FRESHNESS_CAP = 0.03
+RAW_CHAT_HALF_LIFE_DAYS = 30.0
+RAW_MEETING_HALF_LIFE_DAYS = 90.0
+RAW_ARTIFACT_WARNING = (
+    "Raw artifact evidence is a lead. Verify the source context or distill it "
+    "before use as durable memory."
+)
+
+
+def _quoted_phrases(query: str) -> list[str]:
+    return [
+        match.group(1).strip()
+        for match in re.finditer(r'"([^"\r\n]{1,2000})"', query)
+        if match.group(1).strip()
+    ]
+
+
+def _raw_exact_reason(query: str, hit: ArtifactSearchHit) -> str | None:
+    candidate = query.strip().strip('"').casefold()
+    identifiers = {
+        hit.external_id.casefold(),
+        hit.artifact_id.casefold(),
+        hit.artifact_uri.casefold(),
+    }
+    if candidate in identifiers:
+        return "exact identifier"
+    searchable = f"{hit.title}\n{hit.text}".casefold()
+    if any(phrase.casefold() in searchable for phrase in _quoted_phrases(query)):
+        return "exact phrase"
+    return None
+
+
+def merge_artifact_evidence(
+    query: str,
+    markdown_packet: EvidencePacket | None,
+    artifact_hits: list[ArtifactSearchHit],
+    *,
+    settings: Settings,
+    now: datetime,
+    limit: int,
+) -> EvidencePacket:
+    """Fuse distilled and raw rankings while preserving each answer gate."""
+    if not artifact_hits and markdown_packet is not None:
+        return markdown_packet
+
+    combined: dict[str, SearchHit] = {}
+    if markdown_packet is not None:
+        for rank, original in enumerate(markdown_packet.results, start=1):
+            hit = copy.deepcopy(original)
+            hit.score += 1.0 / (settings.rrf_k + rank)
+            hit.ranks.setdefault("distilled", rank)
+            combined[hit.memory_id] = hit
+
+    for rank, raw in enumerate(artifact_hits, start=1):
+        reason = _raw_exact_reason(query, raw)
+        score = 1.0 / (settings.rrf_k + rank)
+        score += min(0.04, raw.score * 0.04)
+        if reason is not None:
+            score += 0.20
+        occurred_at = raw.occurred_at
+        occurred = occurred_at
+        if occurred is not None:
+            if occurred.tzinfo is None:
+                occurred = occurred.replace(tzinfo=timezone.utc)
+            age_days = max(
+                0.0,
+                (now - occurred.astimezone(timezone.utc)).total_seconds()
+                / 86400.0,
+            )
+            half_life = (
+                RAW_MEETING_HALF_LIFE_DAYS
+                if raw.entity in {"meeting", "recording", "transcript", "transcript-cue"}
+                else RAW_CHAT_HALF_LIFE_DAYS
+            )
+            freshness = (
+                RAW_FRESHNESS_CAP
+                if reason is not None
+                else RAW_FRESHNESS_CAP * 0.5 ** (age_days / half_life)
+            )
+            score += freshness
+        ranking = (
+            "artifact-fts"
+            if raw.evidence_class == "raw"
+            else "artifact-vector"
+        )
+        hit = SearchHit(
+            memory_id=raw.artifact_id,
+            source_id=f"artifact-{raw.source}",
+            path=raw.artifact_uri,
+            title=raw.title,
+            heading=raw.entity,
+            text=raw.text,
+            score=score,
+            ranks={ranking: rank},
+            signals={ranking: raw.score},
+            reasons=[reason] if reason else [],
+            evidence_class=raw.evidence_class,
+            artifact_uri=raw.artifact_uri,
+            source_label=raw.source,
+            source_instance=raw.source_instance,
+            occurred_at=(
+                raw.occurred_at.isoformat() if raw.occurred_at is not None else None
+            ),
+            artifact_kind=raw.entity,
+            external_id=raw.external_id,
+        )
+        existing = combined.get(raw.artifact_uri)
+        if existing is None:
+            combined[raw.artifact_uri] = hit
+            continue
+        # A burst can start at the same artifact as a raw FTS hit. Preserve
+        # the raw record because only it carries the external ID answer gate.
+        winner, secondary = (
+            (existing, hit)
+            if (
+                bool(existing.reasons),
+                existing.evidence_class == "raw",
+                existing.score,
+            )
+            >= (
+                bool(hit.reasons),
+                hit.evidence_class == "raw",
+                hit.score,
+            )
+            else (hit, existing)
+        )
+        winner.ranks.update(secondary.ranks)
+        winner.signals.update(secondary.signals)
+        combined[raw.artifact_uri] = winner
+
+    ranked = sorted(
+        combined.values(),
+        key=lambda hit: (
+            hit.score,
+            hit.evidence_class == "distilled",
+            hit.title.casefold(),
+        ),
+        reverse=True,
+    )[:limit]
+    top = ranked[0] if ranked else None
+    if top is None:
+        answer_status = "no_answer"
+    elif top.evidence_class == "distilled":
+        answer_status = (
+            markdown_packet.answer_status
+            if markdown_packet is not None
+            else "no_answer"
+        )
+    else:
+        answer_status = (
+            "answered"
+            if any(
+                reason in {"exact identifier", "exact phrase"}
+                for reason in top.reasons
+            )
+            else "no_answer"
+        )
+
+    plan = (
+        copy.deepcopy(markdown_packet.plan)
+        if markdown_packet is not None
+        else {
+            "scope": {},
+            "retrievers": [],
+            "fusion": f"RRF(k={settings.rrf_k})",
+            "rerank": True,
+            "context_expansion": False,
+        }
+    )
+    retrievers = list(plan.get("retrievers", []))
+    if "artifact-fts" not in retrievers:
+        retrievers.append("artifact-fts")
+    plan["retrievers"] = retrievers
+    diagnostics = (
+        copy.deepcopy(markdown_packet.diagnostics)
+        if markdown_packet is not None
+        else {
+            "candidate_counts": {},
+            "provider_latency_ms": {},
+            "route": "artifact-only",
+        }
+    )
+    diagnostics.setdefault("candidate_counts", {})["artifact"] = len(
+        artifact_hits
+    )
+    return EvidencePacket(
+        query=query,
+        answer_status=answer_status,
+        results=ranked,
+        plan=plan,
+        diagnostics=diagnostics,
+    )
 
 
 def _parse_utc(value: str) -> datetime | None:
@@ -68,13 +263,6 @@ def _lexical_score(bm25: float) -> float:
     """
     relevance = max(0.0, -bm25)
     return relevance / (1.0 + relevance)
-
-
-def _fts_expression(query: str) -> str:
-    terms = list(dict.fromkeys(tokenize(query)))
-    if not terms:
-        return '""'
-    return " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms[:24])
 
 
 def _intent_expansions(tokens: set[str]) -> set[str]:
@@ -171,7 +359,7 @@ class RetrievalEngine:
                 ORDER BY lexical_score
                 LIMIT ?
                 """,
-                [_fts_expression(query), *parameters, limit],
+                [fts_expression(query), *parameters, limit],
             ).fetchall()
         return [
             _row_hit(row, _lexical_score(row["lexical_score"]), "lexical", rank)

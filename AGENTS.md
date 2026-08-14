@@ -11,8 +11,9 @@ They also apply to `graphify-codebase/` and all future subdirectories.
 - Do not commit organization names, private domains, ticket prefixes, or user-specific paths.
 - Put machine-specific and organization-specific configuration in the ignored `.env`.
 - Use neutral names and identifiers in documentation, tests, and benchmark fixtures.
-- Keep Markdown as the memory authority.
-- Treat SQLite and Graphify data as derived data.
+- Keep Markdown as the authority for distilled durable memory.
+- Keep the artifact SQLite database as the authority for raw artifacts.
+- Treat Markdown search SQLite, artifact burst indexes, and Graphify data as derived data.
 
 ## Public repository privacy
 
@@ -71,6 +72,7 @@ Read [docs/writing-standard.md](docs/writing-standard.md) before you change tech
 - Keep the canonical skill in `skill/ai-memory/`.
 - Keep the canonical Graphify skill in `graphify-codebase/skill/graphify/`.
 - Keep harness-local skill files as discovery stubs.
+- For a new system, follow `docs/agent-new-system-setup.md`.
 - Keep Graphify Codebase independent from AI Memory.
 - Do not add memory storage, recall, feedback, or learning behavior to the Graphify skill.
 

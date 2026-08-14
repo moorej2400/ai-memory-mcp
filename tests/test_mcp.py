@@ -17,13 +17,34 @@ def test_public_tool_surface_is_small_and_stable(
     tools = {
         tool.name: tool for tool in server._tool_manager.list_tools()
     }
-    assert set(tools) == {"memory_recall", "memory_sync", "memory_status"}
+    assert set(tools) == {
+        "memory_recall",
+        "memory_artifact_read",
+        "memory_sync",
+        "memory_status",
+    }
     assert tools["memory_recall"].annotations.readOnlyHint is True
+    assert tools["memory_artifact_read"].annotations.readOnlyHint is True
+    assert tools["memory_artifact_read"].annotations.idempotentHint is True
     assert tools["memory_status"].annotations.readOnlyHint is True
     assert tools["memory_sync"].annotations.readOnlyHint is False
     assert tools["memory_recall"].output_schema["additionalProperties"] is False
     assert tools["memory_recall"].parameters["properties"]["limit"]["maximum"] == 20
+    assert {
+        "source_label",
+        "source_instance",
+        "artifact_kind",
+        "date_from",
+        "date_to",
+    } <= set(tools["memory_recall"].parameters["properties"])
+    assert (
+        tools["memory_artifact_read"].parameters["properties"]["limit"]["maximum"]
+        == 200
+    )
     assert tools["memory_sync"].parameters["properties"] == {}
+    assert "derived indexes" in tools["memory_sync"].description
+    assert "artifact data changes" in tools["memory_sync"].description
+    assert "artifact data changes" in server.instructions
 
 
 def test_tool_call_runs_full_retrieval_internally(

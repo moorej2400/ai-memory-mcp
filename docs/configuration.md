@@ -19,6 +19,10 @@ Copy `.env.example` when you create the configuration manually.
 | `AI_MEMORY_GRAPHIFY_PYTHON` | Overrides the pinned Graphify interpreter. |
 | `AI_MEMORY_GRAPHIFY_MCP_EXE` | Overrides the pinned Graphify MCP executable. |
 | `AI_MEMORY_LOG_DIR` | Sets the local index and retrieval log directory. |
+| `AI_MEMORY_ARTIFACT_DB` | Sets the canonical raw artifact database file. |
+| `AI_MEMORY_ARTIFACT_OBJECTS_DIR` | Sets the attachment object directory. |
+| `AI_MEMORY_ARTIFACT_BACKUP_DIR` | Sets the artifact backup directory. |
+| `AI_MEMORY_ARTIFACT_BATCH_MAX_BYTES` | Sets the maximum uncompressed intake batch size. |
 
 Use a JSON object for `AI_MEMORY_RETRIEVAL_SOURCES`:
 
@@ -37,6 +41,9 @@ them only to point at a Graphify installed somewhere else.
 The server writes no Markdown files.
 The AI Memory skill writes new records only under `AI_MEMORY_WORK_DIR`.
 The indexer reads all configured sources without changing them.
+
+The default artifact batch limit is 268435456 bytes.
+Set a positive integer when you override this limit.
 
 ## Graphify
 
@@ -83,7 +90,8 @@ repository-owned scripts.
 The server accepts only a loopback host.
 The HTTP transport does not provide authentication.
 
-The retrieval log contains the query and the returned evidence.
+The retrieval log contains Markdown queries and returned evidence.
+Artifact routes store query hashes, evidence digests, and metadata.
 Keep the log directory outside the repository.
 
 ## Repository privacy

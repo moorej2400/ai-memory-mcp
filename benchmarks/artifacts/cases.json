@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "fixture": {
+    "conversations": 100,
+    "messages": 100000,
+    "meetings": 100,
+    "transcripts": 100,
+    "transcript_cues": 50000,
+    "expected_jsonl_sha256": "380e2e23d1a387771377af75e57f073d44e2658b927555b99bb0b207c977b727"
+  },
+  "cases": [
+    {
+      "id": "message-decision",
+      "query": "violet checkpoint token qx-042-769",
+      "entity": "message",
+      "external_id": "message-042-000769"
+    },
+    {
+      "id": "meeting-cue",
+      "query": "silver rollback beacon rb-037-273",
+      "entity": "transcript-cue",
+      "external_id": "cue-037-000273"
+    }
+  ]
+}

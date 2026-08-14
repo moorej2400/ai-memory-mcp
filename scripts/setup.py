@@ -17,6 +17,7 @@ from _common import (  # noqa: E402
     info,
     repository_root,
     run_main,
+    venv_executable,
     venv_python,
 )
 
@@ -28,6 +29,10 @@ AI_MEMORY_RETRIEVAL_SOURCES="{{}}"
 AI_MEMORY_MCP_STATE_DIR="{home}/.ai-memory-mcp"
 AI_MEMORY_GRAPHIFY_STATE_DIR="{home}/.graphify"
 AI_MEMORY_GRAPH_PATH="{home}/.graphify/corpora/ai-memory/graphify-out/graph.json"
+AI_MEMORY_ARTIFACT_DB="{home}/.ai-memory/artifacts.sqlite3"
+AI_MEMORY_ARTIFACT_OBJECTS_DIR="{home}/.ai-memory/objects"
+AI_MEMORY_ARTIFACT_BACKUP_DIR="{home}/.ai-memory/backups"
+AI_MEMORY_ARTIFACT_BATCH_MAX_BYTES="268435456"
 GRAPHIFY_GLOBAL_MCP_URL="http://127.0.0.1:4324/mcp"
 GRAPHIFY_OPENAI_BASE_URL=""
 GRAPHIFY_OPENAI_API_KEY=""
@@ -71,6 +76,16 @@ def _ensure_venv(venv_root: Path, bootstrap: list[str], label: str) -> Path:
     if not python.is_file():
         raise ScriptError(f"The {label} environment has no interpreter: {python}")
     return python
+
+
+def _initialize_artifact_store(application_python: Path, root: Path) -> None:
+    # Use the installed entry point so setup verifies the same command that
+    # operators and automation use after provisioning.
+    artifact_cli = venv_executable(root / ".venv", "ai-memory-artifact")
+    _run(
+        [str(artifact_cli), "init"],
+        "Failed to initialize the artifact database.",
+    )
 
 
 def main() -> None:
@@ -165,6 +180,8 @@ def main() -> None:
             newline="\n",
         )
         info(f"Created local configuration: {env_path}")
+
+    _initialize_artifact_store(application_python, root)
 
     _run(
         [str(application_python), "-m", "ai_memory_mcp.cli"],

@@ -35,6 +35,16 @@ def tokenize(value: str) -> list[str]:
     ]
 
 
+def fts_expression(query: str) -> str:
+    """Build one bounded FTS expression from quoted, normalized tokens."""
+    terms = list(dict.fromkeys(tokenize(query)))
+    if not terms:
+        return '""'
+    return " OR ".join(
+        f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms[:24]
+    )
+
+
 def query_identifiers(value: str) -> list[str]:
     return list(dict.fromkeys(match.group(0).strip() for match in IDENTIFIER_RE.finditer(value)))
 
