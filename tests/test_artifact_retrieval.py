@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from ai_memory_mcp.artifacts.models import (
 )
 from ai_memory_mcp.artifacts.store import ArtifactStore
 from ai_memory_mcp.config import Settings
+from ai_memory_mcp.embedding import EmbeddingUnavailable
 from ai_memory_mcp.service import MemoryService
 
 
@@ -85,6 +87,24 @@ def test_exact_raw_phrase_can_answer(artifact_settings: Settings) -> None:
     assert response.status == "answered"
     assert response.evidence[0].evidence_class == "raw"
     assert response.citations[0].path.startswith("artifact://")
+
+
+def test_exact_raw_phrase_after_five_thousand_characters_can_answer(
+    artifact_settings: Settings,
+) -> None:
+    phrase = "late exact evidence marker"
+    ArtifactStore(artifact_settings).apply_batch(
+        _raw_batch(text=("Unrelated filler text. " * 300) + phrase)
+    )
+
+    response = MemoryService(artifact_settings).recall(
+        f'"{phrase}"',
+        source_label="chat-source",
+    )
+
+    assert response.status == "answered"
+    assert phrase in response.evidence[0].text
+    assert len(response.evidence[0].text) <= 5000
 
 
 def test_artifact_recall_works_without_a_markdown_index(
@@ -203,6 +223,93 @@ def test_markdown_recall_works_when_artifact_database_is_missing(
     assert not settings.artifact_db.exists()
 
 
+def test_markdown_recall_works_when_artifact_database_path_is_rejected(
+    benchmark_settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_db = tmp_path / "rejected" / "artifacts.sqlite3"
+    artifact_db.parent.mkdir(parents=True)
+    artifact_db.write_bytes(b"configured")
+    settings = replace(
+        benchmark_settings,
+        artifact_db=artifact_db,
+        artifact_objects_dir=tmp_path / "rejected" / "objects",
+        artifact_backup_dir=tmp_path / "rejected" / "backups",
+    )
+
+    def reject_path(_: Settings) -> None:
+        raise ValueError("Artifact database must use a local filesystem.")
+
+    monkeypatch.setattr(
+        "ai_memory_mcp.service.require_current_artifact_schema",
+        reject_path,
+    )
+    service = MemoryService(settings)
+
+    markdown = service.recall("ALPHA-142", limit=1)
+    artifact = service.recall("ALPHA-142", source_label="chat-source", limit=1)
+
+    assert markdown.status == "answered"
+    assert markdown.evidence[0].evidence_class == "distilled"
+    assert artifact.status == "no_answer"
+    assert artifact.warnings == [
+        "Artifact database is not available for this filter."
+    ]
+
+
+def test_raw_recall_survives_artifact_semantic_provider_failure(
+    artifact_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ArtifactStore(artifact_settings).apply_batch(_raw_batch())
+
+    def fail_semantic(*_: object, **__: object) -> None:
+        raise EmbeddingUnavailable("synthetic provider is unavailable")
+
+    monkeypatch.setattr(
+        "ai_memory_mcp.artifacts.vector_index.search_artifact_vectors",
+        fail_semantic,
+    )
+
+    response = MemoryService(artifact_settings).recall(
+        '"documented rotation"',
+        source_label="chat-source",
+        limit=1,
+    )
+
+    assert response.status == "answered"
+    assert response.evidence[0].evidence_class == "raw"
+    assert "Artifact semantic index is not available" in response.warnings[-1]
+
+
+def test_markdown_recall_survives_raw_artifact_search_failure(
+    benchmark_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ArtifactStore(benchmark_settings).apply_batch(_raw_batch())
+
+    def fail_raw_search(*_: object, **__: object) -> None:
+        raise sqlite3.DatabaseError("synthetic FTS failure")
+
+    monkeypatch.setattr(
+        "ai_memory_mcp.service.ArtifactSearch.search",
+        fail_raw_search,
+    )
+    service = MemoryService(benchmark_settings)
+
+    markdown = service.recall("ALPHA-142", limit=1)
+    artifact = service.recall("ALPHA-142", source_label="chat-source", limit=1)
+
+    assert markdown.status == "answered"
+    assert markdown.evidence[0].evidence_class == "distilled"
+    assert "Artifact database is not available." in markdown.warnings
+    assert artifact.status == "no_answer"
+    assert artifact.warnings == [
+        "Artifact database is not available for this filter."
+    ]
+
+
 def test_distilled_note_outranks_stale_raw_paraphrase(
     benchmark_settings: Settings,
     tmp_path: Path,
@@ -287,22 +394,26 @@ def test_artifact_failure_audit_hashes_the_query(
     sensitive_marker = "failed-private-artifact-query"
 
     def fail_search(*_args: object, **_kwargs: object) -> object:
-        raise RuntimeError("Synthetic artifact search failure")
+        raise RuntimeError(f"Synthetic artifact search failure: {sensitive_marker}")
 
     monkeypatch.setattr(
         "ai_memory_mcp.service.ArtifactSearch.search",
         fail_search,
     )
-    with pytest.raises(RuntimeError, match="Synthetic"):
-        MemoryService(settings).recall(
-            sensitive_marker,
-            source_label="chat-source",
-        )
+    response = MemoryService(settings).recall(
+        sensitive_marker,
+        source_label="chat-source",
+    )
+    assert response.status == "no_answer"
+    assert response.warnings == [
+        "Artifact database is not available for this filter."
+    ]
     record = json.loads(
         (settings.resolved_log_dir / "retrieval.jsonl")
         .read_text(encoding="utf-8")
         .splitlines()[-1]
     )
+    assert record["event"] == "retrieval_completed"
     assert sensitive_marker not in json.dumps(record)
     assert record["query_sha256"]
     assert record["query_characters"] == len(sensitive_marker)
@@ -315,7 +426,7 @@ def test_status_and_ordered_read_include_artifact_state(
     service = MemoryService(artifact_settings)
     status = service.status()
     assert status.artifact_database.available is True
-    assert status.artifact_database.schema_version == 2
+    assert status.artifact_database.schema_version == 3
     assert status.artifact_database.artifacts == 1
 
     reference = artifact_uri(

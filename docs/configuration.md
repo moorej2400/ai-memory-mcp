@@ -90,7 +90,8 @@ repository-owned scripts.
 The server accepts only a loopback host.
 The HTTP transport does not provide authentication.
 
-The retrieval log contains the query and the returned evidence.
+The retrieval log contains Markdown queries and returned evidence.
+Artifact routes store query hashes, evidence digests, and metadata.
 Keep the log directory outside the repository.
 
 ## Repository privacy

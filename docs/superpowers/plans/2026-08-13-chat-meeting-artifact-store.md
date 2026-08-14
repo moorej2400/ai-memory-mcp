@@ -482,7 +482,10 @@ class RedactionPayload(StrictModel):
     reason: str = Field(min_length=1, max_length=500)
 ```
 
-A redaction removes the complete artifact content.
+A redaction removes the complete active artifact content.
+Move unshared object bytes to a private quarantine because automatic file deletion is not permitted.
+Preserve object bytes while another active artifact still references them.
+Do not read or copy later object handoffs for a redacted artifact.
 The system does not support selective field redaction in the first release.
 
 Each normalized payload uses these common fields:
@@ -544,7 +547,7 @@ git commit -m "feat: define artifact identity and configuration"
 
 **Interfaces:**
 
-- `ARTIFACT_SCHEMA_VERSION = 2`
+- `ARTIFACT_SCHEMA_VERSION = 3`
 - `connect_artifact_db(path, *, read_only=False) -> sqlite3.Connection`
 - `migrate_artifact_db(settings) -> MigrationResult`
 - `artifact_database_status(settings) -> ArtifactDatabaseStatus`
@@ -557,8 +560,8 @@ Create tests for these behaviors:
 def test_migration_creates_schema_and_fts(artifact_settings: Settings) -> None:
     result = migrate_artifact_db(artifact_settings)
     assert result.from_version == 0
-    assert result.to_version == 2
-    assert result.applied == [1, 2]
+    assert result.to_version == 3
+    assert result.applied == [1, 2, 3]
     with connect_artifact_db(artifact_settings.artifact_db) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
@@ -574,8 +577,8 @@ def test_migration_creates_schema_and_fts(artifact_settings: Settings) -> None:
 def test_repeated_migration_is_a_no_op(artifact_settings: Settings) -> None:
     migrate_artifact_db(artifact_settings)
     result = migrate_artifact_db(artifact_settings)
-    assert result.from_version == 2
-    assert result.to_version == 2
+    assert result.from_version == 3
+    assert result.to_version == 3
     assert result.applied == []
 ```
 
@@ -605,7 +608,8 @@ Do not use the immutable flag for the active database.
 
 - [ ] **Step 4: Add migration 1**
 
-Migration 1 creates this schema:
+Migration 1 creates this initial schema.
+Migration 3 replaces the initial global alias constraint.
 
 ```sql
 CREATE TABLE artifact_metadata (
@@ -700,6 +704,7 @@ CREATE TABLE artifact_aliases (
     alias_kind TEXT NOT NULL,
     alias_value TEXT NOT NULL,
     PRIMARY KEY(artifact_id, source, source_instance, alias_kind, alias_value),
+    -- Migration 3 removes this global constraint.
     UNIQUE(source, source_instance, alias_kind, alias_value)
 );
 
@@ -793,11 +798,28 @@ CREATE INDEX artifact_links_target_idx
     ON artifact_links(target_artifact_id, relation, source_artifact_id);
 ```
 
+- [ ] **Step 6: Add migration 3**
+
+Migration 3 rebuilds `artifact_aliases` without the global alias constraint.
+The per-artifact primary key remains unique.
+The same conversation or calendar alias can identify multiple meeting occurrences.
+
+Migration 3 copies all version 2 alias rows into the new table.
+It then replaces the old table and adds this lookup index:
+
+```sql
+CREATE INDEX artifact_aliases_lookup_idx
+    ON artifact_aliases(
+        source, source_instance, alias_kind, alias_value, artifact_id
+    );
+```
+
 Read tools must open the database with `mode=ro`.
 Read tools must reject an old schema without changing the database.
-All database paths must reject a known network filesystem.
+All artifact SQLite paths must reject a known network filesystem.
+This rule covers canonical, backup, restore, migration source, and vector snapshot paths.
 
-- [ ] **Step 6: Make migrations recoverable**
+- [ ] **Step 7: Make migrations recoverable**
 
 Before a non-empty database migration, create a timestamped SQLite backup.
 Use `sqlite3.Connection.backup()`.
@@ -807,7 +829,7 @@ Apply each migration inside one transaction.
 Record the migration only after every statement succeeds.
 On POSIX systems, set new private directories to mode `0700` and new database files to `0600`.
 
-- [ ] **Step 7: Verify Task 3**
+- [ ] **Step 8: Verify Task 3**
 
 Run:
 
@@ -818,7 +840,7 @@ Run:
 
 Expected: all tests pass.
 
-- [ ] **Step 8: Commit Task 3**
+- [ ] **Step 9: Commit Task 3**
 
 ```bash
 git add src/ai_memory_mcp/artifacts/schema.py tests/test_artifact_schema.py
@@ -1109,7 +1131,7 @@ Expected: collection fails because `objects.py` does not exist.
 Read the source in bounded chunks.
 Write a temporary file inside the destination directory.
 Flush and synchronize the temporary file.
-Use `os.replace()` to publish the verified object.
+Use an exclusive hard link to publish the verified object.
 
 If the destination exists, verify its hash and reuse it.
 Do not overwrite a destination that has a different hash.
@@ -1327,7 +1349,7 @@ The `status` command reports these fields:
 ```json
 {
   "available": true,
-  "schema_version": 2,
+  "schema_version": 3,
   "database_path": "<configured path>",
   "journal_mode": "wal",
   "artifacts": 0,
@@ -1930,7 +1952,7 @@ Embed a burst when one condition is true:
 
 Treat an active attachment child as a message attachment link.
 
-Keep every burst available through raw FTS.
+Keep every underlying raw record available through canonical raw FTS.
 Do not create one semantic vector for each message.
 
 - [ ] **Step 5: Publish a separate derived artifact index**
@@ -2170,6 +2192,8 @@ Map each source table to a version 1 artifact event.
 Use the original conversation ID as its external ID.
 Use a composite conversation and message ID for each message external ID.
 Use a composite message and attachment ID for each attachment external ID.
+Use a time-qualified conversation fallback for each legacy meeting occurrence.
+Store the original meeting conversation ID as an alias and related-chat link.
 Use the source instance supplied by the operator.
 
 Use legacy Markdown only for these values:
@@ -2393,7 +2417,11 @@ When `--artifact-out` is absent, keep the existing legacy database behavior duri
 When `--artifact-out` is present, do not call `upsertMessages()`.
 Call a new `recordConversationFetchCoverage()` function instead.
 
-After each successful conversation fetch, add conversation, message, attachment, meeting-link, and delete events to the batch.
+After each successful conversation fetch, add conversation, message, attachment, and meeting-link events to the batch.
+
+Do not emit explicit events for messages that reconciliation does not find.
+Emit complete coverage only for a proven source range.
+AI Memory creates ordered coverage tombstones for missing artifacts.
 
 Use a composite message identity because provider message IDs can be conversation-scoped.
 Use a composite attachment identity because provider attachment IDs can be reused.
@@ -2721,6 +2749,7 @@ git commit -m "test: validate chat and meeting artifact intake"
 - [ ] A stale edit cannot replace newer current state.
 - [ ] A delete creates a tombstone and leaves revision evidence.
 - [ ] A redaction removes searchable content from current and revision payloads.
+- [ ] A redaction quarantines unshared object bytes and blocks later handoff reads.
 - [ ] A complete reconciliation can tombstone missing bounded records.
 - [ ] An incomplete fetch cannot claim complete coverage.
 - [ ] Artifact IDs cannot collide across source instances or entity kinds.

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import unicodedata
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -11,7 +11,7 @@ import yaml
 
 from ai_memory_mcp.config import Settings
 
-from .context import active_context_ids
+from .context import active_ancestor_predicate, active_context_ids
 from .identity import artifact_uri as make_artifact_uri
 from .identity import parse_artifact_uri
 from .models import ArtifactScope, DistillationCandidate
@@ -24,6 +24,14 @@ TIMESTAMP_SPEAKER_RE = re.compile(
 )
 SPEAKER_TURN_RE = re.compile(r"^\s*[^#>\-\d\s][^:\n]{0,60}:\s+\S")
 ARTIFACT_LINK_RE = re.compile(r"\]\((artifact://[^)\s]+)\)")
+TRANSCRIPT_HEADING_RE = re.compile(
+    r"^(?:[ \t]{0,3}#{1,6}[ \t]+(?:\*\*|__|`|\*|_)?[ \t]*"
+    r"transcript[ \t]*(?:\*\*|__|`|\*|_)?[ \t]*:?[ \t]*#*[ \t]*|"
+    r"[ \t]{0,3}(?:\*\*|__|`|\*|_)?[ \t]*transcript[ \t]*"
+    r"(?:\*\*|__|`|\*|_)?[ \t]*:?[ \t]*\n"
+    r"[ \t]{0,3}(?:=+|-+)[ \t]*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
 MAX_QUOTED_EVIDENCE_LINES = 12
 MAX_QUOTED_EVIDENCE_CHARACTERS = 2400
 
@@ -98,6 +106,7 @@ def list_pending_distillations(
         "a.entity IN ('meeting', 'conversation')",
         "a.deleted_at IS NULL",
         "a.redacted_at IS NULL",
+        active_ancestor_predicate("a"),
     ]
     parameters: list[Any] = []
     if selected.source is not None:
@@ -172,7 +181,9 @@ def _safe_markdown_path(settings: Settings, memory_path: str) -> Path:
         raise ValueError("The Markdown note path escapes the memory root.")
     folded = relative.as_posix().casefold()
     if root.is_dir():
-        for existing in root.rglob("*.md"):
+        for existing in root.rglob("*"):
+            if not existing.is_file() or existing.suffix.casefold() != ".md":
+                continue
             existing_relative = existing.relative_to(root).as_posix()
             if (
                 existing_relative.casefold() == folded
@@ -197,6 +208,62 @@ def _frontmatter(markdown: str) -> tuple[dict[str, Any], str]:
     if not isinstance(metadata, dict):
         raise ValueError("The Markdown note frontmatter must be a mapping.")
     return metadata, parts[2].lstrip()
+
+
+def _is_note_date(value: Any) -> bool:
+    if type(value) is date:
+        return True
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_required_frontmatter(
+    metadata: dict[str, Any],
+    *,
+    entity: str,
+    artifact_reference: str,
+) -> None:
+    _, artifact_value = parse_artifact_uri(artifact_reference)
+    if metadata.get("type") != "memory":
+        raise ValueError("The Markdown note type must be memory.")
+    if not isinstance(metadata.get("title"), str) or not metadata["title"].strip():
+        raise ValueError("The Markdown note title must be a nonempty string.")
+    if (
+        not isinstance(metadata.get("root_scope"), str)
+        or not metadata["root_scope"].strip()
+    ):
+        raise ValueError("The Markdown note root_scope must be a nonempty string.")
+    primary_scope = metadata.get("primary_scope")
+    if not isinstance(primary_scope, dict) or primary_scope != {
+        "kind": "reference",
+        "id": f"artifact:{artifact_value}",
+    }:
+        raise ValueError("The Markdown note primary_scope must match the artifact.")
+    if metadata.get("status") != "active":
+        raise ValueError("The Markdown note status must be active.")
+    for field in ("created", "updated"):
+        if not _is_note_date(metadata.get(field)):
+            raise ValueError(f"The Markdown note {field} must be a calendar date.")
+    if metadata.get("artifact_kind") != entity:
+        raise ValueError("The Markdown note artifact_kind does not match the artifact.")
+    if not isinstance(metadata.get("related"), list):
+        raise ValueError("The Markdown note related field must be a list.")
+    provenance = metadata.get("provenance")
+    if not isinstance(provenance, list) or not any(
+        isinstance(item, dict)
+        and item.get("source") == "artifact-store"
+        and item.get("reference") == artifact_reference
+        and _is_note_date(item.get("verified"))
+        for item in provenance
+    ):
+        raise ValueError(
+            "The Markdown note provenance must contain the verified artifact source."
+        )
 
 
 def _looks_like_transcript(body: str) -> bool:
@@ -250,7 +317,14 @@ def _validate_note(
     for field, value in expected.items():
         if str(metadata.get(field) or "") != value:
             raise ValueError(f"The Markdown note {field} does not match current state.")
+    _validate_required_frontmatter(
+        metadata,
+        entity=entity,
+        artifact_reference=artifact_reference,
+    )
     _, _, managed = _managed_region(body)
+    if TRANSCRIPT_HEADING_RE.search(managed):
+        raise ValueError("The Markdown note must not contain a Transcript section.")
     opening = re.split(r"(?m)^##\s+", managed, maxsplit=1)[0]
     summary_lines = [
         line.strip()
@@ -268,7 +342,12 @@ def _validate_note(
         if next_heading is not None:
             evidence_region = evidence_region[: next_heading.start()]
     links = ARTIFACT_LINK_RE.findall(evidence_region)
-    for link in links:
+    managed_links = ARTIFACT_LINK_RE.findall(managed)
+    if sorted(managed_links) != sorted(links):
+        raise ValueError(
+            "Every managed artifact link must be inside the Evidence section."
+        )
+    for link in managed_links:
         parse_artifact_uri(link)
         if link not in allowed_references:
             raise ValueError(
@@ -278,6 +357,23 @@ def _validate_note(
         raise ValueError("A meeting Markdown note needs an Evidence section.")
     if entity == "meeting" and not links:
         raise ValueError("A meeting Markdown note needs an artifact evidence link.")
+    quoted_evidence = []
+    for line in evidence_region.splitlines():
+        stripped = line.lstrip()
+        if not stripped.startswith(">"):
+            continue
+        content = stripped[1:].strip()
+        if not content or content.casefold().startswith("source:"):
+            continue
+        without_links = re.sub(
+            r"\[[^]]*\]\(artifact://[^)\s]+\)",
+            "",
+            content,
+        )
+        if re.search(r"[A-Za-z0-9]", without_links):
+            quoted_evidence.append(content)
+    if entity == "meeting" and not quoted_evidence:
+        raise ValueError("A meeting Markdown note needs concise quoted evidence.")
     if evidence_heading is not None and not links:
         raise ValueError("The Evidence section needs an artifact link.")
     if _looks_like_transcript(body):
@@ -290,12 +386,13 @@ def _current_state(
     entity: str,
 ) -> sqlite3.Row:
     row = connection.execute(
-        """
+        f"""
         SELECT a.entity, d.*
         FROM artifacts AS a
         JOIN distillation_state AS d USING(artifact_id)
         WHERE a.artifact_id = ? AND a.entity = ?
           AND a.deleted_at IS NULL AND a.redacted_at IS NULL
+          AND {active_ancestor_predicate("a")}
         """,
         (artifact_id, entity),
     ).fetchone()

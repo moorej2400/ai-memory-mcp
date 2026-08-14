@@ -121,13 +121,14 @@ It does not replace lexical or semantic retrieval.
 
 ## Refresh architecture
 
-`memory_sync` updates SQLite after a normal Markdown change.
+`memory_sync` updates the derived indexes after canonical Markdown or artifact data changes.
 The maintenance script rebuilds the Graphify graph.
 
 ```mermaid
 flowchart TD
     Change[Canonical Markdown change] --> Sync[memory_sync]
-    Sync --> IndexStage[Build staged SQLite snapshot]
+    ArtifactChange[Canonical artifact data change] --> Sync
+    Sync --> IndexStage[Build staged derived indexes]
     Maintenance[Graphify maintenance script] --> GraphStage[Build staged Graphify data]
     GraphStage --> GraphValidate{Graph validation}
     GraphValidate -->|pass| GraphPublish[Publish Graphify graph]
@@ -196,7 +197,8 @@ For more setup information, read the [installation guide](docs/installation.md).
 | Tool | Function |
 |---|---|
 | `memory_recall` | Returns cited evidence and applicable relationships. |
-| `memory_sync` | Updates the derived index from canonical Markdown. |
+| `memory_artifact_read` | Returns ordered raw context for one artifact reference. |
+| `memory_sync` | Updates the derived indexes after canonical Markdown or artifact data changes. |
 | `memory_status` | Reports source, index, Graphify, and runtime status. |
 
 ## Repository layout

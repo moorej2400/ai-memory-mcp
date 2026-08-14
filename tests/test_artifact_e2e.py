@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from io import StringIO
+from io import BytesIO
 from pathlib import Path
 
 from ai_memory_mcp.artifacts.distillation import (
@@ -204,7 +204,7 @@ Keep this section outside the managed region.
 def test_batch_to_distilled_markdown_recall_is_idempotent(
     artifact_settings: Settings,
 ) -> None:
-    batch = read_artifact_batch(StringIO(_jsonl_batch()))
+    batch = read_artifact_batch(BytesIO(_jsonl_batch().encode()))
     receipt = ingest_artifact_batch(artifact_settings, batch)
     assert receipt.accepted == 17
     store = ArtifactStore(artifact_settings)

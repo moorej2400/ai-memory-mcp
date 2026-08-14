@@ -147,3 +147,55 @@ def store_object(
         media_type=media_type,
         relative_path=relative.as_posix(),
     )
+
+
+def quarantine_object(
+    settings: Settings,
+    sha256: str,
+    relative_path: str,
+) -> Path:
+    """Move an unreferenced object outside active content-addressed storage."""
+    if not SHA256_PATTERN.fullmatch(sha256):
+        raise ValueError("The object hash must be a lowercase SHA-256 digest.")
+    object_root = settings.artifact_objects_dir.expanduser().resolve()
+    source = (object_root / relative_path).resolve()
+    if not source.is_relative_to(object_root) or not source.is_file():
+        raise ValueError("The active object path is not available for quarantine.")
+    quarantine_dir = object_root / "quarantine" / "sha256" / sha256[:2]
+    _private_directory(quarantine_dir)
+    destination = quarantine_dir / f"{sha256}-{uuid.uuid4().hex}"
+    moved = False
+    try:
+        source.rename(destination)
+        moved = True
+        _private_file(destination)
+        _sync_directory(source.parent)
+        _sync_directory(destination.parent)
+    except BaseException:
+        # A failed permission or durability operation must not strand bytes
+        # outside the path that the current database row still identifies.
+        if moved and destination.exists() and not source.exists():
+            destination.rename(source)
+            _private_file(source)
+            _sync_directory(source.parent)
+            _sync_directory(destination.parent)
+        raise
+    return destination
+
+
+def restore_quarantined_object(
+    settings: Settings,
+    quarantine_path: Path,
+    relative_path: str,
+) -> None:
+    """Restore one quarantined object after a database rollback."""
+    object_root = settings.artifact_objects_dir.expanduser().resolve()
+    destination = (object_root / relative_path).resolve()
+    if not destination.is_relative_to(object_root):
+        raise ValueError("The active object path is outside the object directory.")
+    _private_directory(destination.parent)
+    if destination.exists():
+        return
+    quarantine_path.rename(destination)
+    _private_file(destination)
+    _sync_directory(destination.parent)

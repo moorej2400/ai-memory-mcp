@@ -89,6 +89,7 @@ def _batch(
     batch_id: str = "batch-1",
     coverage: list[CoverageClaim] | None = None,
     input_sha256: str | None = None,
+    observed_at: datetime = OBSERVED,
 ) -> ParsedArtifactBatch:
     manifest = ArtifactBatchManifest.model_validate(
         {
@@ -97,7 +98,7 @@ def _batch(
             "batch_id": batch_id,
             "source": "chat-source",
             "source_instance": "workspace",
-            "observed_at": OBSERVED,
+            "observed_at": observed_at,
             "event_count": len(events),
             "coverage": coverage or [],
         }
@@ -187,6 +188,59 @@ def test_reused_batch_id_with_different_input_is_rejected(
         artifact_store.apply_batch(changed)
 
 
+def test_reparenting_under_a_descendant_is_rejected_transactionally(
+    artifact_store: ArtifactStore,
+) -> None:
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="cycle-root",
+                    text="Root",
+                    source_updated_at="2026-01-02T10:00:00Z",
+                ),
+                _event(
+                    entity="message",
+                    external_id="cycle-child",
+                    text="Child",
+                    parent_entity="conversation",
+                    parent_external_id="cycle-root",
+                    source_updated_at="2026-01-02T10:00:00Z",
+                ),
+            ],
+            batch_id="cycle-initial",
+        )
+    )
+
+    with pytest.raises(ValueError, match="cycle"):
+        artifact_store.apply_batch(
+            _batch(
+                [
+                    _event(
+                        entity="conversation",
+                        external_id="cycle-root",
+                        text="Root correction",
+                        parent_entity="message",
+                        parent_external_id="cycle-child",
+                        source_updated_at="2026-01-02T11:00:00Z",
+                    )
+                ],
+                batch_id="cycle-correction",
+            )
+        )
+
+    root = artifact_store.get_by_external_id(
+        "chat-source",
+        "workspace",
+        "conversation",
+        "cycle-root",
+    )
+    assert root.parent_artifact_id is None
+    assert root.text_content == "Root"
+    assert artifact_store.event_count(root.artifact_id) == 1
+
+
 def test_newer_edit_creates_revision_and_updates_current(
     artifact_store: ArtifactStore,
 ) -> None:
@@ -212,6 +266,88 @@ def test_newer_edit_creates_revision_and_updates_current(
     )
     assert current.text_content == "Use the green setting."
     assert artifact_store.event_count(current.artifact_id) == 2
+
+
+def test_parent_only_message_correction_reopens_old_and_new_conversations(
+    artifact_store: ArtifactStore,
+    artifact_settings: Settings,
+) -> None:
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="parent-correction-a",
+                    text="Conversation A",
+                ),
+                _event(
+                    entity="conversation",
+                    external_id="parent-correction-b",
+                    text="Conversation B",
+                ),
+                _event(
+                    entity="message",
+                    external_id="parent-correction-message",
+                    text="Move this evidence.",
+                    parent_entity="conversation",
+                    parent_external_id="parent-correction-a",
+                    source_updated_at="2026-01-02T10:00:00Z",
+                ),
+            ],
+            batch_id="parent-correction-initial",
+        )
+    )
+    conversation_a = artifact_id(
+        "chat-source",
+        "workspace",
+        "conversation",
+        "parent-correction-a",
+    )
+    with connect_artifact_db(artifact_settings.artifact_db) as connection:
+        initial_digest = connection.execute(
+            "SELECT latest_source_digest FROM distillation_state "
+            "WHERE artifact_id = ?",
+            (conversation_a,),
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE distillation_state SET status = 'distilled' "
+            "WHERE artifact_id = ?",
+            (conversation_a,),
+        )
+
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="message",
+                    external_id="parent-correction-message",
+                    text="Move this evidence.",
+                    parent_entity="conversation",
+                    parent_external_id="parent-correction-b",
+                    source_updated_at="2026-01-02T11:00:00Z",
+                )
+            ],
+            batch_id="parent-correction-moved",
+        )
+    )
+
+    with connect_artifact_db(
+        artifact_settings.artifact_db,
+        read_only=True,
+    ) as connection:
+        states = {
+            row["external_id"]: (row["status"], row["latest_source_digest"])
+            for row in connection.execute(
+                "SELECT a.external_id, d.status, d.latest_source_digest "
+                "FROM distillation_state AS d "
+                "JOIN artifacts AS a USING(artifact_id) "
+                "WHERE a.external_id IN (?, ?)",
+                ("parent-correction-a", "parent-correction-b"),
+            )
+        }
+    assert states["parent-correction-a"][0] == "pending"
+    assert states["parent-correction-a"][1] != initial_digest
+    assert states["parent-correction-b"][0] == "pending"
 
 
 def test_older_edit_is_recorded_but_does_not_replace_current(
@@ -264,6 +400,133 @@ def test_source_sequence_has_priority_over_source_time(
         )
     )
     assert receipt.stale == 1
+
+
+def test_event_identity_ignores_lower_priority_ordering_fields(
+    artifact_store: ArtifactStore,
+) -> None:
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="event-precedence-conversation",
+                    text="Conversation",
+                ),
+                _event(
+                    entity="message",
+                    external_id="event-precedence-message",
+                    text="Stable payload",
+                    parent_entity="conversation",
+                    parent_external_id="event-precedence-conversation",
+                    source_sequence=7,
+                    source_updated_at="2026-01-02T10:00:00Z",
+                    source_version="version-a",
+                ),
+            ],
+            batch_id="event-precedence-initial",
+        )
+    )
+    current = artifact_store.get_by_external_id(
+        "chat-source",
+        "workspace",
+        "message",
+        "event-precedence-message",
+    )
+
+    receipt = artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="message",
+                    external_id="event-precedence-message",
+                    text="Stable payload",
+                    parent_entity="conversation",
+                    parent_external_id="event-precedence-conversation",
+                    source_sequence=7,
+                    source_updated_at="2026-01-03T10:00:00Z",
+                    source_version="version-b",
+                )
+            ],
+            batch_id="event-precedence-replay",
+        )
+    )
+
+    assert receipt.unchanged == 1
+    assert receipt.accepted == 0
+    assert artifact_store.event_count(current.artifact_id) == 1
+
+
+def test_provider_attachment_sequence_orders_enrichment_and_correction(
+    artifact_store: ArtifactStore,
+) -> None:
+    initial_time = int(
+        datetime.fromisoformat("2026-01-02T10:06:00+00:00").timestamp() * 1000
+    )
+    corrected_time = int(
+        datetime.fromisoformat("2026-01-02T10:07:00+00:00").timestamp() * 1000
+    )
+    root_events = [
+        _event(
+            entity="conversation",
+            external_id="conversation-attachment-sequence",
+            text="Conversation",
+        ),
+        _event(
+            entity="message",
+            external_id="message-attachment-sequence",
+            text="Message",
+            parent_entity="conversation",
+            parent_external_id="conversation-attachment-sequence",
+        ),
+    ]
+    remote = _event(
+        entity="attachment",
+        external_id="attachment-sequence",
+        text="Remote metadata",
+        parent_entity="message",
+        parent_external_id="message-attachment-sequence",
+        source_sequence=initial_time * 2,
+        source_updated_at="2026-01-02T10:06:00Z",
+    )
+    downloaded = _event(
+        entity="attachment",
+        external_id="attachment-sequence",
+        text="Downloaded object",
+        parent_entity="message",
+        parent_external_id="message-attachment-sequence",
+        source_sequence=initial_time * 2 + 1,
+        source_updated_at="2026-01-02T10:06:00Z",
+    )
+    corrected = _event(
+        entity="attachment",
+        external_id="attachment-sequence",
+        text="Corrected downloaded object",
+        parent_entity="message",
+        parent_external_id="message-attachment-sequence",
+        source_sequence=corrected_time * 2 + 1,
+        source_updated_at="2026-01-02T10:07:00Z",
+    )
+
+    assert artifact_store.apply_batch(
+        _batch([*root_events, remote], batch_id="batch-attachment-remote")
+    ).accepted == 3
+    assert artifact_store.apply_batch(
+        _batch([downloaded], batch_id="batch-attachment-downloaded")
+    ).accepted == 1
+    assert artifact_store.apply_batch(
+        _batch([corrected], batch_id="batch-attachment-corrected")
+    ).accepted == 1
+    replay = artifact_store.apply_batch(
+        _batch([corrected], batch_id="batch-attachment-corrected-replay")
+    )
+
+    assert replay.unchanged == 1
+    current = artifact_store.get_by_external_id(
+        "chat-source", "workspace", "attachment", "attachment-sequence"
+    )
+    assert current.text_content == "Corrected downloaded object"
+    assert artifact_store.event_count(current.artifact_id) == 3
 
 
 def test_artifact_times_are_stored_in_canonical_utc(
@@ -351,6 +614,128 @@ def test_delete_tombstones_and_upsert_can_restore(
     assert artifact_store.count("message") == 1
 
 
+def test_parent_delete_tombstones_active_attachment_descendants(
+    artifact_store: ArtifactStore,
+    artifact_settings: Settings,
+) -> None:
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="conversation-cascade",
+                    text="Conversation",
+                ),
+                _event(
+                    entity="message",
+                    external_id="message-cascade",
+                    text="Message",
+                    parent_entity="conversation",
+                    parent_external_id="conversation-cascade",
+                    source_updated_at="2026-01-02T10:00:00Z",
+                ),
+                _event(
+                    entity="attachment",
+                    external_id="attachment-cascade",
+                    text="Attachment searchable marker",
+                    parent_entity="message",
+                    parent_external_id="message-cascade",
+                    source_updated_at="2026-01-02T10:00:00Z",
+                ),
+            ],
+            batch_id="batch-cascade-initial",
+        )
+    )
+
+    receipt = artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="message",
+                    external_id="message-cascade",
+                    parent_entity="conversation",
+                    parent_external_id="conversation-cascade",
+                    operation="delete",
+                    source_updated_at="2026-01-02T11:00:00Z",
+                )
+            ],
+            batch_id="batch-cascade-delete",
+        )
+    )
+
+    assert receipt.tombstones == 2
+    assert artifact_store.count("message") == 0
+    assert artifact_store.count("attachment") == 0
+    with connect_artifact_db(
+        artifact_settings.artifact_db,
+        read_only=True,
+    ) as connection:
+        searchable = connection.execute(
+            "SELECT count(*) FROM artifacts_fts "
+            "WHERE artifacts_fts MATCH 'searchable'"
+        ).fetchone()[0]
+    assert searchable == 0
+
+
+def test_complete_attachment_coverage_removes_an_omitted_attachment(
+    artifact_store: ArtifactStore,
+) -> None:
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="conversation-attachment-coverage",
+                    text="Conversation",
+                ),
+                _event(
+                    entity="message",
+                    external_id="message-attachment-coverage",
+                    text="Message",
+                    parent_entity="conversation",
+                    parent_external_id="conversation-attachment-coverage",
+                ),
+                _event(
+                    entity="attachment",
+                    external_id="attachment-removed",
+                    text="Removed attachment",
+                    parent_entity="message",
+                    parent_external_id="message-attachment-coverage",
+                ),
+            ],
+            batch_id="batch-attachment-initial",
+        )
+    )
+    claim = CoverageClaim(
+        parent=ArtifactReference(
+            entity="message",
+            external_id="message-attachment-coverage",
+        ),
+        entity="attachment",
+        complete=True,
+    )
+
+    receipt = artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="message",
+                    external_id="message-attachment-coverage",
+                    text="Message without attachment",
+                    parent_entity="conversation",
+                    parent_external_id="conversation-attachment-coverage",
+                    source_updated_at="2026-01-02T11:00:00Z",
+                )
+            ],
+            batch_id="batch-attachment-removed",
+            coverage=[claim],
+        )
+    )
+
+    assert receipt.tombstones == 1
+    assert artifact_store.count("attachment") == 0
+
+
 def test_redaction_clears_current_and_prior_revision_payloads(
     artifact_store: ArtifactStore,
 ) -> None:
@@ -377,6 +762,67 @@ def test_redaction_clears_current_and_prior_revision_payloads(
     assert current.text_content == ""
     assert current.redacted_at is not None
     assert artifact_store.revision_payloads(current.artifact_id)[:-1] == [None]
+
+
+@pytest.mark.parametrize("redaction_sequence", [None, 4, 5])
+def test_explicit_redaction_overrides_missing_older_or_equal_source_ordering(
+    artifact_store: ArtifactStore,
+    artifact_settings: Settings,
+    redaction_sequence: int | None,
+) -> None:
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="redaction-order-conversation",
+                    text="Conversation",
+                ),
+                _event(
+                    entity="message",
+                    external_id="redaction-order-message",
+                    text="privacyordermarker",
+                    parent_entity="conversation",
+                    parent_external_id="redaction-order-conversation",
+                    source_sequence=5,
+                ),
+            ],
+            batch_id="redaction-order-initial",
+        )
+    )
+    receipt = artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="message",
+                    external_id="redaction-order-message",
+                    parent_entity="conversation",
+                    parent_external_id="redaction-order-conversation",
+                    operation="redact",
+                    source_sequence=redaction_sequence,
+                )
+            ],
+            batch_id=f"redaction-order-{redaction_sequence}",
+        )
+    )
+
+    current = artifact_store.get_by_external_id(
+        "chat-source",
+        "workspace",
+        "message",
+        "redaction-order-message",
+    )
+    assert receipt.redactions == 1
+    assert receipt.conflicts == 0
+    assert current.redacted_at is not None
+    with connect_artifact_db(
+        artifact_settings.artifact_db,
+        read_only=True,
+    ) as connection:
+            assert connection.execute(
+                "SELECT count(*) FROM artifacts_fts WHERE artifacts_fts MATCH ?",
+                ("privacyordermarker",),
+            ).fetchone()[0] == 0
 
 
 def test_redaction_suppresses_all_later_upsert_payloads(
@@ -535,6 +981,231 @@ def test_complete_coverage_tombstones_an_omitted_child(
     assert artifact_store.count("message") == 0
 
 
+def test_authoritative_replay_restores_a_coverage_tombstone(
+    artifact_store: ArtifactStore,
+    artifact_settings: Settings,
+) -> None:
+    original = message_batch(batch_id="batch-replay-original")
+    artifact_store.apply_batch(original)
+    message = original.events[1]
+    claim = CoverageClaim(
+        parent=ArtifactReference(
+            entity="conversation",
+            external_id="conversation-1",
+        ),
+        entity="message",
+        complete=True,
+    )
+    artifact_store.apply_batch(
+        _batch(
+            [],
+            batch_id="batch-replay-coverage",
+            coverage=[claim],
+            observed_at=datetime(2026, 1, 2, 13, 0, tzinfo=timezone.utc),
+        )
+    )
+    message_id = artifact_id(
+        "chat-source", "workspace", "message", "message-17"
+    )
+    assert artifact_store.count("message") == 0
+    assert artifact_store.event_count(message_id) == 2
+
+    restored = artifact_store.apply_batch(
+        _batch(
+            [message],
+            batch_id="batch-replay-restored",
+            observed_at=datetime(2026, 1, 2, 14, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    current = artifact_store.get_by_external_id(
+        "chat-source", "workspace", "message", "message-17"
+    )
+    with connect_artifact_db(
+        artifact_settings.artifact_db,
+        read_only=True,
+    ) as connection:
+        dispositions = connection.execute(
+            "SELECT disposition FROM artifact_batch_events WHERE batch_id = ?",
+            ("batch-replay-restored",),
+        ).fetchall()
+    assert restored.accepted == 1
+    assert current.deleted_at is None
+    assert current.text_content == "Use the blue setting."
+    assert artifact_store.event_count(message_id) == 2
+    assert [row[0] for row in dispositions] == ["accepted"]
+
+
+def test_delayed_complete_coverage_does_not_tombstone_a_newer_child(
+    artifact_store: ArtifactStore,
+    artifact_settings: Settings,
+) -> None:
+    newer_observation = datetime(2026, 1, 2, 13, 0, tzinfo=timezone.utc)
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="conversation-newer",
+                    text="Conversation",
+                ),
+                _event(
+                    entity="message",
+                    external_id="message-newer",
+                    text="Newer message",
+                    parent_entity="conversation",
+                    parent_external_id="conversation-newer",
+                ),
+            ],
+            batch_id="batch-newer",
+            observed_at=newer_observation,
+        )
+    )
+    claim = CoverageClaim(
+        parent=ArtifactReference(
+            entity="conversation",
+            external_id="conversation-newer",
+        ),
+        entity="message",
+        complete=True,
+    )
+
+    receipt = artifact_store.apply_batch(
+        _batch([], batch_id="batch-delayed-coverage", coverage=[claim])
+    )
+
+    with connect_artifact_db(
+        artifact_settings.artifact_db,
+        read_only=True,
+    ) as connection:
+        coverage_count = connection.execute(
+            "SELECT count(*) FROM artifact_coverage WHERE batch_id = ?",
+            ("batch-delayed-coverage",),
+        ).fetchone()[0]
+    assert receipt.tombstones == 0
+    assert artifact_store.count("message") == 1
+    assert coverage_count == 1
+
+
+def test_delayed_upsert_does_not_restore_a_newer_coverage_tombstone(
+    artifact_store: ArtifactStore,
+) -> None:
+    initial_observation = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    coverage_observation = datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc)
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="conversation-covered",
+                    text="Conversation",
+                ),
+                _event(
+                    entity="message",
+                    external_id="message-covered-late",
+                    text="Initial message",
+                    parent_entity="conversation",
+                    parent_external_id="conversation-covered",
+                    source_updated_at="2026-01-01T10:00:00Z",
+                ),
+            ],
+            batch_id="batch-covered-initial",
+            observed_at=initial_observation,
+        )
+    )
+    claim = CoverageClaim(
+        parent=ArtifactReference(
+            entity="conversation",
+            external_id="conversation-covered",
+        ),
+        entity="message",
+        complete=True,
+    )
+    artifact_store.apply_batch(
+        _batch(
+            [],
+            batch_id="batch-covered-delete",
+            coverage=[claim],
+            observed_at=coverage_observation,
+        )
+    )
+
+    receipt = artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="message",
+                    external_id="message-covered-late",
+                    text="Delayed edit",
+                    parent_entity="conversation",
+                    parent_external_id="conversation-covered",
+                    source_updated_at="2026-01-01T10:30:00Z",
+                )
+            ],
+            batch_id="batch-covered-delayed-edit",
+            observed_at=datetime(2026, 1, 1, 13, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    assert receipt.stale == 1
+    assert artifact_store.count("message") == 0
+
+
+def test_recurring_meetings_can_share_conversation_and_calendar_aliases(
+    artifact_store: ArtifactStore,
+    artifact_settings: Settings,
+) -> None:
+    first = _event(
+        entity="meeting",
+        external_id="conversation:series-chat:2026-01-02T09:00:00Z",
+        text="First occurrence",
+        parent_entity="conversation",
+        parent_external_id="series-chat",
+    )
+    second = _event(
+        entity="meeting",
+        external_id="conversation:series-chat:2026-01-09T09:00:00Z",
+        text="Second occurrence",
+        parent_entity="conversation",
+        parent_external_id="series-chat",
+    )
+    for meeting in (first, second):
+        assert isinstance(meeting.payload, ArtifactPayload)
+        meeting.payload.aliases = [
+            ArtifactAlias(kind="conversation-id", value="series-chat"),
+            ArtifactAlias(kind="calendar-id", value="series-calendar"),
+        ]
+
+    receipt = artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="series-chat",
+                    text="Recurring meeting chat",
+                ),
+                first,
+                second,
+            ],
+            batch_id="batch-recurring-meetings",
+        )
+    )
+
+    with connect_artifact_db(
+        artifact_settings.artifact_db,
+        read_only=True,
+    ) as connection:
+        shared_alias_counts = dict(
+            connection.execute(
+                "SELECT alias_kind, count(*) FROM artifact_aliases "
+                "WHERE alias_value IN ('series-chat', 'series-calendar') "
+                "GROUP BY alias_kind"
+            )
+        )
+    assert receipt.accepted == 3
+    assert shared_alias_counts == {"calendar-id": 2, "conversation-id": 2}
+
+
 def test_coverage_tombstone_adds_revision_evidence_and_clears_relations(
     artifact_store: ArtifactStore,
     artifact_settings: Settings,
@@ -674,6 +1345,68 @@ def test_system_message_does_not_mark_conversation_for_distillation(
         )
         is None
     )
+
+
+def test_normal_message_reclassified_as_system_reopens_distillation(
+    artifact_store: ArtifactStore,
+    artifact_settings: Settings,
+) -> None:
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="conversation-reclassified-system",
+                    text="Conversation",
+                ),
+                _event(
+                    entity="message",
+                    external_id="message-reclassified-system",
+                    text="A decision was recorded.",
+                    parent_entity="conversation",
+                    parent_external_id="conversation-reclassified-system",
+                    source_updated_at="2026-01-02T10:00:00Z",
+                ),
+            ],
+            batch_id="batch-reclassified-system-initial",
+        )
+    )
+    conversation_id = artifact_id(
+        "chat-source",
+        "workspace",
+        "conversation",
+        "conversation-reclassified-system",
+    )
+    with connect_artifact_db(artifact_settings.artifact_db) as connection:
+        connection.execute(
+            "UPDATE distillation_state SET status = 'distilled' "
+            "WHERE artifact_id = ?",
+            (conversation_id,),
+        )
+
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="message",
+                    external_id="message-reclassified-system",
+                    text="Person joined",
+                    parent_entity="conversation",
+                    parent_external_id="conversation-reclassified-system",
+                    classification="system",
+                    source_updated_at="2026-01-02T11:00:00Z",
+                )
+            ],
+            batch_id="batch-reclassified-system-correction",
+        )
+    )
+
+    assert artifact_store.distillation_status(
+        "chat-source",
+        "workspace",
+        "conversation",
+        "conversation-reclassified-system",
+    ) == "pending"
 
 
 @pytest.mark.parametrize("operation", ["delete", "redact"])
@@ -850,6 +1583,329 @@ def test_related_chat_message_reopens_meeting_and_changes_its_digest(
     assert changed["latest_source_digest"] != initial[0]
 
 
+def test_attachment_upsert_reopens_conversation_and_related_meeting(
+    artifact_store: ArtifactStore,
+    artifact_settings: Settings,
+) -> None:
+    related = [
+        {
+            "relation": "related-chat",
+            "target": {
+                "entity": "conversation",
+                "external_id": "conversation-attachment-root",
+            },
+        }
+    ]
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="conversation-attachment-root",
+                    text="Attachment chat",
+                ),
+                _event(
+                    entity="meeting",
+                    external_id="meeting-attachment-root",
+                    text="Attachment meeting",
+                    parent_entity="conversation",
+                    parent_external_id="conversation-attachment-root",
+                    links=related,
+                ),
+                _event(
+                    entity="message",
+                    external_id="message-attachment-root",
+                    text="Read the evidence.",
+                    parent_entity="conversation",
+                    parent_external_id="conversation-attachment-root",
+                ),
+            ],
+            batch_id="batch-attachment-roots",
+        )
+    )
+    root_ids = [
+        artifact_id(
+            "chat-source",
+            "workspace",
+            entity,
+            external_id,
+        )
+        for entity, external_id in (
+            ("conversation", "conversation-attachment-root"),
+            ("meeting", "meeting-attachment-root"),
+        )
+    ]
+    with connect_artifact_db(artifact_settings.artifact_db) as connection:
+        before = {
+            row["artifact_id"]: row["latest_source_digest"]
+            for row in connection.execute(
+                "SELECT artifact_id, latest_source_digest FROM distillation_state "
+                "WHERE artifact_id IN (?, ?)",
+                root_ids,
+            )
+        }
+        connection.execute(
+            "UPDATE distillation_state SET status = 'distilled' "
+            "WHERE artifact_id IN (?, ?)",
+            root_ids,
+        )
+
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="attachment",
+                    external_id="attachment-new-evidence",
+                    text="New attachment evidence",
+                    parent_entity="message",
+                    parent_external_id="message-attachment-root",
+                )
+            ],
+            batch_id="batch-attachment-upsert",
+        )
+    )
+
+    with connect_artifact_db(
+        artifact_settings.artifact_db,
+        read_only=True,
+    ) as connection:
+        after = connection.execute(
+            "SELECT artifact_id, status, latest_source_digest "
+            "FROM distillation_state WHERE artifact_id IN (?, ?)",
+            root_ids,
+        ).fetchall()
+    assert {row["status"] for row in after} == {"pending"}
+    assert all(
+        row["latest_source_digest"] != before[row["artifact_id"]]
+        for row in after
+    )
+
+
+def test_attachment_coverage_removal_reopens_distillation_roots(
+    artifact_store: ArtifactStore,
+    artifact_settings: Settings,
+) -> None:
+    related = [
+        {
+            "relation": "related-chat",
+            "target": {
+                "entity": "conversation",
+                "external_id": "conversation-attachment-remove",
+            },
+        }
+    ]
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="conversation-attachment-remove",
+                    text="Attachment removal chat",
+                ),
+                _event(
+                    entity="meeting",
+                    external_id="meeting-attachment-remove",
+                    text="Attachment removal meeting",
+                    parent_entity="conversation",
+                    parent_external_id="conversation-attachment-remove",
+                    links=related,
+                ),
+                _event(
+                    entity="message",
+                    external_id="message-attachment-remove",
+                    text="Read the attached evidence.",
+                    parent_entity="conversation",
+                    parent_external_id="conversation-attachment-remove",
+                ),
+                _event(
+                    entity="attachment",
+                    external_id="attachment-old-evidence",
+                    text="Old attachment evidence",
+                    parent_entity="message",
+                    parent_external_id="message-attachment-remove",
+                ),
+            ],
+            batch_id="batch-attachment-remove-initial",
+        )
+    )
+    root_ids = [
+        artifact_id("chat-source", "workspace", entity, external_id)
+        for entity, external_id in (
+            ("conversation", "conversation-attachment-remove"),
+            ("meeting", "meeting-attachment-remove"),
+        )
+    ]
+    with connect_artifact_db(artifact_settings.artifact_db) as connection:
+        before = {
+            row["artifact_id"]: row["latest_source_digest"]
+            for row in connection.execute(
+                "SELECT artifact_id, latest_source_digest FROM distillation_state "
+                "WHERE artifact_id IN (?, ?)",
+                root_ids,
+            )
+        }
+        connection.execute(
+            "UPDATE distillation_state SET status = 'distilled' "
+            "WHERE artifact_id IN (?, ?)",
+            root_ids,
+        )
+    claim = CoverageClaim(
+        parent=ArtifactReference(
+            entity="message",
+            external_id="message-attachment-remove",
+        ),
+        entity="attachment",
+        complete=True,
+    )
+
+    artifact_store.apply_batch(
+        _batch(
+            [],
+            batch_id="batch-attachment-remove-coverage",
+            coverage=[claim],
+        )
+    )
+
+    with connect_artifact_db(
+        artifact_settings.artifact_db,
+        read_only=True,
+    ) as connection:
+        after = connection.execute(
+            "SELECT artifact_id, status, latest_source_digest "
+            "FROM distillation_state WHERE artifact_id IN (?, ?)",
+            root_ids,
+        ).fetchall()
+    assert {row["status"] for row in after} == {"pending"}
+    assert all(
+        row["latest_source_digest"] != before[row["artifact_id"]]
+        for row in after
+    )
+
+
+def test_meeting_owned_attachment_reopens_meeting_distillation(
+    artifact_store: ArtifactStore,
+    artifact_settings: Settings,
+) -> None:
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="conversation-direct-attachment",
+                    text="Conversation",
+                ),
+                _event(
+                    entity="meeting",
+                    external_id="meeting-direct-attachment",
+                    text="Meeting",
+                    parent_entity="conversation",
+                    parent_external_id="conversation-direct-attachment",
+                ),
+                _event(
+                    entity="message",
+                    external_id="conversation-direct-message",
+                    text="Conversation evidence",
+                    parent_entity="conversation",
+                    parent_external_id="conversation-direct-attachment",
+                ),
+            ],
+            batch_id="batch-meeting-attachment-root",
+        )
+    )
+    meeting_id = artifact_id(
+        "chat-source",
+        "workspace",
+        "meeting",
+        "meeting-direct-attachment",
+    )
+    conversation_id = artifact_id(
+        "chat-source",
+        "workspace",
+        "conversation",
+        "conversation-direct-attachment",
+    )
+    with connect_artifact_db(artifact_settings.artifact_db) as connection:
+        initial = connection.execute(
+            "SELECT latest_source_digest FROM distillation_state "
+            "WHERE artifact_id = ?",
+            (meeting_id,),
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE distillation_state SET status = 'distilled' "
+            "WHERE artifact_id IN (?, ?)",
+            (meeting_id, conversation_id),
+        )
+
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="attachment",
+                    external_id="meeting-direct-evidence",
+                    text="Meeting attachment evidence",
+                    parent_entity="meeting",
+                    parent_external_id="meeting-direct-attachment",
+                )
+            ],
+            batch_id="batch-meeting-attachment-added",
+        )
+    )
+
+    with connect_artifact_db(
+        artifact_settings.artifact_db,
+        read_only=True,
+    ) as connection:
+        changed = connection.execute(
+            "SELECT status, latest_source_digest FROM distillation_state "
+            "WHERE artifact_id = ?",
+            (meeting_id,),
+        ).fetchone()
+        conversation_status = connection.execute(
+            "SELECT status FROM distillation_state WHERE artifact_id = ?",
+            (conversation_id,),
+        ).fetchone()[0]
+    assert changed["status"] == "pending"
+    assert changed["latest_source_digest"] != initial
+    assert conversation_status == "distilled"
+
+    with connect_artifact_db(artifact_settings.artifact_db) as connection:
+        connection.execute(
+            "UPDATE distillation_state SET status = 'distilled' "
+            "WHERE artifact_id = ?",
+            (meeting_id,),
+        )
+    artifact_store.apply_batch(
+        _batch(
+            [],
+            batch_id="batch-meeting-attachment-coverage",
+            coverage=[
+                CoverageClaim(
+                    parent=ArtifactReference(
+                        entity="meeting",
+                        external_id="meeting-direct-attachment",
+                    ),
+                    entity="attachment",
+                    complete=True,
+                )
+            ],
+        )
+    )
+    with connect_artifact_db(
+        artifact_settings.artifact_db,
+        read_only=True,
+    ) as connection:
+        statuses = {
+            row["artifact_id"]: row["status"]
+            for row in connection.execute(
+                "SELECT artifact_id, status FROM distillation_state "
+                "WHERE artifact_id IN (?, ?)",
+                (meeting_id, conversation_id),
+            )
+        }
+    assert statuses[meeting_id] == "pending"
+    assert statuses[conversation_id] == "distilled"
+
+
 def test_meeting_digest_excludes_sibling_meeting_descendants(
     artifact_store: ArtifactStore,
     artifact_settings: Settings,
@@ -986,11 +2042,25 @@ def _message_record(source_payload: dict[str, object] | None = None) -> dict[str
 
 def test_jsonl_parser_hashes_the_exact_input() -> None:
     raw = _jsonl(_manifest(), _message_record())
-    parsed = read_artifact_batch(io.StringIO(raw))
+    parsed = read_artifact_batch(io.BytesIO(raw.encode()))
     from hashlib import sha256
 
     assert parsed.input_sha256 == sha256(raw.encode()).hexdigest()
     assert len(parsed.events) == 1
+
+
+def test_jsonl_parser_distinguishes_crlf_from_lf_input() -> None:
+    from hashlib import sha256
+
+    lf = _jsonl(_manifest(), _message_record()).encode()
+    crlf = lf.replace(b"\n", b"\r\n")
+
+    lf_batch = read_artifact_batch(io.BytesIO(lf))
+    crlf_batch = read_artifact_batch(io.BytesIO(crlf))
+
+    assert lf_batch.input_sha256 == sha256(lf).hexdigest()
+    assert crlf_batch.input_sha256 == sha256(crlf).hexdigest()
+    assert lf_batch.input_sha256 != crlf_batch.input_sha256
 
 
 @pytest.mark.parametrize(
@@ -1004,13 +2074,28 @@ def test_jsonl_parser_hashes_the_exact_input() -> None:
 )
 def test_jsonl_parser_rejects_invalid_streams(raw: str, match: str) -> None:
     with pytest.raises((ValueError, ValidationError), match=match):
-        read_artifact_batch(io.StringIO(raw))
+        read_artifact_batch(io.BytesIO(raw.encode()))
 
 
 def test_jsonl_parser_rejects_oversized_input() -> None:
     raw = _jsonl(_manifest(), _message_record())
+
+    class BoundedStream(io.BytesIO):
+        requested_sizes: list[int]
+
+        def __init__(self, value: bytes) -> None:
+            super().__init__(value)
+            self.requested_sizes = []
+
+        def read(self, size: int = -1) -> bytes:
+            self.requested_sizes.append(size)
+            return super().read(size)
+
+    stream = BoundedStream(raw.encode())
     with pytest.raises(ValueError, match="size"):
-        read_artifact_batch(io.StringIO(raw), max_bytes=10)
+        read_artifact_batch(stream, max_bytes=10)
+    assert stream.requested_sizes == [11]
+    assert stream.tell() == 11
 
 
 @pytest.mark.parametrize(
@@ -1024,4 +2109,4 @@ def test_jsonl_parser_rejects_oversized_input() -> None:
 def test_jsonl_parser_rejects_secret_material(payload: dict[str, object]) -> None:
     raw = _jsonl(_manifest(), _message_record(payload))
     with pytest.raises(ValueError, match="secret|authentication"):
-        read_artifact_batch(io.StringIO(raw))
+        read_artifact_batch(io.BytesIO(raw.encode()))

@@ -15,7 +15,7 @@ from .models import (
     ArtifactIntegrityResult,
     ArtifactRestoreResult,
 )
-from .schema import connect_artifact_db
+from .schema import connect_artifact_db, require_local_database_path
 
 HASH_CHUNK_BYTES = 1024 * 1024
 
@@ -80,7 +80,8 @@ def _sha256_file(path: Path) -> str:
 
 
 def _read_only(path: Path) -> sqlite3.Connection:
-    uri = f"file:{quote(path.resolve().as_posix(), safe='/')}?mode=ro"
+    path = require_local_database_path(path)
+    uri = f"file:{quote(path.as_posix(), safe='/')}?mode=ro"
     connection = sqlite3.connect(uri, uri=True, timeout=10.0)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -130,13 +131,16 @@ def backup_artifact_db(settings: Settings) -> ArtifactBackupResult:
     """Create and verify one transactionally consistent SQLite backup."""
     if not settings.artifact_db.is_file():
         raise FileNotFoundError("Artifact database is not available.")
-    backup_dir = settings.artifact_backup_dir.expanduser()
-    _private_directory(backup_dir)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    destination = backup_dir / f"artifacts-{stamp}.sqlite3"
+    destination = require_local_database_path(
+        settings.artifact_backup_dir / f"artifacts-{stamp}.sqlite3"
+    )
+    backup_dir = destination.parent
+    _private_directory(backup_dir)
     temporary = backup_dir / (
         f".{destination.name}.partial-{os.getpid()}-{time.time_ns()}"
     )
+    require_local_database_path(temporary)
     try:
         with (
             connect_artifact_db(
@@ -175,7 +179,8 @@ def restore_artifact_db(
 ) -> ArtifactRestoreResult:
     """Restore a verified backup to a new operator-selected database path."""
     source = source_backup.expanduser().resolve(strict=True)
-    target = destination.expanduser()
+    source = require_local_database_path(source)
+    target = require_local_database_path(destination)
     if not source.is_file():
         raise ValueError("The artifact backup must be a regular file.")
     if target.exists():
@@ -188,6 +193,7 @@ def restore_artifact_db(
     temporary = target.parent / (
         f".{target.name}.partial-{os.getpid()}-{time.time_ns()}"
     )
+    require_local_database_path(temporary)
     try:
         with _read_only(source) as backup, sqlite3.connect(temporary) as restored:
             backup.backup(restored)

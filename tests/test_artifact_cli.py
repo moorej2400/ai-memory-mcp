@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -101,7 +103,7 @@ def test_ingest_status_search_and_read_write_json_objects(
     assert main(["status"]) == 0
     status = _one_json(capsys)
     assert status["available"] is True
-    assert status["schema_version"] == 2
+    assert status["schema_version"] == 3
     assert status["artifacts"] == 2
     assert status["active_artifacts"] == 2
     assert status["batches"] == 1
@@ -125,6 +127,58 @@ def test_ingest_status_search_and_read_write_json_objects(
     read = _one_json(capsys)
     assert read["focus"] == reference
     assert read["records"][0]["text"].startswith("Use the documented")
+
+
+def test_status_reports_a_missing_database_without_creating_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    database = tmp_path / "artifacts.sqlite3"
+
+    assert main(["status"]) == 0
+
+    status = _one_json(capsys)
+    assert status["available"] is False
+    assert status["integrity"] == "missing"
+    assert status["schema_version"] == 0
+    assert database.exists() is False
+
+
+def test_status_reports_an_old_schema_without_changing_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    database = tmp_path / "artifacts.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE artifact_schema_migrations("
+            "version INTEGER PRIMARY KEY, applied_at TEXT, "
+            "application_version TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO artifact_schema_migrations VALUES (1, ?, ?)",
+            ("2026-01-01T00:00:00Z", "0.1.0"),
+        )
+    before = database.read_bytes()
+    before_digest = sha256(before).hexdigest()
+
+    assert main(["status"]) == 0
+
+    status = _one_json(capsys)
+    assert status["available"] is False
+    assert status["schema_version"] == 1
+    assert "not current" in str(status["error"])
+    after = database.read_bytes()
+    assert after == before
+    assert sha256(after).hexdigest() == before_digest
+    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+        assert connection.execute(
+            "SELECT MAX(version) FROM artifact_schema_migrations"
+        ).fetchone()[0] == 1
 
 
 def test_validation_error_uses_stderr_and_exit_code_two(

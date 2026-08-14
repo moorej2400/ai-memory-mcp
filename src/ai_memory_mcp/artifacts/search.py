@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from typing import Literal
@@ -15,7 +16,11 @@ from .identity import (
     canonical_json,
     parse_artifact_uri,
 )
-from .context import MEETING_CONTEXT_SQL
+from .context import (
+    CONVERSATION_CONTEXT_SQL,
+    MEETING_CONTEXT_SQL,
+    active_ancestor_predicate,
+)
 from .models import (
     ArtifactReadRecord,
     ArtifactReadResponse,
@@ -25,6 +30,8 @@ from .models import (
 from .schema import connect_artifact_db, require_current_artifact_schema
 
 ReadDirection = Literal["around", "before", "after"]
+MAX_SEARCH_HIT_TEXT = 5000
+QUOTED_PHRASE_RE = re.compile(r'"([^"\r\n]{1,2000})"')
 
 
 def _parent_id(reference: str) -> str:
@@ -33,6 +40,25 @@ def _parent_id(reference: str) -> str:
     if not ARTIFACT_ID_PATTERN.fullmatch(reference):
         raise ValueError("The artifact parent reference has an invalid format.")
     return reference
+
+
+def _bounded_search_text(text: str, query: str | None) -> str:
+    if len(text) <= MAX_SEARCH_HIT_TEXT:
+        return text
+    if query:
+        for quoted in QUOTED_PHRASE_RE.finditer(query):
+            phrase = quoted.group(1).strip()
+            if not phrase:
+                continue
+            match = re.search(re.escape(phrase), text, re.IGNORECASE)
+            if match is None:
+                continue
+            available = MAX_SEARCH_HIT_TEXT - (match.end() - match.start())
+            start = max(0, match.start() - (available // 2))
+            end = min(len(text), start + MAX_SEARCH_HIT_TEXT)
+            start = max(0, end - MAX_SEARCH_HIT_TEXT)
+            return text[start:end]
+    return text[:MAX_SEARCH_HIT_TEXT]
 
 
 def _cursor_encode(row: sqlite3.Row) -> str:
@@ -102,6 +128,7 @@ class ArtifactSearch:
             "artifacts_fts MATCH ?",
             "a.deleted_at IS NULL",
             "a.redacted_at IS NULL",
+            active_ancestor_predicate("a"),
         ]
         parameters: list[object] = [fts_expression(query)]
         if selected_scope.source is not None:
@@ -142,7 +169,7 @@ class ArtifactSearch:
                 """,
                 parameters,
             ).fetchall()
-        return [self._search_hit(row) for row in rows]
+        return [self._search_hit(row, query=query) for row in rows]
 
     def get(
         self,
@@ -157,6 +184,7 @@ class ArtifactSearch:
             "entity = ?",
             "deleted_at IS NULL",
             "redacted_at IS NULL",
+            active_ancestor_predicate("artifacts"),
         ]
         parameters: list[object] = [artifact_value, entity]
         if selected_scope.source is not None:
@@ -197,6 +225,7 @@ class ArtifactSearch:
         row: sqlite3.Row,
         *,
         score: float | None = None,
+        query: str | None = None,
     ) -> ArtifactSearchHit:
         if score is None:
             relevance = max(0.0, -float(row["lexical_score"]))
@@ -212,7 +241,7 @@ class ArtifactSearch:
             source_instance=str(row["source_instance"]),
             external_id=str(row["external_id"]),
             title=str(row["title"]),
-            text=str(row["text_content"])[:5000],
+            text=_bounded_search_text(str(row["text_content"]), query),
             author_name=str(row["author_name"]),
             occurred_at=row["occurred_at"],
             score=score,
@@ -239,10 +268,11 @@ class ArtifactSearch:
             read_only=True,
         ) as connection:
             focus = connection.execute(
-                """
+                f"""
                 SELECT * FROM artifacts
                 WHERE artifact_id = ? AND entity = ?
                   AND deleted_at IS NULL AND redacted_at IS NULL
+                  AND {active_ancestor_predicate("artifacts")}
                 """,
                 (artifact_value, entity),
             ).fetchone()
@@ -280,8 +310,7 @@ class ArtifactSearch:
         active = "a.deleted_at IS NULL AND a.redacted_at IS NULL"
         if entity == "conversation":
             return (
-                f"SELECT a.* FROM artifacts AS a WHERE {active} "
-                "AND a.parent_artifact_id = ? AND a.entity = 'message'",
+                CONVERSATION_CONTEXT_SQL,
                 [focus["artifact_id"]],
                 False,
             )

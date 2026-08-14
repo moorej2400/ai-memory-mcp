@@ -22,6 +22,7 @@ A meeting note contains a summary, decisions, actions, open questions, and short
 A conversation note contains durable resolutions, decisions, and reusable context.
 
 A distilled note links each important claim to an `artifact://` citation.
+`artifact://<entity>/<artifact-id>` is the stable raw citation format.
 A distilled note does not contain a complete transcript or chat log.
 
 Each managed note contains one distillation region.
@@ -54,6 +55,11 @@ Each object uses the path `sha256/<digest-prefix>/<digest>`.
 The intake process verifies the complete SHA-256 digest before publication.
 The intake process copies the file and does not change the provider source file.
 SQLite never stores the local provider source path.
+
+A redaction removes unshared object bytes from active content-addressed storage.
+The system moves those bytes to a private quarantine because automatic file deletion is not permitted.
+The system preserves an object while another active artifact still references it.
+Later events for a redacted artifact do not read or copy provider handoff files.
 
 ## Recovery
 

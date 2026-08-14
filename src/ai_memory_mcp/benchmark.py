@@ -57,18 +57,25 @@ def _percentile(values: list[float], fraction: float) -> float:
     return ordered[max(index, 0)]
 
 
-def run_benchmark(label: str) -> dict[str, Any]:
-    root = _benchmark_root()
-    lock = verify_contract(root)
-    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    state_dir = root / "runs" / f"state-{run_stamp}"
-    settings = Settings(
+def _benchmark_settings(root: Path, state_dir: Path) -> Settings:
+    return Settings(
         memory_root=root / "fixtures" / "vault",
         state_dir=state_dir,
         graph_path=root / "fixtures" / "graph.json",
         graphify_mcp_url="",
         embedding_provider="hashed",
+        artifact_db=state_dir / "artifacts.sqlite3",
+        artifact_objects_dir=state_dir / "artifact-objects",
+        artifact_backup_dir=state_dir / "artifact-backups",
     )
+
+
+def run_benchmark(label: str) -> dict[str, Any]:
+    root = _benchmark_root()
+    lock = verify_contract(root)
+    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    state_dir = root / "runs" / f"state-{run_stamp}"
+    settings = _benchmark_settings(root, state_dir)
     index_result = build_index(settings, force=True)
     service = MemoryService(settings)
     cases = json.loads((root / "cases.json").read_text(encoding="utf-8"))["cases"]

@@ -5,6 +5,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal
 
 from ai_memory_mcp.config import Settings
@@ -15,6 +16,7 @@ from .models import (
     ArtifactEvent,
     ArtifactIngestReceipt,
     ArtifactPayload,
+    ArtifactReference,
     ParsedArtifactBatch,
     RedactionPayload,
     StoredObject,
@@ -107,7 +109,8 @@ class ArtifactStore:
         replayed = self._replayed_batch_receipt(batch)
         if replayed is not None:
             return replayed
-        batch, prepared_objects = self._prepare_objects(batch)
+        redacted_artifacts = self._redacted_artifact_ids(batch)
+        batch, prepared_objects = self._prepare_objects(batch, redacted_artifacts)
         manifest = batch.manifest
         counters = {
             "accepted": 0,
@@ -120,6 +123,8 @@ class ArtifactStore:
         changed = 0
         pending_links: list[tuple[str, ArtifactPayload]] = []
         distillation_roots: dict[str, str] = {}
+        redacted_object_hashes: set[str] = set()
+        quarantined_objects: list[tuple[Path, str]] = []
 
         with connect_artifact_db(self.settings.artifact_db) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -157,6 +162,18 @@ class ArtifactStore:
 
                 event_artifacts: list[tuple[ArtifactEvent, str, str]] = []
                 for ordinal, event in enumerate(batch.events):
+                    if event.operation == "redact":
+                        redacted_object_hashes.update(
+                            self._artifact_object_hashes(
+                                connection,
+                                artifact_id(
+                                    manifest.source,
+                                    manifest.source_instance,
+                                    event.entity,
+                                    event.external_id,
+                                ),
+                            )
+                        )
                     result = self._apply_event(
                         connection,
                         batch,
@@ -169,22 +186,36 @@ class ArtifactStore:
                         artifact_value,
                         material_changed,
                         distillation_relevant,
+                        prior_parent_value,
                     ) = result
+                    prepared = prepared_objects.get(ordinal)
+                    if prepared is not None:
+                        # Revision payloads identify their object digest. Keep
+                        # matching metadata for stale and conflict evidence too.
+                        self._record_object(connection, prepared[0])
                     if disposition == "accepted":
                         counters["accepted"] += 1
-                        connection.execute(
-                            "DELETE FROM artifact_object_links "
-                            "WHERE artifact_id = ?",
-                            (artifact_value,),
-                        )
-                        prepared = prepared_objects.get(ordinal)
-                        if prepared is not None:
-                            self._link_object(
-                                connection,
-                                artifact_value,
-                                prepared[0],
-                                prepared[1],
+                        # A later redaction in this transaction owns final
+                        # object cleanup. Do not require its skipped handoff.
+                        if artifact_value not in redacted_artifacts:
+                            connection.execute(
+                                "DELETE FROM artifact_object_links "
+                                "WHERE artifact_id = ?",
+                                (artifact_value,),
                             )
+                            if prepared is not None:
+                                self._link_object(
+                                    connection,
+                                    artifact_value,
+                                    prepared[0].sha256,
+                                    prepared[1],
+                                )
+                            elif isinstance(event.payload, ArtifactPayload):
+                                self._link_recorded_object(
+                                    connection,
+                                    artifact_value,
+                                    event.payload,
+                                )
                     elif disposition == "unchanged":
                         counters["unchanged"] += 1
                     elif disposition == "stale":
@@ -195,13 +226,30 @@ class ArtifactStore:
                         counters["tombstones"] += 1
                     elif disposition == "redacted":
                         counters["redactions"] += 1
+                        if prepared is not None:
+                            redacted_object_hashes.add(prepared[0].sha256)
                     if material_changed:
                         changed += 1
+                    if disposition == "tombstone" and material_changed:
+                        changed += self._tombstone_descendants(
+                            connection,
+                            batch,
+                            artifact_value,
+                            event_value,
+                            counters,
+                        )
                     if material_changed and distillation_relevant:
                         self._remember_distillation_root(
                             connection,
                             event,
                             artifact_value,
+                            event_value,
+                            distillation_roots,
+                        )
+                        self._remember_prior_parent_root(
+                            connection,
+                            event.entity,
+                            prior_parent_value,
                             event_value,
                             distillation_roots,
                         )
@@ -223,6 +271,10 @@ class ArtifactStore:
                 self._update_distillation_state(
                     connection,
                     distillation_roots,
+                )
+                quarantined_objects = self._quarantine_unreferenced_objects(
+                    connection,
+                    redacted_object_hashes,
                 )
                 if changed:
                     connection.execute(
@@ -256,9 +308,14 @@ class ArtifactStore:
                 )
             except BaseException:
                 connection.rollback()
+                self._restore_quarantined_objects(quarantined_objects)
                 raise
             else:
-                connection.commit()
+                try:
+                    connection.commit()
+                except BaseException:
+                    self._restore_quarantined_objects(quarantined_objects)
+                    raise
 
         return ArtifactIngestReceipt(
             batch_id=manifest.batch_id,
@@ -286,15 +343,64 @@ class ArtifactStore:
             raise ValueError("The artifact batch ID already has different input.")
         return self._receipt_from_batch(prior)
 
+    def _redacted_artifact_ids(self, batch: ParsedArtifactBatch) -> set[str]:
+        manifest = batch.manifest
+        values = {
+            artifact_id(
+                manifest.source,
+                manifest.source_instance,
+                event.entity,
+                event.external_id,
+            )
+            for event in batch.events
+        }
+        redacted: set[str] = set()
+        if values:
+            placeholders = ",".join("?" for _ in values)
+            with connect_artifact_db(
+                self.settings.artifact_db,
+                read_only=True,
+            ) as connection:
+                redacted.update(
+                    str(row[0])
+                    for row in connection.execute(
+                        f"SELECT artifact_id FROM artifacts "
+                        f"WHERE redacted_at IS NOT NULL "
+                        f"AND artifact_id IN ({placeholders})",
+                        tuple(values),
+                    )
+                )
+        # A redaction earlier in one batch must block later handoff reads for
+        # the same artifact before the database transaction starts.
+        for event in batch.events:
+            value = artifact_id(
+                manifest.source,
+                manifest.source_instance,
+                event.entity,
+                event.external_id,
+            )
+            if event.operation == "redact":
+                redacted.add(value)
+        return redacted
+
     def _prepare_objects(
         self,
         batch: ParsedArtifactBatch,
+        redacted_artifacts: set[str],
     ) -> tuple[ParsedArtifactBatch, dict[int, tuple[StoredObject, str]]]:
         from .objects import store_object
 
         prepared_batch = batch.model_copy(deep=True)
         prepared: dict[int, tuple[StoredObject, str]] = {}
         for ordinal, event in enumerate(prepared_batch.events):
+            value = artifact_id(
+                batch.manifest.source,
+                batch.manifest.source_instance,
+                event.entity,
+                event.external_id,
+            )
+            if value in redacted_artifacts:
+                continue
             payload = event.payload
             if not isinstance(payload, ArtifactPayload) or payload.object is None:
                 continue
@@ -322,12 +428,130 @@ class ArtifactStore:
             prepared[ordinal] = (stored, original_name)
         return prepared_batch, prepared
 
+    def _quarantine_unreferenced_objects(
+        self,
+        connection: sqlite3.Connection,
+        hashes: set[str],
+    ) -> list[tuple[Path, str]]:
+        from .objects import quarantine_object
+
+        moved: list[tuple[Path, str]] = []
+        try:
+            for digest in sorted(hashes):
+                referenced = connection.execute(
+                    "SELECT 1 FROM artifact_object_links WHERE sha256 = ? LIMIT 1",
+                    (digest,),
+                ).fetchone()
+                if referenced is not None or self._object_has_retained_revision(
+                    connection,
+                    digest,
+                ):
+                    continue
+                row = connection.execute(
+                    "SELECT relative_path FROM artifact_objects WHERE sha256 = ?",
+                    (digest,),
+                ).fetchone()
+                relative_path = (
+                    str(row["relative_path"])
+                    if row is not None
+                    else f"sha256/{digest[:2]}/{digest}"
+                )
+                active_path = self.settings.artifact_objects_dir / relative_path
+                if active_path.is_file():
+                    quarantine_path = quarantine_object(
+                        self.settings,
+                        digest,
+                        relative_path,
+                    )
+                    # Track the move before the SQL write so either failure path
+                    # can restore the filesystem to the active database state.
+                    moved.append((quarantine_path, relative_path))
+                connection.execute(
+                    "DELETE FROM artifact_objects WHERE sha256 = ?",
+                    (digest,),
+                )
+        except BaseException:
+            self._restore_quarantined_objects(moved)
+            raise
+        return moved
+
     @staticmethod
-    def _link_object(
+    def _artifact_object_hashes(
         connection: sqlite3.Connection,
         artifact_value: str,
+    ) -> set[str]:
+        """Return current and revision object hashes before redaction scrubs them."""
+        hashes = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT sha256 FROM artifact_object_links WHERE artifact_id = ?",
+                (artifact_value,),
+            )
+        }
+        for row in connection.execute(
+            "SELECT payload_json FROM artifact_events "
+            "WHERE artifact_id = ? AND payload_json IS NOT NULL",
+            (artifact_value,),
+        ):
+            digest = ArtifactStore._payload_object_hash(row[0])
+            if digest is not None:
+                hashes.add(digest)
+        return hashes
+
+    @staticmethod
+    def _object_has_retained_revision(
+        connection: sqlite3.Connection,
+        digest: str,
+    ) -> bool:
+        # A non-redacted artifact can still cite an older object revision after
+        # another artifact removes its current link to the same digest.
+        for row in connection.execute(
+            "SELECT event.payload_json FROM artifact_events AS event "
+            "JOIN artifacts AS artifact USING(artifact_id) "
+            "WHERE artifact.redacted_at IS NULL "
+            "AND event.payload_json IS NOT NULL"
+        ):
+            if ArtifactStore._payload_object_hash(row[0]) == digest:
+                return True
+        return False
+
+    @staticmethod
+    def _payload_object_hash(payload_json: object) -> str | None:
+        try:
+            payload = json.loads(str(payload_json))
+        except (TypeError, ValueError):
+            return None
+        object_payload = payload.get("object") if isinstance(payload, dict) else None
+        digest = (
+            object_payload.get("expected_sha256")
+            if isinstance(object_payload, dict)
+            else None
+        )
+        if (
+            isinstance(digest, str)
+            and len(digest) == 64
+            and all(character in "0123456789abcdef" for character in digest)
+        ):
+            return digest
+        return None
+
+    def _restore_quarantined_objects(
+        self,
+        moved: list[tuple[Path, str]],
+    ) -> None:
+        from .objects import restore_quarantined_object
+
+        for quarantine_path, relative_path in reversed(moved):
+            restore_quarantined_object(
+                self.settings,
+                quarantine_path,
+                relative_path,
+            )
+
+    @staticmethod
+    def _record_object(
+        connection: sqlite3.Connection,
         stored: StoredObject,
-        original_name: str,
     ) -> None:
         verified_at = _utc_now()
         connection.execute(
@@ -351,13 +575,54 @@ class ArtifactStore:
                 verified_at,
             ),
         )
+
+    @staticmethod
+    def _link_object(
+        connection: sqlite3.Connection,
+        artifact_value: str,
+        digest: str,
+        original_name: str,
+    ) -> None:
         connection.execute(
             """
             INSERT INTO artifact_object_links(
                 artifact_id, sha256, relation, original_name
             ) VALUES (?, ?, 'content', ?)
             """,
-            (artifact_value, stored.sha256, original_name),
+            (artifact_value, digest, original_name),
+        )
+
+    def _link_recorded_object(
+        self,
+        connection: sqlite3.Connection,
+        artifact_value: str,
+        payload: ArtifactPayload,
+    ) -> None:
+        """Re-link an accepted metadata-only snapshot to verified stored bytes."""
+        from .objects import verify_object
+
+        object_input = payload.object
+        digest = object_input.expected_sha256 if object_input is not None else None
+        if digest is None:
+            return
+        row = connection.execute(
+            "SELECT byte_count FROM artifact_objects WHERE sha256 = ?",
+            (digest,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("The accepted object hash is not in object storage.")
+        verification = verify_object(self.settings, digest)
+        if not verification.ok or verification.byte_count != int(row["byte_count"]):
+            raise ValueError("The accepted object hash failed stored-object verification.")
+        connection.execute(
+            "UPDATE artifact_objects SET last_verified_at = ? WHERE sha256 = ?",
+            (_utc_now(), digest),
+        )
+        self._link_object(
+            connection,
+            artifact_value,
+            digest,
+            object_input.original_name or "",
         )
 
     def _apply_event(
@@ -379,6 +644,7 @@ class ArtifactStore:
         str,
         bool,
         bool,
+        str | None,
     ]:
         manifest = batch.manifest
         artifact_value = artifact_id(
@@ -406,10 +672,105 @@ class ArtifactStore:
             },
         )
         existing_event = connection.execute(
-            "SELECT artifact_id FROM artifact_events WHERE event_id = ?",
+            "SELECT artifact_id, payload_json FROM artifact_events WHERE event_id = ?",
             (event_value,),
         ).fetchone()
         if existing_event is not None:
+            current = connection.execute(
+                "SELECT * FROM artifacts WHERE artifact_id = ?",
+                (artifact_value,),
+            ).fetchone()
+            can_restore_coverage = bool(
+                current is not None
+                and current["deleted_at"] is not None
+                and current["redacted_at"] is None
+                and event.operation == "upsert"
+                and isinstance(event.payload, ArtifactPayload)
+                and existing_event["payload_json"] is not None
+                and _parse_time(str(_iso(manifest.observed_at)))
+                > _parse_time(str(current["deleted_at"]))
+            )
+            if can_restore_coverage:
+                last_event = connection.execute(
+                    "SELECT source_version FROM artifact_events WHERE event_id = ?",
+                    (current["last_event_id"],),
+                ).fetchone()
+                can_restore_coverage = bool(
+                    last_event is not None
+                    and str(last_event["source_version"] or "").startswith(
+                        ("coverage:", "cascade:")
+                    )
+                )
+            if can_restore_coverage:
+                prior_parent_value = (
+                    str(current["parent_artifact_id"])
+                    if current["parent_artifact_id"] is not None
+                    else None
+                )
+                prior_root_parent_value = (
+                    prior_parent_value
+                    if prior_parent_value is not None
+                    and prior_parent_value != parent_value
+                    else None
+                )
+                fields = _payload_fields(event.payload)
+                observed_at = _iso(manifest.observed_at)
+                # Reuse the existing raw revision. The new batch only restores
+                # current materialized state after a later authoritative sighting.
+                connection.execute(
+                    """
+                    UPDATE artifacts
+                    SET parent_artifact_id = ?, title = ?, author_id = ?,
+                        author_name = ?, author_id_confidence = ?,
+                        occurred_at = ?, source_updated_at = ?,
+                        source_version = ?, source_sequence = ?,
+                        text_content = ?, content_format = ?, payload_json = ?,
+                        payload_sha256 = ?, last_observed_at = ?,
+                        last_event_id = ?, deleted_at = NULL
+                    WHERE artifact_id = ?
+                    """,
+                    (
+                        parent_value,
+                        fields["title"],
+                        fields["author_id"],
+                        fields["author_name"],
+                        fields["author_id_confidence"],
+                        fields["occurred_at"],
+                        _iso(event.source_updated_at),
+                        event.source_version,
+                        event.source_sequence,
+                        fields["text_content"],
+                        fields["content_format"],
+                        payload_json,
+                        payload_sha256,
+                        observed_at,
+                        event_value,
+                        artifact_value,
+                    ),
+                )
+                self._replace_aliases(
+                    connection,
+                    manifest.source,
+                    manifest.source_instance,
+                    artifact_value,
+                    event.payload,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO artifact_batch_events(
+                        batch_id, ordinal, event_id, disposition
+                    ) VALUES (?, ?, ?, 'accepted')
+                    """,
+                    (manifest.batch_id, ordinal, event_value),
+                )
+                return (
+                    "accepted",
+                    event_value,
+                    artifact_value,
+                    True,
+                    not self._is_system_only_change(current, event),
+                    prior_root_parent_value,
+                )
             connection.execute(
                 """
                 INSERT INTO artifact_batch_events(
@@ -418,13 +779,34 @@ class ArtifactStore:
                 """,
                 (manifest.batch_id, ordinal, event_value),
             )
-            return "unchanged", event_value, str(existing_event[0]), False, False
+            return (
+                "unchanged",
+                event_value,
+                str(existing_event[0]),
+                False,
+                False,
+                None,
+            )
 
         current = connection.execute(
             "SELECT * FROM artifacts WHERE artifact_id = ?",
             (artifact_value,),
         ).fetchone()
-        distillation_relevant = not self._is_system_message(current, event)
+        prior_parent_value = (
+            str(current["parent_artifact_id"])
+            if current is not None and current["parent_artifact_id"] is not None
+            else None
+        )
+        effective_parent_value = parent_value
+        if event.operation != "upsert" and effective_parent_value is None:
+            effective_parent_value = prior_parent_value
+        prior_root_parent_value = (
+            prior_parent_value
+            if prior_parent_value is not None
+            and prior_parent_value != effective_parent_value
+            else None
+        )
+        distillation_relevant = not self._is_system_only_change(current, event)
         if (
             current is not None
             and current["redacted_at"] is not None
@@ -450,9 +832,38 @@ class ArtifactStore:
                 """,
                 (manifest.batch_id, ordinal, event_value),
             )
-            return "redacted", event_value, artifact_value, True, False
-        if current is not None:
-            ordering = self._compare_ordering(current, event, payload_sha256)
+            return (
+                "redacted",
+                event_value,
+                artifact_value,
+                True,
+                False,
+                None,
+            )
+        if current is not None and event.operation != "redact":
+            current_delete_is_coverage = False
+            if current["deleted_at"] is not None:
+                last_event = connection.execute(
+                    "SELECT source_version FROM artifact_events WHERE event_id = ?",
+                    (current["last_event_id"],),
+                ).fetchone()
+                current_delete_is_coverage = bool(
+                    last_event is not None
+                    and str(last_event["source_version"] or "").startswith(
+                        ("coverage:", "cascade:")
+                    )
+                )
+            # A provider snapshot observed before a tombstone cannot restore
+            # that tombstone, even when it carries a previously unseen edit.
+            if (
+                event.operation == "upsert"
+                and current_delete_is_coverage
+                and _parse_time(str(_iso(manifest.observed_at)))
+                <= _parse_time(str(current["deleted_at"]))
+            ):
+                ordering = "stale"
+            else:
+                ordering = self._compare_ordering(current, event, payload_sha256)
             if ordering in {"stale", "conflict"}:
                 self._insert_event(
                     connection,
@@ -472,7 +883,14 @@ class ArtifactStore:
                     """,
                     (manifest.batch_id, ordinal, event_value, ordering),
                 )
-                return ordering, event_value, artifact_value, False, False
+                return (
+                    ordering,
+                    event_value,
+                    artifact_value,
+                    False,
+                    False,
+                    None,
+                )
 
         observed_at = _iso(manifest.observed_at)
         if event.operation == "upsert":
@@ -668,20 +1086,28 @@ class ArtifactStore:
             artifact_value,
             True,
             distillation_relevant,
+            prior_root_parent_value,
         )
 
     @staticmethod
-    def _is_system_message(
+    def _is_system_only_change(
         current: sqlite3.Row | None,
         event: ArtifactEvent,
     ) -> bool:
         if event.entity != "message":
             return False
+        current_is_system = bool(
+            current is not None
+            and ArtifactStore._payload_is_system(str(current["payload_json"]))
+        )
         if isinstance(event.payload, ArtifactPayload):
-            return (event.payload.classification or "").casefold() == "system"
-        if current is None:
-            return False
-        return ArtifactStore._payload_is_system(str(current["payload_json"]))
+            incoming_is_system = (
+                event.payload.classification or ""
+            ).casefold() == "system"
+            # A normal-to-system correction removes prior summary evidence.
+            # Only a new system row or a system-to-system edit is irrelevant.
+            return incoming_is_system and (current is None or current_is_system)
+        return current_is_system
 
     @staticmethod
     def _payload_is_system(payload_json: str) -> bool:
@@ -716,6 +1142,29 @@ class ArtifactStore:
             raise ValueError(
                 f"Artifact parent does not exist before child {event.external_id}."
             )
+        child_value = artifact_id(
+            manifest.source,
+            manifest.source_instance,
+            event.entity,
+            event.external_id,
+        )
+        creates_cycle = connection.execute(
+            """
+            WITH RECURSIVE ancestors(artifact_id) AS (
+                SELECT ?
+                UNION
+                SELECT parent.parent_artifact_id
+                FROM artifacts AS parent
+                JOIN ancestors AS child
+                  ON parent.artifact_id = child.artifact_id
+                WHERE parent.parent_artifact_id IS NOT NULL
+            )
+            SELECT 1 FROM ancestors WHERE artifact_id = ? LIMIT 1
+            """,
+            (parent_value, child_value),
+        ).fetchone()
+        if creates_cycle is not None:
+            raise ValueError("Artifact parent would create a hierarchy cycle.")
         return parent_value
 
     @staticmethod
@@ -894,6 +1343,95 @@ class ArtifactStore:
             (artifact_value,),
         )
 
+    def _tombstone_descendants(
+        self,
+        connection: sqlite3.Connection,
+        batch: ParsedArtifactBatch,
+        root_artifact_id: str,
+        root_event_id: str,
+        counters: dict[str, int],
+    ) -> int:
+        rows = connection.execute(
+            """
+            WITH RECURSIVE descendants(
+                artifact_id, external_id, entity, parent_artifact_id, depth
+            ) AS (
+                SELECT artifact_id, external_id, entity,
+                       parent_artifact_id, 1
+                FROM artifacts
+                WHERE parent_artifact_id = ?
+                  AND deleted_at IS NULL AND redacted_at IS NULL
+                UNION ALL
+                SELECT child.artifact_id, child.external_id, child.entity,
+                       child.parent_artifact_id, parent.depth + 1
+                FROM artifacts AS child
+                JOIN descendants AS parent
+                  ON child.parent_artifact_id = parent.artifact_id
+                WHERE child.deleted_at IS NULL AND child.redacted_at IS NULL
+            )
+            SELECT descendant.*, parent.entity AS parent_entity,
+                   parent.external_id AS parent_external_id
+            FROM descendants AS descendant
+            JOIN artifacts AS parent
+              ON parent.artifact_id = descendant.parent_artifact_id
+            ORDER BY descendant.depth, descendant.artifact_id
+            """,
+            (root_artifact_id,),
+        ).fetchall()
+        tombstoned_at = _iso(batch.manifest.observed_at)
+        for row in rows:
+            parent = ArtifactReference(
+                entity=str(row["parent_entity"]),
+                external_id=str(row["parent_external_id"]),
+            )
+            event = ArtifactEvent.model_validate(
+                {
+                    "schema": "ai-memory/artifact-event@1",
+                    "record": "event",
+                    "entity": row["entity"],
+                    "operation": "delete",
+                    "external_id": row["external_id"],
+                    "parent": parent,
+                    "source_version": f"cascade:{root_event_id}",
+                }
+            )
+            payload_sha256 = sha256_text(canonical_json(None))
+            descendant_event_id = event_id(
+                batch.manifest.source,
+                batch.manifest.source_instance,
+                {
+                    "entity": event.entity,
+                    "external_id": event.external_id,
+                    "parent_artifact_id": row["parent_artifact_id"],
+                    "operation": "delete",
+                    "source_version": event.source_version,
+                    "payload_sha256": payload_sha256,
+                },
+            )
+            self._insert_event(
+                connection,
+                batch,
+                event,
+                str(row["artifact_id"]),
+                str(row["parent_artifact_id"]),
+                descendant_event_id,
+                None,
+                payload_sha256,
+            )
+            connection.execute(
+                "UPDATE artifacts SET deleted_at = ?, last_observed_at = ?, "
+                "last_event_id = ? WHERE artifact_id = ?",
+                (
+                    tombstoned_at,
+                    tombstoned_at,
+                    descendant_event_id,
+                    row["artifact_id"],
+                ),
+            )
+            self._clear_current_relations(connection, str(row["artifact_id"]))
+            counters["tombstones"] += 1
+        return len(rows)
+
     @staticmethod
     def _replace_links(
         connection: sqlite3.Connection,
@@ -976,8 +1514,14 @@ class ArtifactStore:
                 "entity = ?",
                 "deleted_at IS NULL",
                 "redacted_at IS NULL",
+                # A delayed snapshot cannot remove state observed after that snapshot.
+                "last_observed_at <= ?",
             ]
-            parameters: list[Any] = [parent_value, claim.entity]
+            parameters: list[Any] = [
+                parent_value,
+                claim.entity,
+                _iso(manifest.observed_at),
+            ]
             if claim.covered_from is not None:
                 conditions.append("occurred_at >= ?")
                 parameters.append(_iso(claim.covered_from))
@@ -1044,6 +1588,13 @@ class ArtifactStore:
                 self._clear_current_relations(connection, str(row["artifact_id"]))
                 counters["tombstones"] += 1
                 changed += 1
+                changed += self._tombstone_descendants(
+                    connection,
+                    batch,
+                    str(row["artifact_id"]),
+                    tombstone_event,
+                    counters,
+                )
                 if not self._payload_is_system(str(row["payload_json"])):
                     self._remember_root_for_covered_child(
                         connection,
@@ -1079,11 +1630,6 @@ class ArtifactStore:
         roots: dict[str, str],
     ) -> None:
         if event.entity == "message":
-            payload = event.payload
-            if isinstance(payload, ArtifactPayload) and (
-                payload.classification or ""
-            ).casefold() == "system":
-                return
             row = connection.execute(
                 "SELECT parent_artifact_id FROM artifacts WHERE artifact_id = ?",
                 (artifact_value,),
@@ -1111,6 +1657,20 @@ class ArtifactStore:
                 roots,
             )
             return
+        if event.entity == "attachment":
+            owner = self._nearest_distillation_root(connection, artifact_value)
+            if owner is None:
+                return
+            entity, root = owner
+            roots[root] = event_value
+            if entity == "conversation":
+                self._remember_related_meetings(
+                    connection,
+                    root,
+                    event_value,
+                    roots,
+                )
+            return
         if event.entity == "meeting":
             roots[artifact_value] = event_value
             return
@@ -1118,6 +1678,35 @@ class ArtifactStore:
             root = self._meeting_ancestor(connection, artifact_value)
             if root is not None:
                 roots[root] = event_value
+
+    def _remember_prior_parent_root(
+        self,
+        connection: sqlite3.Connection,
+        entity: str,
+        prior_parent_value: str | None,
+        event_value: str,
+        roots: dict[str, str],
+    ) -> None:
+        if prior_parent_value is None or entity not in {
+            "message",
+            "attachment",
+            "recording",
+            "transcript",
+            "transcript-cue",
+        }:
+            return
+        owner = self._nearest_distillation_root(connection, prior_parent_value)
+        if owner is None:
+            return
+        root_entity, root = owner
+        roots[root] = event_value
+        if root_entity == "conversation":
+            self._remember_related_meetings(
+                connection,
+                root,
+                event_value,
+                roots,
+            )
 
     def _remember_root_for_covered_child(
         self,
@@ -1141,6 +1730,19 @@ class ArtifactStore:
                 event_value,
                 roots,
             )
+        elif entity == "attachment":
+            owner = self._nearest_distillation_root(connection, parent_value)
+            if owner is None:
+                return
+            root_entity, root = owner
+            roots[root] = event_value
+            if root_entity == "conversation":
+                self._remember_related_meetings(
+                    connection,
+                    root,
+                    event_value,
+                    roots,
+                )
         elif entity in {"recording", "transcript", "transcript-cue"}:
             root = self._meeting_ancestor(connection, parent_value)
             if parent[0] == "meeting":
@@ -1187,6 +1789,49 @@ class ArtifactStore:
             if row is None:
                 return None
             if row["entity"] == "meeting":
+                return current
+            if row["parent_artifact_id"] is None:
+                return None
+            current = str(row["parent_artifact_id"])
+        raise ValueError("Artifact parent depth exceeds the supported limit.")
+
+    @staticmethod
+    def _nearest_distillation_root(
+        connection: sqlite3.Connection,
+        artifact_value: str,
+    ) -> tuple[str, str] | None:
+        current = artifact_value
+        for _ in range(8):
+            row = connection.execute(
+                "SELECT entity, parent_artifact_id FROM artifacts "
+                "WHERE artifact_id = ?",
+                (current,),
+            ).fetchone()
+            if row is None:
+                return None
+            entity = str(row["entity"])
+            if entity in {"conversation", "meeting"}:
+                return entity, current
+            if row["parent_artifact_id"] is None:
+                return None
+            current = str(row["parent_artifact_id"])
+        raise ValueError("Artifact parent depth exceeds the supported limit.")
+
+    @staticmethod
+    def _conversation_ancestor(
+        connection: sqlite3.Connection,
+        artifact_value: str,
+    ) -> str | None:
+        current = artifact_value
+        for _ in range(8):
+            row = connection.execute(
+                "SELECT entity, parent_artifact_id FROM artifacts "
+                "WHERE artifact_id = ?",
+                (current,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["entity"] == "conversation":
                 return current
             if row["parent_artifact_id"] is None:
                 return None

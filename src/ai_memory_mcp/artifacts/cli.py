@@ -15,9 +15,9 @@ from ai_memory_mcp.config import Settings
 from .ingest import ingest_artifact_batch, read_artifact_batch
 from .models import ArtifactScope
 from .schema import (
+    ARTIFACT_SCHEMA_VERSION,
     artifact_database_status,
     connect_artifact_db,
-    migrate_artifact_db,
 )
 from .search import ArtifactSearch
 
@@ -149,11 +149,11 @@ def _ingest(settings: Settings, args: argparse.Namespace) -> Any:
     try:
         if args.input == "-":
             batch = read_artifact_batch(
-                sys.stdin,
+                sys.stdin.buffer,
                 max_bytes=settings.artifact_batch_max_bytes,
             )
         else:
-            with Path(args.input).open("r", encoding="utf-8") as stream:
+            with Path(args.input).open("rb") as stream:
                 batch = read_artifact_batch(
                     stream,
                     max_bytes=settings.artifact_batch_max_bytes,
@@ -169,8 +169,29 @@ def _ingest(settings: Settings, args: argparse.Namespace) -> Any:
 
 
 def _status(settings: Settings) -> dict[str, Any]:
-    migrate_artifact_db(settings)
     health = artifact_database_status(settings)
+    common = {
+        "available": False,
+        "schema_version": health.schema_version,
+        "database_path": str(settings.artifact_db),
+        "journal_mode": None,
+        "artifacts": 0,
+        "active_artifacts": 0,
+        "batches": 0,
+        "pending_distillations": 0,
+        "last_batch_at": None,
+    }
+    if not health.exists:
+        return {**common, "integrity": health.integrity}
+    if health.schema_version != ARTIFACT_SCHEMA_VERSION:
+        return {
+            **common,
+            "integrity": health.integrity,
+            "error": (
+                "The artifact database schema is not current. "
+                "Run an artifact intake or migration command."
+            ),
+        }
     with connect_artifact_db(
         settings.artifact_db,
         read_only=True,
@@ -207,6 +228,7 @@ def _status(settings: Settings) -> dict[str, Any]:
         "batches": batches,
         "pending_distillations": pending,
         "last_batch_at": last,
+        "integrity": health.integrity,
     }
 
 

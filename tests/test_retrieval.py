@@ -5,7 +5,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from ai_memory_mcp.benchmark import verify_contract
+from ai_memory_mcp.benchmark import _benchmark_settings, verify_contract
 from ai_memory_mcp.config import Settings
 from ai_memory_mcp.service import MemoryService
 
@@ -15,6 +15,15 @@ def test_frozen_contract_is_unchanged(project_root: Path) -> None:
     assert lock["sha256"] == (
         "e6a13efda90f9a654b702c9c5161f2bbb97aff5e2de145bd060ab537b0753e0c"
     )
+
+
+def test_frozen_benchmark_uses_isolated_artifact_paths(tmp_path: Path) -> None:
+    state_dir = tmp_path / "benchmark-state"
+    settings = _benchmark_settings(tmp_path / "benchmark", state_dir)
+
+    assert settings.artifact_db == state_dir / "artifacts.sqlite3"
+    assert settings.artifact_objects_dir == state_dir / "artifact-objects"
+    assert settings.artifact_backup_dir == state_dir / "artifact-backups"
 
 
 def test_all_frozen_cases_pass(

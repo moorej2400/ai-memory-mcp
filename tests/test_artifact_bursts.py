@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from ai_memory_mcp.artifacts.bursts import group_bursts
+from ai_memory_mcp.artifacts.bursts import MAX_BURST_CHARACTERS, group_bursts
 from ai_memory_mcp.artifacts.models import ArtifactBurstRecord
 
 
@@ -15,6 +15,7 @@ def message(
     classification: str = "user",
     reactions: tuple[str, ...] = (),
     attachment: bool = False,
+    author_name: str | None = None,
 ) -> ArtifactBurstRecord:
     hour, minute = map(int, time.split(":"))
     artifact_suffix = f"{hour:02d}{minute:02d}".ljust(32, "a")
@@ -27,7 +28,7 @@ def message(
         source_instance="workspace",
         entity="message",
         author_id=author,
-        author_name=author.title(),
+        author_name=author.title() if author_name is None else author_name,
         participant_names=("Actor A", "Actor B"),
         occurred_at=datetime(
             2026,
@@ -85,6 +86,43 @@ def test_parent_change_splits_a_burst() -> None:
     assert len(bursts) == 2
 
 
+def test_interleaved_parents_do_not_fragment_same_parent_bursts() -> None:
+    other_parent = "art_" + "b" * 32
+    bursts = group_bursts(
+        [
+            message("10:00", "actor-a", "First point."),
+            message(
+                "10:01",
+                "actor-b",
+                "Other conversation.",
+                parent=other_parent,
+            ),
+            message("10:02", "actor-a", "Second point."),
+        ]
+    )
+    assert [burst.record_count for burst in bursts] == [2, 1]
+
+
+def test_display_name_only_authors_form_separate_bursts() -> None:
+    bursts = group_bursts(
+        [
+            message(
+                "10:00",
+                "",
+                "First actor.",
+                author_name="Actor One",
+            ),
+            message(
+                "10:01",
+                "",
+                "Second actor.",
+                author_name="Actor Two",
+            ),
+        ]
+    )
+    assert [burst.record_count for burst in bursts] == [1, 1]
+
+
 def test_eight_record_and_character_limits_split_bursts() -> None:
     records = [
         message(f"10:{index:02d}", "actor-a", f"Point {index}.")
@@ -97,6 +135,18 @@ def test_eight_record_and_character_limits_split_bursts() -> None:
         message("11:01", "actor-a", "b" * 1200),
     ]
     assert len(group_bursts(long_records)) == 2
+
+
+def test_single_record_burst_is_capped_at_the_character_limit() -> None:
+    one_character = group_bursts([message("11:10", "actor-a", "x")])[0]
+    render_overhead = len(one_character.text) - 1
+    exact_text = "x" * (MAX_BURST_CHARACTERS - render_overhead)
+    exact = group_bursts([message("11:11", "actor-a", exact_text)])[0]
+    oversized = group_bursts([message("11:12", "actor-a", "x" * 2500)])[0]
+
+    assert len(exact.text) == MAX_BURST_CHARACTERS
+    assert exact.text.endswith(exact_text)
+    assert len(oversized.text) == MAX_BURST_CHARACTERS
 
 
 def test_system_and_low_signal_bursts_are_not_embedded() -> None:

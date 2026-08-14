@@ -3,6 +3,30 @@ from __future__ import annotations
 import sqlite3
 
 
+def active_ancestor_predicate(alias: str) -> str:
+    """Return a correlated SQL predicate that requires every ancestor to be active."""
+    return f"""
+    NOT EXISTS (
+        WITH RECURSIVE ancestors(
+            artifact_id, parent_artifact_id, deleted_at, redacted_at
+        ) AS (
+            SELECT parent.artifact_id, parent.parent_artifact_id,
+                   parent.deleted_at, parent.redacted_at
+            FROM artifacts AS parent
+            WHERE parent.artifact_id = {alias}.parent_artifact_id
+            UNION ALL
+            SELECT parent.artifact_id, parent.parent_artifact_id,
+                   parent.deleted_at, parent.redacted_at
+            FROM artifacts AS parent
+            JOIN ancestors AS child
+              ON parent.artifact_id = child.parent_artifact_id
+        )
+        SELECT 1 FROM ancestors
+        WHERE deleted_at IS NOT NULL OR redacted_at IS NOT NULL
+    )
+    """
+
+
 # A related chat can contain sibling meeting occurrences. Restrict each branch
 # by entity so one meeting cannot absorb another meeting's transcript context.
 MEETING_CONTEXT_SQL = """

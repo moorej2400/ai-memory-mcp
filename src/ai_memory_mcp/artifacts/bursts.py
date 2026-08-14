@@ -48,14 +48,24 @@ def _should_embed(records: list[ArtifactBurstRecord], text: str) -> bool:
     )
 
 
+def _author_key(record: ArtifactBurstRecord) -> str:
+    stable_id = record.author_id.strip()
+    if stable_id:
+        return f"id:{stable_id}"
+    display_name = " ".join(record.author_name.split()).casefold()
+    return f"name:{display_name}"
+
+
 def _burst(records: list[ArtifactBurstRecord]) -> ArtifactBurst:
     first = records[0]
     last = records[-1]
-    text = _render(records)
+    # Raw artifacts retain complete text. Cap only the derived semantic unit so
+    # one oversized record cannot bypass the documented burst limit.
+    text = _render(records)[:MAX_BURST_CHARACTERS]
     identity = canonical_json(
         {
             "parent": first.parent_artifact_id,
-            "author": first.author_id,
+            "author": _author_key(first),
             "first": first.artifact_id,
             "last": last.artifact_id,
             "text": text,
@@ -89,7 +99,13 @@ def group_bursts(records: list[ArtifactBurstRecord]) -> list[ArtifactBurst]:
             for record in records
             if not record.deleted and not record.redacted
         ),
-        key=lambda record: (record.occurred_at, record.artifact_id),
+        # Parent-first ordering prevents activity in another conversation from
+        # splitting one conversation's contiguous semantic run.
+        key=lambda record: (
+            record.parent_artifact_id,
+            record.occurred_at,
+            record.artifact_id,
+        ),
     )
     result: list[ArtifactBurst] = []
     current: list[ArtifactBurstRecord] = []
@@ -100,7 +116,7 @@ def group_bursts(records: list[ArtifactBurstRecord]) -> list[ArtifactBurst]:
             prospective = [*current, record]
             split = bool(
                 record.parent_artifact_id != previous.parent_artifact_id
-                or record.author_id != previous.author_id
+                or _author_key(record) != _author_key(previous)
                 or record.occurred_at - previous.occurred_at > MAX_BURST_GAP
                 or len(current) >= MAX_BURST_RECORDS
                 or len(_render(prospective)) > MAX_BURST_CHARACTERS

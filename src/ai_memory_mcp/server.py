@@ -38,7 +38,8 @@ def create_server(settings: Settings | None = None) -> FastMCP:
             "Use memory_recall for all memory retrieval. The server selects exact, "
             "search, raw-artifact, neighbor, and relationship behavior. Use "
             "memory_artifact_read for ordered raw context. Use memory_sync after "
-            "canonical Markdown changes. Use memory_status for diagnostics."
+            "canonical Markdown or artifact data changes. Use memory_status for "
+            "diagnostics."
         ),
         host=settings.host,
         port=settings.port,
@@ -236,7 +237,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         structured_output=True,
     )
     def memory_sync() -> SyncResponse:
-        """Update the derived index from canonical Markdown."""
+        """Update the derived indexes after canonical Markdown or artifact data changes."""
         return service.sync()
 
     @mcp.tool(

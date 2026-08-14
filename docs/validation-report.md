@@ -15,8 +15,12 @@ Status: satisfactory
 
 ## Automated tests
 
-All 247 automated tests passed.
+All 354 automated tests passed.
+One platform-specific test was skipped.
 The tests covered artifact intake, retrieval, distillation, migration, recovery, MCP tools, client merging, and repository privacy.
+All eight provider TypeScript test files passed.
+The provider shell setup test passed.
+The artifact database uses schema version 3.
 
 ## Frozen benchmark
 
@@ -31,8 +35,8 @@ All 20 cases passed.
 | No-answer accuracy | 1.000 |
 | Scope leakage | 0.000 |
 | Citation failures | 0.000 |
-| Median latency | 2.58 ms |
-| 95th percentile latency | 3.52 ms |
+| Median latency | 2.60 ms |
+| 95th percentile latency | 4.27 ms |
 
 The frozen contract SHA-256 value is:
 

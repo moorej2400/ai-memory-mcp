@@ -16,6 +16,7 @@ from ai_memory_mcp.models import ArtifactIndexResult
 from ai_memory_mcp.text import cosine_sparse
 
 from .bursts import group_bursts
+from .context import active_ancestor_predicate
 from .identity import artifact_uri, parse_artifact_uri
 from .models import (
     ArtifactBurst,
@@ -24,7 +25,7 @@ from .models import (
     ArtifactSearchHit,
     ArtifactVectorSearchResult,
 )
-from .schema import connect_artifact_db
+from .schema import connect_artifact_db, require_local_database_path
 
 ARTIFACT_VECTOR_SCHEMA_VERSION = 1
 
@@ -36,6 +37,7 @@ def _utc_iso(value: datetime) -> str:
 
 
 def _connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
+    path = require_local_database_path(path)
     if read_only:
         connection = sqlite3.connect(
             f"file:{path.resolve().as_posix()}?mode=ro",
@@ -60,6 +62,8 @@ def _schema_matches(path: Path) -> bool:
 
 
 def current_artifact_index_path(settings: Settings) -> Path | None:
+    # Validate the index root even when it has no snapshot to inspect.
+    require_local_database_path(settings.state_dir / "artifact-index.sqlite")
     pointer = settings.artifact_pointer_path
     if pointer.is_file():
         try:
@@ -151,7 +155,7 @@ def _load_records(settings: Settings) -> tuple[int, list[ArtifactBurstRecord]]:
             raise RuntimeError("The artifact database has no change counter.")
         change_counter = int(counter_row[0])
         rows = connection.execute(
-            """
+            f"""
             SELECT child.*, parent.title AS parent_title,
                    parent.payload_json AS parent_payload_json,
                    EXISTS(
@@ -172,6 +176,7 @@ def _load_records(settings: Settings) -> tuple[int, list[ArtifactBurstRecord]]:
             WHERE child.entity IN ('message', 'transcript-cue')
               AND child.deleted_at IS NULL AND child.redacted_at IS NULL
               AND parent.deleted_at IS NULL AND parent.redacted_at IS NULL
+              AND {active_ancestor_predicate("child")}
               AND child.occurred_at IS NOT NULL
             ORDER BY child.parent_artifact_id, child.occurred_at,
                      child.artifact_id
@@ -294,11 +299,17 @@ def _publish_pointer(settings: Settings, snapshot: Path) -> None:
     os.replace(temporary, pointer)
 
 
+def _publish_snapshot_no_overwrite(temporary: Path, snapshot: Path) -> None:
+    os.link(temporary, snapshot)
+    temporary.unlink()
+
+
 def build_artifact_vector_index(
     settings: Settings,
     force: bool = False,
 ) -> ArtifactIndexResult:
     started = time.perf_counter()
+    require_local_database_path(settings.state_dir / "artifact-index.sqlite")
     if not settings.artifact_db.is_file():
         raise FileNotFoundError("Artifact database is not available.")
     settings.state_dir.mkdir(parents=True, exist_ok=True)
@@ -344,43 +355,52 @@ def build_artifact_vector_index(
         snapshot = settings.state_dir / (
             f"artifact-index-{stamp}-{os.getpid()}.sqlite"
         )
-        with _connect(snapshot) as connection:
-            _create_schema(connection)
-            embedded = 0
-            for burst in bursts:
-                vector_blob = None
-                if burst.embed:
-                    vector_blob = encode_vector(provider.embed(burst.text))
-                    embedded += 1
-                _insert_burst(connection, burst, vector_blob)
-            metadata = {
-                "schema_version": str(ARTIFACT_VECTOR_SCHEMA_VERSION),
-                "built_at": datetime.now(timezone.utc).isoformat(),
-                "artifact_change_counter": str(change_counter),
-                "embedding_provider": provider.name,
-                "embedding_model": provider.model,
-                "embedding_dimensions": str(provider.dimensions),
-                "embedding_fingerprint": provider_fingerprint,
-                "bursts": str(len(bursts)),
-                "embedded_bursts": str(embedded),
-            }
-            connection.executemany(
-                "INSERT INTO metadata(key, value) VALUES (?, ?)",
-                metadata.items(),
-            )
-            connection.commit()
-            integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
-            if integrity != "ok":
-                raise RuntimeError(
-                    f"Artifact vector index integrity check failed: {integrity}"
+        temporary = settings.state_dir / (
+            f".artifact-index.partial-{os.getpid()}-{time.time_ns()}.sqlite"
+        )
+        try:
+            with _connect(temporary) as connection:
+                _create_schema(connection)
+                embedded = 0
+                for burst in bursts:
+                    vector_blob = None
+                    if burst.embed:
+                        vector_blob = encode_vector(provider.embed(burst.text))
+                        embedded += 1
+                    _insert_burst(connection, burst, vector_blob)
+                metadata = {
+                    "schema_version": str(ARTIFACT_VECTOR_SCHEMA_VERSION),
+                    "built_at": datetime.now(timezone.utc).isoformat(),
+                    "artifact_change_counter": str(change_counter),
+                    "embedding_provider": provider.name,
+                    "embedding_model": provider.model,
+                    "embedding_dimensions": str(provider.dimensions),
+                    "embedding_fingerprint": provider_fingerprint,
+                    "bursts": str(len(bursts)),
+                    "embedded_bursts": str(embedded),
+                }
+                connection.executemany(
+                    "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                    metadata.items(),
                 )
-        if _canonical_change_counter(settings) != change_counter:
-            raise RuntimeError(
-                "The artifact database changed during semantic index publication."
-            )
-        if os.name != "nt":
-            snapshot.chmod(0o600)
-        _publish_pointer(settings, snapshot)
+                connection.commit()
+                integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+                if integrity != "ok":
+                    raise RuntimeError(
+                        f"Artifact vector index integrity check failed: {integrity}"
+                    )
+            if _canonical_change_counter(settings) != change_counter:
+                raise RuntimeError(
+                    "The artifact database changed during semantic index publication."
+                )
+            if os.name != "nt":
+                temporary.chmod(0o600)
+            _publish_snapshot_no_overwrite(temporary, snapshot)
+            _publish_pointer(settings, snapshot)
+        except BaseException:
+            if temporary.exists():
+                temporary.unlink()
+            raise
     return ArtifactIndexResult(
         snapshot=str(snapshot),
         change_counter=change_counter,
@@ -442,7 +462,9 @@ def search_artifact_vectors(
         conditions.append("started_at >= ?")
         parameters.append(_utc_iso(scope.date_from))
     if scope.date_to is not None:
-        conditions.append("started_at <= ?")
+        # A burst is indivisible evidence. Require all of its records to fit
+        # inside the requested time range before returning its combined text.
+        conditions.append("ended_at <= ?")
         parameters.append(_utc_iso(scope.date_to))
     with _connect(current, read_only=True) as connection:
         rows = connection.execute(

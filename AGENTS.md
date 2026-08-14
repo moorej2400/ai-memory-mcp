@@ -11,8 +11,9 @@ They also apply to `graphify-codebase/` and all future subdirectories.
 - Do not commit organization names, private domains, ticket prefixes, or user-specific paths.
 - Put machine-specific and organization-specific configuration in the ignored `.env`.
 - Use neutral names and identifiers in documentation, tests, and benchmark fixtures.
-- Keep Markdown as the memory authority.
-- Treat SQLite and Graphify data as derived data.
+- Keep Markdown as the authority for distilled durable memory.
+- Keep the artifact SQLite database as the authority for raw artifacts.
+- Treat Markdown search SQLite, artifact burst indexes, and Graphify data as derived data.
 
 ## Public repository privacy
 

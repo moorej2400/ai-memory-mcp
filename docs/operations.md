@@ -276,8 +276,8 @@ Restart each configured client after the command finishes.
 
 ## Refresh Graphify
 
-Use `memory_sync` after an ordinary memory update.
-The tool updates only the derived SQLite index.
+Use `memory_sync` after canonical Markdown or artifact data changes.
+The tool updates the independent Markdown and artifact indexes.
 
 Use the maintenance script when the Graphify graph must change.
 The script uses staging and validation.
@@ -317,7 +317,8 @@ The transcript also records failures and rollback operations.
 ## Review local logs
 
 The index log records source counts, changes, errors, lock waits, and elapsed time.
-The retrieval log records each query, result, citation, diagnostic, and elapsed time.
+The retrieval log records Markdown queries, results, citations, diagnostics, and elapsed time.
+Artifact routes record query hashes, evidence digests, and metadata.
 
 Read these files under `AI_MEMORY_LOG_DIR`:
 

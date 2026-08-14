@@ -9,12 +9,15 @@ from pathlib import Path
 import pytest
 
 import ai_memory_mcp.artifacts.migrate_legacy as migration_module
+import ai_memory_mcp.artifacts.schema as schema_module
 from ai_memory_mcp.artifacts.cli import main
 from ai_memory_mcp.artifacts.migrate_legacy import (
     plan_legacy_migration,
     run_legacy_migration,
 )
+from ai_memory_mcp.artifacts.models import ArtifactAlias, ArtifactPayload
 from ai_memory_mcp.artifacts.schema import connect_artifact_db
+from ai_memory_mcp.artifacts.store import ArtifactStore
 from ai_memory_mcp.config import Settings
 
 
@@ -126,6 +129,13 @@ def test_legacy_import_preserves_raw_and_summary_roles(
         object_count = connection.execute(
             "SELECT count(*) FROM artifact_objects"
         ).fetchone()[0]
+        meeting_identity = connection.execute(
+            "SELECT external_id FROM artifacts WHERE entity = 'meeting'"
+        ).fetchone()[0]
+        meeting_aliases = connection.execute(
+            "SELECT alias_kind, alias_value FROM artifact_aliases "
+            "WHERE artifact_id = (SELECT artifact_id FROM artifacts WHERE entity = 'meeting')"
+        ).fetchall()
     assert entities == {
         "attachment": 1,
         "conversation": 1,
@@ -138,6 +148,12 @@ def test_legacy_import_preserves_raw_and_summary_roles(
     assert "## Transcript" not in conversation
     assert migration_records == 1
     assert object_count == 1
+    assert meeting_identity == (
+        "conversation:conversation-1:2026-01-02T09%3A00%3A00.000Z"
+    )
+    assert [(row[0], row[1]) for row in meeting_aliases] == [
+        ("conversation-id", "conversation-1")
+    ]
     for path, digest in source_fingerprints.items():
         assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
 
@@ -153,6 +169,81 @@ def test_repeated_legacy_import_is_a_no_op(
     assert second.unchanged_events == 10
 
 
+def test_legacy_retry_records_evidence_after_post_intake_failure(
+    artifact_settings: Settings,
+    legacy_fixture: LegacyFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verify_import = migration_module._verify_import
+    attempts = 0
+
+    def fail_first_verification(*args: object, **kwargs: object):
+        nonlocal attempts
+        attempts += 1
+        verification = verify_import(*args, **kwargs)
+        if attempts == 1:
+            raise RuntimeError("Synthetic post-intake failure.")
+        return verification
+
+    monkeypatch.setattr(migration_module, "_verify_import", fail_first_verification)
+    with pytest.raises(RuntimeError, match="post-intake"):
+        run_legacy_migration(artifact_settings, **legacy_fixture.arguments)
+
+    with connect_artifact_db(
+        artifact_settings.artifact_db,
+        read_only=True,
+    ) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM artifact_batches"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT count(*) FROM artifact_metadata "
+            "WHERE key LIKE 'legacy_migration:%'"
+        ).fetchone()[0] == 0
+
+    receipt = run_legacy_migration(artifact_settings, **legacy_fixture.arguments)
+    assert receipt.verified is True
+    assert receipt.accepted_events == 0
+    with connect_artifact_db(
+        artifact_settings.artifact_db,
+        read_only=True,
+    ) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM artifact_metadata "
+            "WHERE key LIKE 'legacy_migration:%'"
+        ).fetchone()[0] == 1
+
+
+def test_legacy_import_verifies_stored_alias_rows(
+    artifact_settings: Settings,
+    legacy_fixture: LegacyFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    build_events = migration_module._events
+    apply_batch = ArtifactStore.apply_batch
+
+    def events_with_alias(*args: object, **kwargs: object):
+        events = build_events(*args, **kwargs)
+        assert isinstance(events[0].payload, ArtifactPayload)
+        events[0].payload.aliases = [
+            ArtifactAlias(kind="conversation-id", value="legacy-conversation")
+        ]
+        return events
+
+    def apply_then_corrupt_aliases(self: ArtifactStore, batch: object):
+        receipt = apply_batch(self, batch)
+        with connect_artifact_db(self.settings.artifact_db) as connection:
+            connection.execute("DELETE FROM artifact_aliases")
+            connection.commit()
+        return receipt
+
+    monkeypatch.setattr(migration_module, "_events", events_with_alias)
+    monkeypatch.setattr(ArtifactStore, "apply_batch", apply_then_corrupt_aliases)
+
+    with pytest.raises(RuntimeError, match="alias"):
+        run_legacy_migration(artifact_settings, **legacy_fixture.arguments)
+
+
 def test_missing_tables_are_rejected(
     artifact_settings: Settings,
     tmp_path: Path,
@@ -165,6 +256,25 @@ def test_missing_tables_are_rejected(
             source="chat-source",
             source_instance="workspace",
             sync_db=database,
+        )
+
+
+def test_legacy_migration_rejects_a_network_filesystem_source(
+    legacy_fixture: LegacyFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = legacy_fixture.database.resolve()
+    monkeypatch.setattr(
+        schema_module,
+        "_network_filesystem_type",
+        lambda path: "nfs" if path == selected else None,
+    )
+
+    with pytest.raises(ValueError, match="network filesystem"):
+        plan_legacy_migration(
+            source="chat-source",
+            source_instance="workspace",
+            sync_db=legacy_fixture.database,
         )
 
 
@@ -325,7 +435,10 @@ def test_migration_sanitizes_normalized_text_and_uses_source_allowlists(
     meeting_note = tmp_path / "legacy-meeting.md"
     chat_note.write_text(
         legacy_fixture.chat_notes.read_text(encoding="utf-8")
-        + "\nDownload https://files.example.invalid/item?sig=secret-value.\n",
+        + "\nDownload https://files.example.invalid/item?sig=secret-value.\n"
+        + "Download //files.example.invalid/item?tempauth=protocol-marker.\n"
+        + "Open //files.example.invalid/item?view=1&amp;"
+        + "refresh_token=html-protocol-marker.\n",
         encoding="utf-8",
     )
     meeting_note.write_text(
@@ -344,7 +457,19 @@ def test_migration_sanitizes_normalized_text_and_uses_source_allowlists(
             "UPDATE messages SET content_markdown = ?, raw_json = ? "
             "WHERE message_id = 'message-1'",
             (
-                "See https://files.example.invalid/item?X-Amz-Signature=secret-value.",
+                (
+                    "Authorization: Bearer private-token-marker\n"
+                    "Cookie: sessionid=private-cookie-marker\n"
+                    "cookies=private-cookies-marker\n"
+                    "credential: private-credential-marker\n"
+                    "secret: private-secret-marker\n"
+                    "shared_access_signature: private-signature-marker\n"
+                    "See https://files.example.invalid/item?"
+                    "X-Amz-Signature=secret-value.\n"
+                    "Open https://redirect.example.invalid/item?next="
+                    "%2F%2Ffiles.example.invalid%2Fitem%3F"
+                    "api_key%3Dpercent-protocol-marker."
+                ),
                 (
                     '{"authorId":"actor-a","accessToken":"secret-value",'
                     '"reactions":["like"],"unknown":"private-value"}'
@@ -391,6 +516,15 @@ def test_migration_sanitizes_normalized_text_and_uses_source_allowlists(
     serialized = "\n".join(str(row["payload_json"]) for row in payload_rows)
     assert "secret-value" not in serialized
     assert "private-value" not in serialized
+    assert "private-token-marker" not in serialized
+    assert "private-cookie-marker" not in serialized
+    assert "private-cookies-marker" not in serialized
+    assert "private-credential-marker" not in serialized
+    assert "private-secret-marker" not in serialized
+    assert "private-signature-marker" not in serialized
+    assert "protocol-marker" not in serialized
+    assert "html-protocol-marker" not in serialized
+    assert "percent-protocol-marker" not in serialized
     assert "accessToken" not in serialized
     assert "temporaryDownloadUrl" not in serialized
     for row in payload_rows:

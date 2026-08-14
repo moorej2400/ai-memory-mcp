@@ -226,6 +226,65 @@ def test_read_conversation_returns_active_message_children(
     ]
 
 
+def test_read_conversation_includes_direct_and_message_attachments(
+    artifact_settings: Settings,
+) -> None:
+    store = ArtifactStore(artifact_settings)
+    store.apply_batch(
+        _batch(
+            "chat-source",
+            "workspace",
+            "conversation-attachments",
+            [
+                _event(
+                    "conversation",
+                    "conversation-attachments",
+                    "Conversation",
+                    "2026-01-02T09:00:00Z",
+                ),
+                _event(
+                    "message",
+                    "message-attachment-parent",
+                    "See the attached record.",
+                    "2026-01-02T10:00:00Z",
+                    parent=("conversation", "conversation-attachments"),
+                ),
+                _event(
+                    "attachment",
+                    "attachment-message-child",
+                    "Message attachment",
+                    "2026-01-02T10:01:00Z",
+                    parent=("message", "message-attachment-parent"),
+                ),
+                _event(
+                    "attachment",
+                    "attachment-conversation-child",
+                    "Conversation attachment",
+                    "2026-01-02T10:02:00Z",
+                    parent=("conversation", "conversation-attachments"),
+                ),
+            ],
+        )
+    )
+    reference = artifact_uri(
+        "conversation",
+        artifact_id(
+            "chat-source",
+            "workspace",
+            "conversation",
+            "conversation-attachments",
+        ),
+    )
+
+    result = ArtifactSearch(artifact_settings).read(reference, limit=10)
+
+    assert [(record.entity, record.text) for record in result.records] == [
+        ("message", "See the attached record."),
+        ("attachment", "Message attachment"),
+        ("attachment", "Conversation attachment"),
+    ]
+
+
 def test_include_payload_returns_only_the_exact_focus(
     populated_artifact_store: ArtifactStore,
 ) -> None:

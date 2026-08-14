@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import ai_memory_mcp.artifacts.schema as schema_module
 from ai_memory_mcp.artifacts.backup import (
     backup_artifact_db,
     check_artifact_db,
@@ -146,3 +147,40 @@ def test_restore_does_not_overwrite_a_destination_created_during_publication(
 
     assert destination.read_bytes() == b"racing writer"
     assert not list(destination.parent.glob("*.partial-*"))
+
+
+def test_backup_rejects_a_network_filesystem_destination(
+    artifact_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ArtifactStore(artifact_settings).apply_batch(_batch("backup-network", "message-1"))
+    backup_root = artifact_settings.artifact_backup_dir.resolve()
+    monkeypatch.setattr(
+        schema_module,
+        "_network_filesystem_type",
+        lambda path: "smbfs" if path.resolve().is_relative_to(backup_root) else None,
+    )
+
+    with pytest.raises(ValueError, match="network filesystem"):
+        backup_artifact_db(artifact_settings)
+
+
+@pytest.mark.parametrize("network_side", ["source", "destination"])
+def test_restore_rejects_network_filesystem_database_paths(
+    artifact_settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    network_side: str,
+) -> None:
+    ArtifactStore(artifact_settings).apply_batch(_batch("restore-network", "message-1"))
+    backup = backup_artifact_db(artifact_settings)
+    destination = tmp_path / "network-restore" / "artifacts.sqlite3"
+    selected = backup.path.resolve() if network_side == "source" else destination.resolve()
+    monkeypatch.setattr(
+        schema_module,
+        "_network_filesystem_type",
+        lambda path: "nfs" if path.resolve() == selected else None,
+    )
+
+    with pytest.raises(ValueError, match="network filesystem"):
+        restore_artifact_db(backup.path, destination)

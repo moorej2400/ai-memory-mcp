@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import ntpath
 import sqlite3
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -13,7 +15,7 @@ from urllib.parse import quote
 from ai_memory_mcp import __version__
 from ai_memory_mcp.config import Settings
 
-ARTIFACT_SCHEMA_VERSION = 2
+ARTIFACT_SCHEMA_VERSION = 3
 NETWORK_FILESYSTEM_TYPES = {
     "9p",
     "afpfs",
@@ -24,6 +26,7 @@ NETWORK_FILESYSTEM_TYPES = {
     "smbfs",
     "webdav",
 }
+MOUNT_CACHE_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,8 +69,31 @@ def _decode_mount_path(value: str) -> Path:
     return Path(value).resolve()
 
 
-@lru_cache(maxsize=1)
-def _mounted_filesystems() -> tuple[tuple[Path, str], ...]:
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _windows_drive_type(root: str) -> int:
+    import ctypes
+
+    return int(ctypes.windll.kernel32.GetDriveTypeW(root))  # type: ignore[attr-defined]
+
+
+def _windows_network_filesystem_type(path: Path) -> str | None:
+    value = str(path)
+    if value.startswith("\\\\"):
+        return "unc"
+    drive, _ = ntpath.splitdrive(value)
+    if not drive:
+        return None
+    try:
+        drive_type = _windows_drive_type(f"{drive}\\")
+    except (AttributeError, OSError):
+        return None
+    return "remote" if drive_type == 4 else None
+
+
+def _read_mounted_filesystems() -> tuple[tuple[Path, str], ...]:
     entries: list[tuple[Path, str]] = []
     if sys.platform == "darwin":
         try:
@@ -105,9 +131,23 @@ def _mounted_filesystems() -> tuple[tuple[Path, str], ...]:
     return tuple(entries)
 
 
+@lru_cache(maxsize=2)
+def _mounted_filesystems_for_epoch(_epoch: int) -> tuple[tuple[Path, str], ...]:
+    return _read_mounted_filesystems()
+
+
+def _mounted_filesystems() -> tuple[tuple[Path, str], ...]:
+    # A short cache avoids a mount subprocess for each read without trusting a
+    # mount table for the complete process lifetime.
+    epoch = int(time.monotonic() // MOUNT_CACHE_SECONDS)
+    return _mounted_filesystems_for_epoch(epoch)
+
+
 def _network_filesystem_type(path: Path) -> str | None:
-    if os.name == "nt" and str(path).startswith("\\\\"):
-        return "unc"
+    if _is_windows():
+        windows_type = _windows_network_filesystem_type(path)
+        if windows_type is not None:
+            return windows_type
     resolved = path.expanduser().resolve()
     matches = [
         (mount, filesystem)
@@ -120,18 +160,24 @@ def _network_filesystem_type(path: Path) -> str | None:
     return filesystem if filesystem.casefold() in NETWORK_FILESYSTEM_TYPES else None
 
 
+def require_local_database_path(path: Path) -> Path:
+    """Return a resolved database path after rejecting known network filesystems."""
+    resolved = path.expanduser().resolve()
+    network_type = _network_filesystem_type(resolved)
+    if network_type is not None:
+        raise ValueError(
+            f"A SQLite database cannot use the {network_type} network filesystem."
+        )
+    return resolved
+
+
 def connect_artifact_db(
     path: Path,
     *,
     read_only: bool = False,
 ) -> sqlite3.Connection:
     """Open the artifact database with its durability and isolation rules."""
-    path = path.expanduser().resolve()
-    network_type = _network_filesystem_type(path)
-    if network_type is not None:
-        raise ValueError(
-            f"The artifact database cannot use the {network_type} network filesystem."
-        )
+    path = require_local_database_path(path)
     if read_only:
         uri = f"file:{quote(path.as_posix(), safe='/')}?mode=ro"
         connection = sqlite3.connect(uri, uri=True, timeout=10.0)
@@ -442,20 +488,68 @@ MIGRATION_2_STATEMENTS = (
 )
 
 
+MIGRATION_3_STATEMENTS = (
+    """
+    CREATE TABLE artifact_aliases_v3 (
+        artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+        source TEXT NOT NULL,
+        source_instance TEXT NOT NULL,
+        alias_kind TEXT NOT NULL,
+        alias_value TEXT NOT NULL,
+        PRIMARY KEY(
+            artifact_id, source, source_instance, alias_kind, alias_value
+        )
+    )
+    """,
+    """
+    INSERT INTO artifact_aliases_v3(
+        artifact_id, source, source_instance, alias_kind, alias_value
+    )
+    SELECT artifact_id, source, source_instance, alias_kind, alias_value
+    FROM artifact_aliases
+    """,
+    "DROP TABLE artifact_aliases",
+    "ALTER TABLE artifact_aliases_v3 RENAME TO artifact_aliases",
+    """
+    CREATE INDEX artifact_aliases_lookup_idx
+        ON artifact_aliases(
+            source, source_instance, alias_kind, alias_value, artifact_id
+        )
+    """,
+)
+
+
 def _backup_database(
     connection: sqlite3.Connection,
     settings: Settings,
     version: int,
 ) -> Path:
-    _private_directory(settings.artifact_backup_dir)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    backup_path = settings.artifact_backup_dir / (
-        f"{settings.artifact_db.name}.v{version}.{stamp}.sqlite3"
+    backup_path = require_local_database_path(
+        settings.artifact_backup_dir
+        / f"{settings.artifact_db.name}.v{version}.{stamp}.sqlite3"
     )
-    with sqlite3.connect(backup_path) as backup:
-        connection.backup(backup)
-    _private_file(backup_path)
-    return backup_path
+    _private_directory(backup_path.parent)
+    partial_path = backup_path.parent / (
+        f".{backup_path.name}.partial-{os.getpid()}-{time.time_ns()}"
+    )
+    try:
+        with sqlite3.connect(partial_path) as backup:
+            connection.backup(backup)
+            integrity = str(backup.execute("PRAGMA quick_check").fetchone()[0])
+            if integrity != "ok":
+                raise sqlite3.DatabaseError(
+                    f"The migration backup integrity check returned {integrity}."
+                )
+        _private_file(partial_path)
+        # A hard link publishes the verified recovery point without replacing
+        # a backup that received the same timestamp.
+        os.link(partial_path, backup_path)
+        _private_file(backup_path)
+        return backup_path
+    finally:
+        if partial_path.exists():
+            partial_path.unlink()
 
 
 def _apply_migration_1(connection: sqlite3.Connection) -> None:
@@ -502,6 +596,29 @@ def _apply_migration_2(connection: sqlite3.Connection) -> None:
         connection.commit()
 
 
+def _apply_migration_3(connection: sqlite3.Connection) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        # The version row makes the table rebuild safe to retry after rollback.
+        # Aliases identify evidence but do not globally identify one occurrence.
+        for statement in MIGRATION_3_STATEMENTS:
+            connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO artifact_schema_migrations(
+                version, applied_at, application_version
+            ) VALUES (?, ?, ?)
+            """,
+            (3, now, __version__),
+        )
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
 def migrate_artifact_db(settings: Settings) -> MigrationResult:
     """Move the canonical artifact database to the current schema."""
     path = settings.artifact_db.expanduser()
@@ -529,6 +646,9 @@ def migrate_artifact_db(settings: Settings) -> MigrationResult:
         if from_version < 2:
             _apply_migration_2(connection)
             applied.append(2)
+        if from_version < 3:
+            _apply_migration_3(connection)
+            applied.append(3)
 
     _private_file(path)
     return MigrationResult(

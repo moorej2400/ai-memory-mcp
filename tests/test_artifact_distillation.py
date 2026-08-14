@@ -19,6 +19,7 @@ from ai_memory_mcp.artifacts.models import (
     ArtifactReference,
     ArtifactScope,
     ParsedArtifactBatch,
+    RedactionPayload,
 )
 from ai_memory_mcp.artifacts.store import ArtifactStore
 from ai_memory_mcp.config import Settings
@@ -31,13 +32,27 @@ def _event(
     *,
     occurred_at: str,
     parent: tuple[str, str] | None = None,
+    operation: str = "upsert",
 ) -> ArtifactEvent:
+    if operation == "redact":
+        payload: ArtifactPayload | RedactionPayload | None = RedactionPayload(
+            reason="Source privacy request"
+        )
+    elif operation == "delete":
+        payload = None
+    else:
+        payload = ArtifactPayload(
+            title="Review Meeting" if entity == "meeting" else None,
+            text=text,
+            occurred_at=occurred_at,
+            content_format="plain",
+        )
     return ArtifactEvent.model_validate(
         {
             "schema": "ai-memory/artifact-event@1",
             "record": "event",
             "entity": entity,
-            "operation": "upsert",
+            "operation": operation,
             "external_id": external_id,
             "parent": (
                 ArtifactReference(entity=parent[0], external_id=parent[1])
@@ -45,12 +60,7 @@ def _event(
                 else None
             ),
             "source_updated_at": occurred_at,
-            "payload": ArtifactPayload(
-                title="Review Meeting" if entity == "meeting" else None,
-                text=text,
-                occurred_at=occurred_at,
-                content_format="plain",
-            ),
+            "payload": payload,
         }
     )
 
@@ -210,6 +220,76 @@ def test_meeting_requires_a_markdown_note_before_completion(
         )
 
 
+@pytest.mark.parametrize("operation", ["delete", "redact"])
+def test_inactive_parent_suppresses_pending_and_meeting_completion(
+    artifact_settings: Settings,
+    operation: str,
+) -> None:
+    store = ArtifactStore(artifact_settings)
+    store.apply_batch(
+        _batch(
+            "meeting-parent-initial",
+            [
+                _event(
+                    "conversation",
+                    "meeting-parent-conversation",
+                    "Conversation",
+                    occurred_at="2026-01-02T09:00:00Z",
+                ),
+                _event(
+                    "meeting",
+                    "meeting-with-parent",
+                    "Review meeting",
+                    occurred_at="2026-01-02T09:05:00Z",
+                    parent=("conversation", "meeting-parent-conversation"),
+                ),
+            ],
+        )
+    )
+    candidate = next(
+        item
+        for item in list_pending_distillations(artifact_settings, limit=10)
+        if item.entity == "meeting"
+    )
+    relative = Path("References/Meetings/Inactive Parent.md")
+    note = artifact_settings.memory_root / relative
+    note.parent.mkdir(parents=True)
+    note.write_text(
+        _meeting_note(candidate, candidate.artifact_uri),
+        encoding="utf-8",
+    )
+
+    store.apply_batch(
+        _batch(
+            f"meeting-parent-{operation}",
+            [
+                _event(
+                    "conversation",
+                    "meeting-parent-conversation",
+                    "",
+                    occurred_at="2026-01-02T10:00:00Z",
+                    operation=operation,
+                )
+            ],
+        )
+    )
+
+    assert candidate.artifact_id not in {
+        item.artifact_id
+        for item in list_pending_distillations(artifact_settings, limit=10)
+    }
+    with pytest.raises(ValueError, match="current distillation candidate"):
+        mark_distilled(
+            artifact_settings,
+            artifact_uri=candidate.artifact_uri,
+            memory_id="mem-inactive-parent",
+            memory_source_id="core",
+            memory_path=relative.as_posix(),
+            event_id=candidate.latest_event_id,
+            source_digest=candidate.source_digest,
+        )
+
+
 def test_valid_meeting_note_can_mark_the_current_source_distilled(
     artifact_settings: Settings,
 ) -> None:
@@ -304,6 +384,117 @@ def test_note_validation_rejects_transcript_like_content_and_missing_evidence(
         )
 
 
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "### TrAnScRiPt",
+        "## **Transcript**",
+        "## __Transcript__:",
+        "## `Transcript`",
+    ],
+)
+def test_note_validation_rejects_a_short_transcript_section(
+    artifact_settings: Settings,
+    heading: str,
+) -> None:
+    candidate = _pending_meeting(artifact_settings)
+    relative = Path("References/Meetings/Short Transcript Section.md")
+    path = artifact_settings.memory_root / relative
+    path.parent.mkdir(parents=True)
+    cue_uri = artifact_uri(
+        "transcript-cue",
+        artifact_id("chat-source", "workspace", "transcript-cue", "cue-1"),
+    )
+    note = _meeting_note(candidate, cue_uri).replace(
+        "## Evidence",
+        f"{heading}\n\nPerson: One short turn.\n\n## Evidence",
+    )
+    path.write_text(note, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Transcript section"):
+        mark_distilled(
+            artifact_settings,
+            artifact_uri=candidate.artifact_uri,
+            memory_id="mem-review-meeting",
+            memory_source_id="core",
+            memory_path=relative.as_posix(),
+            event_id=candidate.latest_event_id,
+            source_digest=candidate.source_digest,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "old", "new"),
+    [
+        ("type", "type: memory", "type: note"),
+        ("title", "title: Review Meeting", "title: ''"),
+        ("root_scope", "root_scope: work", "root_scope: ''"),
+        ("primary_scope", "  kind: reference", "  kind: project"),
+        (
+            "primary_scope",
+            "  id: artifact:{artifact_id}",
+            "  id: artifact:art_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        ("status", "status: active", "status: draft"),
+        ("created", "created: 2026-01-02", "created: not-a-date"),
+        ("updated", "updated: 2026-01-02", "updated: not-a-date"),
+        (
+            "artifact_kind",
+            "artifact_kind: meeting",
+            "artifact_kind: conversation",
+        ),
+        ("related", "related: []", "related: {}"),
+        (
+            "provenance",
+            "  - source: artifact-store",
+            "  - source: other-store",
+        ),
+        (
+            "provenance",
+            "    reference: {artifact_uri}",
+            "    reference: artifact://meeting/art_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        (
+            "provenance",
+            "    verified: 2026-01-02",
+            "    verified: not-a-date",
+        ),
+    ],
+)
+def test_note_validation_rejects_invalid_required_frontmatter(
+    artifact_settings: Settings,
+    field: str,
+    old: str,
+    new: str,
+) -> None:
+    candidate = _pending_meeting(artifact_settings)
+    relative = Path(f"References/Meetings/Invalid {field}.md")
+    path = artifact_settings.memory_root / relative
+    path.parent.mkdir(parents=True)
+    cue_uri = artifact_uri(
+        "transcript-cue",
+        artifact_id("chat-source", "workspace", "transcript-cue", "cue-1"),
+    )
+    note = _meeting_note(candidate, cue_uri)
+    old_value = old.format(
+        artifact_id=candidate.artifact_id,
+        artifact_uri=candidate.artifact_uri,
+    )
+    assert old_value in note
+    path.write_text(note.replace(old_value, new), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=field):
+        mark_distilled(
+            artifact_settings,
+            artifact_uri=candidate.artifact_uri,
+            memory_id="mem-review-meeting",
+            memory_source_id="core",
+            memory_path=relative.as_posix(),
+            event_id=candidate.latest_event_id,
+            source_digest=candidate.source_digest,
+        )
+
+
 def test_note_validation_rejects_a_fully_blockquoted_transcript(
     artifact_settings: Settings,
 ) -> None:
@@ -360,6 +551,72 @@ def test_meeting_evidence_link_must_be_inside_the_evidence_section(
     path.write_text(note, encoding="utf-8")
 
     with pytest.raises(ValueError, match="[Ee]vidence"):
+        mark_distilled(
+            artifact_settings,
+            artifact_uri=candidate.artifact_uri,
+            memory_id="mem-review-meeting",
+            memory_source_id="core",
+            memory_path=relative.as_posix(),
+            event_id=candidate.latest_event_id,
+            source_digest=candidate.source_digest,
+        )
+
+
+def test_meeting_evidence_requires_a_quotation_not_only_a_source_link(
+    artifact_settings: Settings,
+) -> None:
+    candidate = _pending_meeting(artifact_settings)
+    cue_uri = artifact_uri(
+        "transcript-cue",
+        artifact_id(
+            "chat-source", "workspace", "transcript-cue", "cue-1"
+        ),
+    )
+    relative = Path("References/Meetings/Link Only Evidence.md")
+    path = artifact_settings.memory_root / relative
+    path.parent.mkdir(parents=True)
+    note = _meeting_note(candidate, cue_uri).replace(
+        '> “Use the green setting for new deployments.”\n>\n',
+        "",
+    )
+    path.write_text(note, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="quoted evidence|quotation"):
+        mark_distilled(
+            artifact_settings,
+            artifact_uri=candidate.artifact_uri,
+            memory_id="mem-review-meeting",
+            memory_source_id="core",
+            memory_path=relative.as_posix(),
+            event_id=candidate.latest_event_id,
+            source_digest=candidate.source_digest,
+        )
+
+
+def test_every_managed_artifact_link_must_be_inside_evidence(
+    artifact_settings: Settings,
+) -> None:
+    candidate = _pending_meeting(artifact_settings)
+    cue_uri = artifact_uri(
+        "transcript-cue",
+        artifact_id(
+            "chat-source", "workspace", "transcript-cue", "cue-1"
+        ),
+    )
+    unrelated_uri = artifact_uri(
+        "message",
+        artifact_id("chat-source", "workspace", "message", "misplaced-link"),
+    )
+    relative = Path("References/Meetings/Extra Misplaced Link.md")
+    path = artifact_settings.memory_root / relative
+    path.parent.mkdir(parents=True)
+    note = _meeting_note(candidate, cue_uri).replace(
+        "- Use the green setting for new deployments.",
+        f"- Use the green setting. [Misplaced source]({unrelated_uri})",
+    )
+    path.write_text(note, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Evidence"):
         mark_distilled(
             artifact_settings,
             artifact_uri=candidate.artifact_uri,
@@ -449,6 +706,25 @@ def test_completion_rejects_case_folded_path_collision(
 ) -> None:
     candidate = _pending_meeting(artifact_settings)
     existing = artifact_settings.memory_root / "References/Meetings/Review.md"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("existing", encoding="utf-8")
+    with pytest.raises(ValueError, match="case"):
+        mark_distilled(
+            artifact_settings,
+            artifact_uri=candidate.artifact_uri,
+            memory_id="mem-review-meeting",
+            memory_source_id="core",
+            memory_path="references/meetings/review.md",
+            event_id=candidate.latest_event_id,
+            source_digest=candidate.source_digest,
+        )
+
+
+def test_completion_rejects_case_folded_uppercase_extension_collision(
+    artifact_settings: Settings,
+) -> None:
+    candidate = _pending_meeting(artifact_settings)
+    existing = artifact_settings.memory_root / "References/Meetings/Review.MD"
     existing.parent.mkdir(parents=True)
     existing.write_text("existing", encoding="utf-8")
     with pytest.raises(ValueError, match="case"):

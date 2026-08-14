@@ -62,6 +62,13 @@ RELATIONSHIP_TERMS = {
     "related",
     "relationship",
 }
+ARTIFACT_PROVIDER_ERRORS = (
+    FileNotFoundError,
+    OSError,
+    RuntimeError,
+    ValueError,
+    sqlite3.DatabaseError,
+)
 
 
 class MemoryService:
@@ -171,7 +178,15 @@ class MemoryService:
                         3,
                     ),
                     "error_type": type(exc).__name__,
-                    "error": str(exc),
+                    **(
+                        {
+                            "error_sha256": hashlib.sha256(
+                                str(exc).encode("utf-8")
+                            ).hexdigest()
+                        }
+                        if artifact_audit_route
+                        else {"error": str(exc)}
+                    ),
                 },
             )
             raise
@@ -280,7 +295,18 @@ class MemoryService:
                 date_from=date_from,
                 date_to=date_to,
             )
-            exact_hit = ArtifactSearch(self.settings).get(query, artifact_scope)
+            try:
+                exact_hit = ArtifactSearch(self.settings).get(query, artifact_scope)
+            except ARTIFACT_PROVIDER_ERRORS:
+                return (
+                    RecallResponse(
+                        status="no_answer",
+                        intent="exact",
+                        query=query,
+                        warnings=["Artifact database is not available."],
+                    ),
+                    {"route": "artifact-unavailable"},
+                )
             packet = merge_artifact_evidence(
                 query,
                 None,
@@ -311,25 +337,40 @@ class MemoryService:
                 date_from=date_from,
                 date_to=date_to,
             )
-            artifact_hits = ArtifactSearch(self.settings).search(
-                query,
-                artifact_scope,
-                limit=max(40, requested_limit * 8),
-            )
-            from .artifacts.vector_index import search_artifact_vectors
-
-            semantic = search_artifact_vectors(
-                self.settings,
-                query,
-                artifact_scope,
-                limit=max(40, requested_limit * 8),
-            )
-            artifact_hits.extend(semantic.hits)
-            if semantic.stale:
-                artifact_semantic_warning = (
-                    "Artifact semantic index is stale. Raw artifact search "
-                    "remains available."
+            try:
+                artifact_hits = ArtifactSearch(self.settings).search(
+                    query,
+                    artifact_scope,
+                    limit=max(40, requested_limit * 8),
                 )
+            except ARTIFACT_PROVIDER_ERRORS:
+                artifact_warning = (
+                    "Artifact database is not available for this filter."
+                    if artifact_filters
+                    else "Artifact database is not available."
+                )
+            else:
+                from .artifacts.vector_index import search_artifact_vectors
+
+                try:
+                    semantic = search_artifact_vectors(
+                        self.settings,
+                        query,
+                        artifact_scope,
+                        limit=max(40, requested_limit * 8),
+                    )
+                except ARTIFACT_PROVIDER_ERRORS:
+                    artifact_semantic_warning = (
+                        "Artifact semantic index is not available. "
+                        "Raw artifact search remains available."
+                    )
+                else:
+                    artifact_hits.extend(semantic.hits)
+                    if semantic.stale:
+                        artifact_semantic_warning = (
+                            "Artifact semantic index is stale. Raw artifact search "
+                            "remains available."
+                        )
         elif artifact_filters and not artifact_available:
             artifact_warning = "Artifact database is not available for this filter."
 
@@ -360,8 +401,13 @@ class MemoryService:
         if use_markdown:
             exact = self.engine.get(self._identity_candidate(query), scope)
             if exact["found"] and not artifact_hits:
+                response = self._exact_response(query, exact["memory"], scope)
+                if artifact_warning:
+                    response.warnings.append(artifact_warning)
+                if artifact_semantic_warning:
+                    response.warnings.append(artifact_semantic_warning)
                 return (
-                    self._exact_response(query, exact["memory"], scope),
+                    response,
                     {
                         "route": "exact",
                         "graphify": self.engine.graph.health(),
@@ -374,13 +420,18 @@ class MemoryService:
                 and self._is_relationship_query(query)
                 and len(mentioned) >= 2
             ):
+                response = self._relationship_response(
+                    query,
+                    mentioned[0],
+                    mentioned[1],
+                    scope,
+                )
+                if artifact_warning:
+                    response.warnings.append(artifact_warning)
+                if artifact_semantic_warning:
+                    response.warnings.append(artifact_semantic_warning)
                 return (
-                    self._relationship_response(
-                        query,
-                        mentioned[0],
-                        mentioned[1],
-                        scope,
-                    ),
+                    response,
                     {
                         "route": "relationship",
                         "mentioned_documents": len(mentioned),
@@ -521,7 +572,7 @@ class MemoryService:
             return False
         try:
             require_current_artifact_schema(self.settings)
-        except (FileNotFoundError, OSError, RuntimeError, sqlite3.DatabaseError):
+        except ARTIFACT_PROVIDER_ERRORS:
             return False
         return True
 

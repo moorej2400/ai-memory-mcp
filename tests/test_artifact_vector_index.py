@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
+import ai_memory_mcp.artifacts.schema as schema_module
 from ai_memory_mcp.artifacts.models import (
     ArtifactBatchManifest,
     ArtifactEvent,
@@ -132,6 +136,22 @@ def test_vector_index_publishes_revisioned_snapshot(
     assert repeated.unchanged is True
 
 
+def test_vector_index_rejects_a_network_filesystem_snapshot(
+    artifact_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _populate(artifact_settings)
+    state_root = artifact_settings.state_dir.resolve()
+    monkeypatch.setattr(
+        schema_module,
+        "_network_filesystem_type",
+        lambda path: "nfs" if path.is_relative_to(state_root) else None,
+    )
+
+    with pytest.raises(ValueError, match="network filesystem"):
+        build_artifact_vector_index(artifact_settings)
+
+
 def test_force_build_preserves_previous_snapshot(
     artifact_settings: Settings,
 ) -> None:
@@ -141,6 +161,26 @@ def test_force_build_preserves_previous_snapshot(
     assert second.snapshot != first.snapshot
     assert Path(first.snapshot).is_file()
     assert Path(second.snapshot).is_file()
+
+
+def test_failed_vector_build_leaves_no_final_looking_snapshot(
+    artifact_settings: Settings,
+    monkeypatch,
+) -> None:
+    _populate(artifact_settings)
+
+    def fail_insert(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("Synthetic vector build failure.")
+
+    monkeypatch.setattr(
+        "ai_memory_mcp.artifacts.vector_index._insert_burst",
+        fail_insert,
+    )
+    with pytest.raises(RuntimeError, match="Synthetic vector build failure"):
+        build_artifact_vector_index(artifact_settings)
+
+    assert list(artifact_settings.state_dir.glob("artifact-index-*.sqlite")) == []
+    assert current_artifact_index_path(artifact_settings) is None
 
 
 def test_vector_query_is_scoped_and_detects_staleness(
@@ -184,6 +224,75 @@ def test_vector_query_is_scoped_and_detects_staleness(
     assert recalled.status == "answered"
     assert recalled.evidence[0].evidence_class == "raw"
     assert any("semantic index is stale" in value for value in recalled.warnings)
+
+
+def test_vector_query_does_not_return_a_burst_across_date_boundaries(
+    artifact_settings: Settings,
+) -> None:
+    long_text = "The bounded retrieval procedure uses exact evidence. " * 5
+    ArtifactStore(artifact_settings).apply_batch(
+        _batch(
+            "vector-date-boundary",
+            [
+                _event(
+                    "conversation",
+                    "conversation-date-boundary",
+                    "Operations",
+                    "2026-01-02T09:55:00Z",
+                ),
+                _event(
+                    "message",
+                    "message-date-first",
+                    long_text,
+                    "2026-01-02T10:00:00Z",
+                    parent=("conversation", "conversation-date-boundary"),
+                ),
+                _event(
+                    "message",
+                    "message-date-second",
+                    long_text,
+                    "2026-01-02T10:05:00Z",
+                    parent=("conversation", "conversation-date-boundary"),
+                ),
+            ],
+        )
+    )
+    build_artifact_vector_index(artifact_settings)
+    before_end = search_artifact_vectors(
+        artifact_settings,
+        "bounded retrieval exact evidence",
+        ArtifactScope(
+            source="chat-source",
+            entities=("message",),
+            date_to=datetime(2026, 1, 2, 10, 2, tzinfo=timezone.utc),
+        ),
+        limit=10,
+    )
+    after_start = search_artifact_vectors(
+        artifact_settings,
+        "bounded retrieval exact evidence",
+        ArtifactScope(
+            source="chat-source",
+            entities=("message",),
+            date_from=datetime(2026, 1, 2, 10, 2, tzinfo=timezone.utc),
+        ),
+        limit=10,
+    )
+    fully_contained = search_artifact_vectors(
+        artifact_settings,
+        "bounded retrieval exact evidence",
+        ArtifactScope(
+            source="chat-source",
+            entities=("message",),
+            date_from=datetime(2026, 1, 2, 9, 59, tzinfo=timezone.utc),
+            date_to=datetime(2026, 1, 2, 10, 6, tzinfo=timezone.utc),
+        ),
+        limit=10,
+    )
+
+    assert before_end.hits == []
+    assert after_start.hits == []
+    assert fully_contained.hits
 
 
 def test_burst_semantic_hit_uses_the_raw_answer_gate(

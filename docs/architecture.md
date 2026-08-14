@@ -113,6 +113,13 @@ The MCP facade gives agents four public tools.
 The facade applies scope rules before retrieval.
 The facade returns source paths and retrieval evidence.
 
+| Tool | Function |
+|---|---|
+| `memory_recall` | Returns cited Markdown and artifact evidence. |
+| `memory_artifact_read` | Returns ordered raw context for one artifact reference. |
+| `memory_sync` | Updates the derived indexes. |
+| `memory_status` | Reports source, index, Graphify, and runtime status. |
+
 ## Query procedure
 
 1. Resolve the optional source and domain scope.
@@ -183,7 +190,8 @@ Examples include unsafe updates, unstable serialization, or insufficient provena
 | Tool | Function |
 |---|---|
 | `memory_recall` | Returns cited evidence and applicable relationships. |
-| `memory_sync` | Updates the derived index from canonical Markdown. |
+| `memory_artifact_read` | Returns ordered raw context for one artifact reference. |
+| `memory_sync` | Updates the derived indexes after canonical Markdown or artifact data changes. |
 | `memory_status` | Reports source, index, Graphify, and runtime status. |
 
 `memory_recall` selects its internal behavior from the query.

@@ -17,7 +17,13 @@ def test_retrieval_audit_records_query_result_and_performance(
     benchmark_settings: Settings,
     tmp_path: Path,
 ) -> None:
-    settings = replace(benchmark_settings, log_dir=tmp_path / "logs")
+    settings = replace(
+        benchmark_settings,
+        log_dir=tmp_path / "logs",
+        artifact_db=tmp_path / "missing-artifacts.sqlite3",
+        artifact_objects_dir=tmp_path / "missing-objects",
+        artifact_backup_dir=tmp_path / "missing-backups",
+    )
     query = "What is the transient authentication retry policy for ALPHA-142?"
     result = MemoryService(settings).recall(query, limit=1)
 

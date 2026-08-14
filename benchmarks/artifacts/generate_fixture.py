@@ -381,7 +381,7 @@ def run_benchmark(
     )
 
     started = time.perf_counter()
-    with Path(generated.path).open(encoding="utf-8") as stream:
+    with Path(generated.path).open("rb") as stream:
         batch = read_artifact_batch(
             stream,
             max_bytes=settings.artifact_batch_max_bytes,

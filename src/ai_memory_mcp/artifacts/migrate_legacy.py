@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
 import yaml
 
@@ -20,12 +20,16 @@ from .identity import artifact_id, canonical_json, sha256_text
 from .ingest import (
     AUTH_QUERY_KEY_TOKENS,
     HTTP_URL_RE,
+    PROTOCOL_RELATIVE_URL_RE,
+    SECRET_ASSIGNMENT_RE,
     SECRET_KEY_TOKENS,
+    _decode_html_url_entities,
     _normalize_security_key,
     _reject_secret_material,
 )
 from .models import (
     ArtifactActor,
+    ArtifactAlias,
     ArtifactBatchManifest,
     ArtifactEvent,
     ArtifactLink,
@@ -37,7 +41,7 @@ from .models import (
     ParsedArtifactBatch,
 )
 from .objects import verify_object
-from .schema import connect_artifact_db
+from .schema import connect_artifact_db, require_local_database_path
 from .store import ArtifactStore
 
 REQUIRED_TABLES = {"conversations", "messages", "attachments", "meetings"}
@@ -137,6 +141,7 @@ def _logical_snapshot(
     *,
     immutable: bool,
 ) -> tuple[sqlite3.Connection, str, tuple[tuple[str, int, int, str], ...]]:
+    path = require_local_database_path(path)
     before = _source_database_fingerprint(path)
     has_wal = Path(f"{path}-wal").is_file()
     # SQLite immutable mode ignores WAL files. Use read-only mode when a WAL exists.
@@ -480,15 +485,6 @@ def plan_legacy_migration(
     ).plan
 
 
-SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?i)\b(?:access[-_]?token|api[-_]?key|authorization|bearer[-_]?token|"
-    r"client[-_]?secret|encrypted[-_]?token|id[-_]?token|password|"
-    r"private[-_]?key|refresh[-_]?token|sas[-_]?token|session[-_]?token|"
-    r"temp(?:orary)?auth|signature|sig|token)"
-    r"\s*([=:])\s*[^\s,;&#]+"
-)
-
-
 def _sanitize_fragment(value: str, *, depth: int) -> str:
     route, marker, query_text = value.partition("?")
     safe_route = _sanitize_text(route, depth=depth + 1)
@@ -512,7 +508,8 @@ def _sanitize_url(value: str, *, depth: int) -> str:
         port = parsed.port
     except ValueError:
         return "[redacted-url]"
-    if parsed.scheme.casefold() not in {"http", "https"}:
+    protocol_relative = not parsed.scheme and bool(parsed.netloc)
+    if parsed.scheme.casefold() not in {"http", "https"} and not protocol_relative:
         return value
     # Rebuild the authority from the host and port so URL userinfo cannot survive.
     if ":" in host and not host.startswith("["):
@@ -537,6 +534,17 @@ def _sanitize_url(value: str, *, depth: int) -> str:
 def _sanitize_text(value: str, *, depth: int = 0) -> str:
     if depth > 8:
         return "[redacted]"
+    try:
+        value = _decode_html_url_entities(value)
+    except ValueError:
+        return "[redacted]"
+    decoded = unquote(value)
+    if decoded != value and (
+        HTTP_URL_RE.search(decoded)
+        or PROTOCOL_RELATIVE_URL_RE.search(decoded)
+        or SECRET_ASSIGNMENT_RE.search(decoded)
+    ):
+        return _sanitize_text(decoded, depth=depth + 1)
 
     def replace_url(match: re.Match[str]) -> str:
         raw = match.group(0)
@@ -545,7 +553,14 @@ def _sanitize_text(value: str, *, depth: int = 0) -> str:
         return f"{_sanitize_url(candidate, depth=depth + 1)}{suffix}"
 
     without_capability_urls = HTTP_URL_RE.sub(replace_url, value)
-    return SECRET_ASSIGNMENT_RE.sub("[redacted]", without_capability_urls)
+    without_capability_urls = PROTOCOL_RELATIVE_URL_RE.sub(
+        replace_url,
+        without_capability_urls,
+    )
+    return SECRET_ASSIGNMENT_RE.sub(
+        r"\g<prefix>\g<indent>[redacted]",
+        without_capability_urls,
+    )
 
 
 def _sanitize(value: Any) -> Any:
@@ -767,6 +782,7 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
 
     for row in data.meetings:
         conversation_id = str(row["conversation_id"])
+        meeting_external_id = _meeting_external_id(row)
         note = data.meeting_mapping.get(conversation_id)
         transcript_external_id = _transcript_external_id(conversation_id)
         links = [
@@ -803,7 +819,7 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
                     "record": "event",
                     "entity": "meeting",
                     "operation": "upsert",
-                    "external_id": conversation_id,
+                    "external_id": meeting_external_id,
                     "parent": {
                         "entity": "conversation",
                         "external_id": conversation_id,
@@ -823,6 +839,12 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
                             else None
                         ),
                         participants=_participants(note),
+                        aliases=[
+                            ArtifactAlias(
+                                kind="conversation-id",
+                                value=conversation_id,
+                            )
+                        ],
                         links=links,
                         source_payload=source_payload,
                     ),
@@ -842,7 +864,7 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
                     "external_id": transcript_external_id,
                     "parent": {
                         "entity": "meeting",
-                        "external_id": conversation_id,
+                        "external_id": meeting_external_id,
                     },
                     "source_version": note.sha256,
                     "source_updated_at": row.get("updated_at"),
@@ -916,6 +938,31 @@ def _attachment_external_id(row: dict[str, Any]) -> str:
         )
     )
     return f"legacy-attachment:{digest}"
+
+
+def _meeting_external_id(row: dict[str, Any]) -> str:
+    conversation_id = str(row["conversation_id"])
+    occurrence = str(
+        row.get("start_time")
+        or row.get("updated_at")
+        or row.get("first_seen_at")
+        or "legacy"
+    )
+    try:
+        parsed = datetime.fromisoformat(occurrence.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        occurrence = (
+            parsed.astimezone(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+    except ValueError:
+        pass
+    return (
+        f"conversation:{quote(conversation_id, safe='')}:"
+        f"{quote(occurrence, safe='')}"
+    )
 
 
 def _transcript_external_id(conversation_id: str) -> str:
@@ -994,6 +1041,7 @@ def _verify_import(
     expected_by_entity: Counter[str] = Counter()
     expected_by_parent: Counter[tuple[str, str]] = Counter()
     expected_object_links = 0
+    expected_aliases: set[tuple[str, str, str]] = set()
     for event in events:
         value = artifact_id(
             data.plan.source,
@@ -1012,6 +1060,11 @@ def _verify_import(
             expected_by_parent[(event.entity, parent_value)] += 1
         expected_rows.append((value, event.entity, parent_value))
         expected_by_entity[event.entity] += 1
+        if isinstance(event.payload, ArtifactPayload):
+            expected_aliases.update(
+                (value, alias.kind, alias.value)
+                for alias in event.payload.aliases
+            )
         if (
             isinstance(event.payload, ArtifactPayload)
             and event.payload.object is not None
@@ -1075,6 +1128,17 @@ def _verify_import(
                 "JOIN artifact_objects AS object ON object.sha256 = link.sha256"
             )
         )
+        actual_aliases = {
+            (str(row[0]), str(row[1]), str(row[2]))
+            for row in connection.execute(
+                "SELECT alias.artifact_id, alias.alias_kind, alias.alias_value "
+                "FROM expected_legacy_artifacts AS expected "
+                "JOIN artifact_aliases AS alias "
+                "ON alias.artifact_id = expected.artifact_id "
+                "WHERE alias.source = ? AND alias.source_instance = ?",
+                (data.plan.source, data.plan.source_instance),
+            )
+        }
 
     if actual_by_entity != expected_by_entity:
         raise RuntimeError("Legacy migration entity counts do not match.")
@@ -1082,6 +1146,8 @@ def _verify_import(
         raise RuntimeError("Legacy migration parent counts do not match.")
     if len(object_rows) != expected_object_links:
         raise RuntimeError("Legacy migration object counts do not match.")
+    if actual_aliases != expected_aliases:
+        raise RuntimeError("Legacy migration alias rows do not match.")
     verified_hashes: set[str] = set()
     for row in object_rows:
         digest = str(row[0])
@@ -1094,6 +1160,7 @@ def _verify_import(
         "children_by_parent": len(actual_by_parent),
         "object_links": len(object_rows),
         "object_hashes": len(verified_hashes),
+        "aliases": len(actual_aliases),
         "unresolved_identities": data.plan.unresolved_identities,
     }
 
@@ -1151,9 +1218,15 @@ def run_legacy_migration(
     if prior is not None:
         if prior[0] != input_sha256:
             raise RuntimeError("The legacy migration batch identity has a conflict.")
-        _verify_import(settings, data, events)
+        verification = _verify_import(settings, data, events)
         if not _source_files_unchanged(database, data):
             raise RuntimeError("A legacy migration source changed during import.")
+        _record_migration_evidence(
+            settings,
+            batch_id,
+            data,
+            verification,
+        )
         return LegacyMigrationReceipt(
             **data.plan.model_dump(),
             batch_id=batch_id,
@@ -1182,6 +1255,28 @@ def run_legacy_migration(
     verification = _verify_import(settings, data, events)
     if not _source_files_unchanged(database, data):
         raise RuntimeError("A legacy migration source changed during import.")
+    _record_migration_evidence(
+        settings,
+        batch_id,
+        data,
+        verification,
+    )
+    return LegacyMigrationReceipt(
+        **data.plan.model_dump(),
+        batch_id=batch_id,
+        accepted_events=receipt.accepted,
+        unchanged_events=receipt.unchanged,
+        source_files_changed=0,
+        verified=True,
+    )
+
+
+def _record_migration_evidence(
+    settings: Settings,
+    batch_id: str,
+    data: LegacyData,
+    verification: dict[str, Any],
+) -> None:
     evidence = canonical_json(
         {
             "database_sha256": data.plan.database_sha256,
@@ -1199,15 +1294,8 @@ def run_legacy_migration(
     )
     with connect_artifact_db(settings.artifact_db) as connection:
         connection.execute(
-            "INSERT OR IGNORE INTO artifact_metadata(key, value) VALUES (?, ?)",
+            "INSERT INTO artifact_metadata(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (f"legacy_migration:{batch_id}", evidence),
         )
         connection.commit()
-    return LegacyMigrationReceipt(
-        **data.plan.model_dump(),
-        batch_id=batch_id,
-        accepted_events=receipt.accepted,
-        unchanged_events=receipt.unchanged,
-        source_files_changed=0,
-        verified=True,
-    )

@@ -45,7 +45,7 @@ def test_small_fixture_has_deterministic_counts_digest_and_top_results(
         "transcript-cue": 8,
     }
 
-    with Path(first.path).open(encoding="utf-8") as stream:
+    with Path(first.path).open("rb") as stream:
         receipt = ingest_artifact_batch(
             artifact_settings,
             read_artifact_batch(stream),

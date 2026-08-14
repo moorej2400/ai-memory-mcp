@@ -42,6 +42,9 @@ def test_public_tool_surface_is_small_and_stable(
         == 200
     )
     assert tools["memory_sync"].parameters["properties"] == {}
+    assert "derived indexes" in tools["memory_sync"].description
+    assert "artifact data changes" in tools["memory_sync"].description
+    assert "artifact data changes" in server.instructions
 
 
 def test_tool_call_runs_full_retrieval_internally(
