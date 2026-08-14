@@ -74,18 +74,27 @@ The command archives an installed adapter before it installs a replacement.
 4. Keep this value stable after the first published batch.
 5. Load the printed browser extension path in a supported Chromium browser.
 6. Keep the browser signed in to the required provider services.
-7. Run `opencli doctor`.
+7. Run the doctor command below.
+
+Run provider commands from the provider repository:
+
+```bash
+set -a
+source .env
+set +a
+"$OPENCLI_DIR/node_modules/.bin/tsx" "$OPENCLI_DIR/src/main.ts" doctor
+```
 
 ## Publish and ingest the first batch
 
 1. Create the provider message batch.
 
 ```bash
-opencli teams messages-sync \
-  --db cli-output/teams-sync.sqlite \
+"$OPENCLI_DIR/node_modules/.bin/tsx" "$OPENCLI_DIR/src/main.ts" teams messages-sync \
+  --db "$TEAMS_CLI_SYNC_DB" \
   --since-hours 1 \
-  --artifact-out cli-output/message-batches/ \
-  --source-instance workspace
+  --artifact-out "$TEAMS_CLI_OUTPUT_DIR/message-batches/" \
+  --source-instance "$TEAMS_CLI_SOURCE_INSTANCE"
 ```
 
 2. Ingest each new JSONL file with `ai-memory-artifact ingest`.
@@ -93,10 +102,10 @@ opencli teams messages-sync \
 4. Create the provider transcript batch.
 
 ```bash
-opencli teams transcripts-sync \
-  --db cli-output/teams-sync.sqlite \
-  --artifact-out cli-output/transcript-batches/ \
-  --source-instance workspace
+"$OPENCLI_DIR/node_modules/.bin/tsx" "$OPENCLI_DIR/src/main.ts" teams transcripts-sync \
+  --db "$TEAMS_CLI_SYNC_DB" \
+  --artifact-out "$TEAMS_CLI_OUTPUT_DIR/transcript-batches/" \
+  --source-instance "$TEAMS_CLI_SOURCE_INSTANCE"
 ```
 
 5. Ingest each new transcript JSONL file.

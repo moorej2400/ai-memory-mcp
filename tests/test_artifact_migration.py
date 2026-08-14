@@ -469,6 +469,8 @@ def test_migration_sanitizes_normalized_text_and_uses_source_allowlists(
                     "Open https://redirect.example.invalid/item?next="
                     "%2F%2Ffiles.example.invalid%2Fitem%3F"
                     "api_key%3Dpercent-protocol-marker."
+                    "\nOpen files.example.invalid/item?secret=schemeless-marker."
+                    "\nOpen localhost:8080/item?token=relative-marker."
                 ),
                 (
                     '{"authorId":"actor-a","accessToken":"secret-value",'
@@ -525,6 +527,8 @@ def test_migration_sanitizes_normalized_text_and_uses_source_allowlists(
     assert "protocol-marker" not in serialized
     assert "html-protocol-marker" not in serialized
     assert "percent-protocol-marker" not in serialized
+    assert "schemeless-marker" not in serialized
+    assert "relative-marker" not in serialized
     assert "accessToken" not in serialized
     assert "temporaryDownloadUrl" not in serialized
     for row in payload_rows:

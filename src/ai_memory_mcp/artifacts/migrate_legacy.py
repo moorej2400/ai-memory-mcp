@@ -49,6 +49,11 @@ CUE_RE = re.compile(
     r"^\s*\[?(?P<time>\d{1,2}:\d{2}(?::\d{2})?)\]?\s+"
     r"(?P<speaker>[^:]{1,100}):\s*(?P<text>.*)$"
 )
+URL_QUERY_VALUE_RE = re.compile(
+    r"(?P<delimiter>[?&#])(?P<html>amp;)?(?P<key>[A-Za-z0-9_.-]+)="
+    r"(?P<value>[^&#\s<>\"']*)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -552,7 +557,16 @@ def _sanitize_text(value: str, *, depth: int = 0) -> str:
         suffix = raw[len(candidate) :]
         return f"{_sanitize_url(candidate, depth=depth + 1)}{suffix}"
 
-    without_capability_urls = HTTP_URL_RE.sub(replace_url, value)
+    def replace_query_value(match: re.Match[str]) -> str:
+        key = match.group("key")
+        if _normalize_security_key(key) not in AUTH_QUERY_KEY_TOKENS:
+            return match.group(0)
+        # Legacy text can contain relative or schemeless URLs. Remove both the
+        # secret key and value so the generic intake boundary can accept them.
+        return f'{match.group("delimiter")}redacted=redacted'
+
+    without_capability_urls = URL_QUERY_VALUE_RE.sub(replace_query_value, value)
+    without_capability_urls = HTTP_URL_RE.sub(replace_url, without_capability_urls)
     without_capability_urls = PROTOCOL_RELATIVE_URL_RE.sub(
         replace_url,
         without_capability_urls,
