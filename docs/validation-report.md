@@ -1,6 +1,6 @@
 # Validation Report
 
-Date: 2026-08-13
+Date: 2026-08-14
 
 Status: satisfactory
 
@@ -15,8 +15,7 @@ Status: satisfactory
 
 ## Automated tests
 
-All 359 automated tests passed.
-One platform-specific test was skipped.
+All 369 automated tests passed.
 The tests covered artifact intake, retrieval, distillation, migration, recovery, MCP tools, client merging, and repository privacy.
 All eight provider TypeScript test files passed.
 The provider shell setup test passed.
@@ -35,8 +34,8 @@ All 20 cases passed.
 | No-answer accuracy | 1.000 |
 | Scope leakage | 0.000 |
 | Citation failures | 0.000 |
-| Median latency | 2.60 ms |
-| 95th percentile latency | 4.27 ms |
+| Median latency | 3.21 ms |
+| 95th percentile latency | 6.98 ms |
 
 The frozen contract SHA-256 value is:
 
@@ -49,16 +48,16 @@ The fixture contained 100 conversations, 100,000 messages, 100 meetings, 100 tra
 
 | Metric | Result |
 |---|---:|
-| Batch validation | 8.531 s |
-| SQLite intake | 38.639 s |
-| Active SQLite files | 809,499,920 bytes |
-| Warm FTS median | 1.275 ms |
-| Warm FTS 95th percentile | 1.311 ms |
-| Ordered-read median | 3.521 ms |
-| Ordered-read 95th percentile | 3.825 ms |
-| Burst-index build | 23.252 s |
-| Warm fused-recall median | 194.069 ms |
-| Warm fused-recall 95th percentile | 258.923 ms |
+| Batch validation | 14.736 s |
+| SQLite intake | 51.252 s |
+| Active SQLite files | 809,541,120 bytes |
+| Warm FTS median | 1.373 ms |
+| Warm FTS 95th percentile | 1.682 ms |
+| Ordered-read median | 3.681 ms |
+| Ordered-read 95th percentile | 4.031 ms |
+| Burst-index build | 25.838 s |
+| Warm fused-recall median | 216.326 ms |
+| Warm fused-recall 95th percentile | 301.651 ms |
 
 The burst index contained 18,800 deterministic bursts.
 All 18,800 bursts had hashed vectors.

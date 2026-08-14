@@ -519,11 +519,7 @@ class MemoryService:
         warnings = self._graph_warnings() if markdown_used else []
         if markdown_used and self.engine.provider_warning:
             warnings.append(self.engine.provider_warning)
-        if (
-            packet.answer_status == "no_answer"
-            and evidence
-            and evidence[0].evidence_class in {"raw", "burst"}
-        ):
+        if evidence and evidence[0].evidence_class in {"raw", "burst"}:
             warnings.append(RAW_ARTIFACT_WARNING)
         elif packet.answer_status == "no_answer" and evidence:
             warnings.append(

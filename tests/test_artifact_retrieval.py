@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -12,11 +13,13 @@ from ai_memory_mcp.artifacts.models import (
     ArtifactBatchManifest,
     ArtifactEvent,
     ArtifactPayload,
+    ArtifactSearchHit,
     ParsedArtifactBatch,
 )
 from ai_memory_mcp.artifacts.store import ArtifactStore
 from ai_memory_mcp.config import Settings
 from ai_memory_mcp.embedding import EmbeddingUnavailable
+from ai_memory_mcp.retrieval import merge_artifact_evidence
 from ai_memory_mcp.service import MemoryService
 
 
@@ -87,6 +90,85 @@ def test_exact_raw_phrase_can_answer(artifact_settings: Settings) -> None:
     assert response.status == "answered"
     assert response.evidence[0].evidence_class == "raw"
     assert response.citations[0].path.startswith("artifact://")
+    assert any("Raw artifact" in warning for warning in response.warnings)
+
+
+def test_artifact_producers_receive_independent_fusion_ranks(
+    artifact_settings: Settings,
+) -> None:
+    hits = [
+        ArtifactSearchHit(
+            artifact_id="raw-1",
+            artifact_uri="artifact://message/raw-1",
+            entity="message",
+            source="chat-source",
+            source_instance="workspace",
+            external_id="raw-1",
+            evidence_class="raw",
+            score=1.0,
+        ),
+        ArtifactSearchHit(
+            artifact_id="raw-2",
+            artifact_uri="artifact://message/raw-2",
+            entity="message",
+            source="chat-source",
+            source_instance="workspace",
+            external_id="raw-2",
+            evidence_class="raw",
+            score=0.9,
+        ),
+        ArtifactSearchHit(
+            artifact_id="burst-1",
+            artifact_uri="artifact://message/burst-1",
+            entity="message",
+            source="chat-source",
+            source_instance="workspace",
+            evidence_class="burst",
+            score=1.0,
+        ),
+    ]
+
+    packet = merge_artifact_evidence(
+        "paraphrase query",
+        None,
+        hits,
+        settings=artifact_settings,
+        now=datetime.now(timezone.utc),
+        limit=10,
+    )
+    by_uri = {hit.artifact_uri: hit for hit in packet.results}
+
+    assert by_uri["artifact://message/raw-1"].ranks["artifact-fts"] == 1
+    assert by_uri["artifact://message/raw-2"].ranks["artifact-fts"] == 2
+    assert by_uri["artifact://message/burst-1"].ranks["artifact-vector"] == 1
+    assert packet.plan["retrievers"] == ["artifact-fts", "artifact-vector"]
+
+
+def test_empty_exact_candidate_does_not_answer_from_a_burst(
+    artifact_settings: Settings,
+) -> None:
+    burst = ArtifactSearchHit(
+        artifact_id="burst-1",
+        artifact_uri="artifact://message/burst-1",
+        entity="message",
+        source="chat-source",
+        source_instance="workspace",
+        evidence_class="burst",
+        text="Unrelated content.",
+        score=1.0,
+    )
+
+    packet = merge_artifact_evidence(
+        '""',
+        None,
+        [burst],
+        settings=artifact_settings,
+        now=datetime.now(timezone.utc),
+        limit=10,
+    )
+
+    assert packet.answer_status == "no_answer"
+    assert packet.results[0].reasons == []
 
 
 def test_exact_raw_phrase_after_five_thousand_characters_can_answer(

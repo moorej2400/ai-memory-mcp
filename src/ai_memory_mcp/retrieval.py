@@ -71,7 +71,7 @@ def _raw_exact_reason(query: str, hit: ArtifactSearchHit) -> str | None:
         hit.artifact_id.casefold(),
         hit.artifact_uri.casefold(),
     }
-    if candidate in identifiers:
+    if candidate and candidate in identifiers:
         return "exact identifier"
     searchable = f"{hit.title}\n{hit.text}".casefold()
     if any(phrase.casefold() in searchable for phrase in _quoted_phrases(query)):
@@ -100,7 +100,17 @@ def merge_artifact_evidence(
             hit.ranks.setdefault("distilled", rank)
             combined[hit.memory_id] = hit
 
-    for rank, raw in enumerate(artifact_hits, start=1):
+    producer_ranks = {"artifact-fts": 0, "artifact-vector": 0}
+    for raw in artifact_hits:
+        ranking = (
+            "artifact-fts"
+            if raw.evidence_class == "raw"
+            else "artifact-vector"
+        )
+        # Each producer owns its RRF rank sequence. A shared sequence makes
+        # later producer lists weaker only because the caller concatenated them.
+        producer_ranks[ranking] += 1
+        rank = producer_ranks[ranking]
         reason = _raw_exact_reason(query, raw)
         score = 1.0 / (settings.rrf_k + rank)
         score += min(0.04, raw.score * 0.04)
@@ -127,11 +137,6 @@ def merge_artifact_evidence(
                 else RAW_FRESHNESS_CAP * 0.5 ** (age_days / half_life)
             )
             score += freshness
-        ranking = (
-            "artifact-fts"
-            if raw.evidence_class == "raw"
-            else "artifact-vector"
-        )
         hit = SearchHit(
             memory_id=raw.artifact_id,
             source_id=f"artifact-{raw.source}",
@@ -219,6 +224,11 @@ def merge_artifact_evidence(
     retrievers = list(plan.get("retrievers", []))
     if "artifact-fts" not in retrievers:
         retrievers.append("artifact-fts")
+    if (
+        any(hit.evidence_class == "burst" for hit in artifact_hits)
+        and "artifact-vector" not in retrievers
+    ):
+        retrievers.append("artifact-vector")
     plan["retrievers"] = retrievers
     diagnostics = (
         copy.deepcopy(markdown_packet.diagnostics)
