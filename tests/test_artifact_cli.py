@@ -157,6 +157,12 @@ def test_init_creates_current_artifact_database_and_is_repeatable(
     first = _one_json(capsys)
     assert first["to_version"] == 3
     assert first["applied"] == [1, 2, 3]
+    data_root = tmp_path / "vault" / ".ai-memory"
+    for relative in ("migration", "provider-state"):
+        assert (data_root / relative).is_dir()
+    assert (tmp_path / "backups").is_dir()
+    assert (tmp_path / "state").is_dir()
+    assert (tmp_path / "objects").is_dir()
 
     assert main(["init"]) == 0
     second = _one_json(capsys)

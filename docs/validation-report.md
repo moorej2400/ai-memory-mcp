@@ -1,6 +1,6 @@
 # Validation Report
 
-Date: 2026-08-14
+Date: 2026-08-16
 
 Status: satisfactory
 
@@ -15,8 +15,8 @@ Status: satisfactory
 
 ## Automated tests
 
-All 369 automated tests passed.
-The tests covered artifact intake, retrieval, distillation, migration, recovery, MCP tools, client merging, and repository privacy.
+All 374 automated tests passed.
+The tests covered storage layout, artifact intake, retrieval, distillation, migration, recovery, MCP tools, client merging, and repository privacy.
 All eight provider TypeScript test files passed.
 The provider shell setup test passed.
 The artifact database uses schema version 3.

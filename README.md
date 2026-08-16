@@ -23,6 +23,9 @@ The artifact database never becomes authoritative for an agent summary.
 All retrieval indexes are derived data.
 The system rebuilds each index from its own canonical store.
 
+AI Memory keeps internal data under `AI_MEMORY_WORK_DIR/.ai-memory/`.
+The hidden directory keeps raw data, backups, indexes, state, and logs separate from Markdown notes.
+
 Read the [architecture guide](docs/architecture.md) for the complete design rules.
 
 ## System architecture

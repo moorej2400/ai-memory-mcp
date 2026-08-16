@@ -80,6 +80,7 @@ The setup script creates `.venv` for the MCP server.
 The script creates `.graphify-runtime` for Graphify 0.9.26.
 The script installs the project in editable mode.
 The script creates `.env` if the file does not exist.
+The script creates internal data under `AI_MEMORY_WORK_DIR/.ai-memory/`.
 The script initializes the canonical artifact database.
 The script builds the first derived index.
 The `--install-clients` option configures all supported clients.

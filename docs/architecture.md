@@ -23,6 +23,28 @@ Distilled Markdown never makes the artifact database authoritative for an agent 
 
 A failed refresh does not change either authority.
 
+## Internal data layout
+
+`AI_MEMORY_WORK_DIR` is the single configured root for Markdown and internal data.
+AI Memory stores implementation data in the hidden `.ai-memory` directory.
+
+```text
+AI_MEMORY_WORK_DIR/
+├── <Markdown memory directories>
+└── .ai-memory/
+    ├── raw/
+    │   ├── artifacts.sqlite3
+    │   └── objects/
+    ├── backups/
+    ├── migration/
+    ├── provider-state/
+    ├── indexes/
+    └── logs/
+```
+
+The indexer excludes hidden directories from Markdown discovery.
+Explicit environment overrides remain available for existing and advanced installations.
+
 ## System flow
 
 ```mermaid

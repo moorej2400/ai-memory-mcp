@@ -50,9 +50,8 @@ def _start_command() -> list[str]:
 def _archive(path: Path) -> None:
     if not path.is_file():
         return
-    # Keep launcher backups beside the rest of the Graphify state, which
-    # defaults to ~/.graphify and so matches the PowerShell implementation
-    # unless the state directory has been configured elsewhere.
+    # Keep launcher backups beside the configured Graphify state so every
+    # platform preserves the launcher inside the same AI Memory data tree.
     archive_root = graphify_state_root() / "backups" / "startup"
     archive_root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]

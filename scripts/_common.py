@@ -105,6 +105,19 @@ def graphify_state_root() -> Path:
     configured = os.environ.get("AI_MEMORY_GRAPHIFY_STATE_DIR", "").strip()
     if configured:
         return expand_path(configured)
+    memory_root = (
+        os.environ.get("AI_MEMORY_WORK_DIR", "").strip()
+        or os.environ.get("AI_MEMORY_DIR", "").strip()
+    )
+    if memory_root:
+        return (
+            expand_path(memory_root)
+            / ".ai-memory"
+            / "provider-state"
+            / "graphify"
+        )
+    # Pre-configuration commands keep the legacy fallback until a memory root
+    # exists; configured installations use the vault-local data layout above.
     return Path.home() / ".graphify"
 
 

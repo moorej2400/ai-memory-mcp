@@ -9,6 +9,16 @@ The two stores contain related information, but they do not have the same role.
 The system can rebuild artifact search data from the canonical artifact database.
 The system can rebuild memory search data from canonical Markdown.
 
+## Storage location
+
+The default internal data root is `AI_MEMORY_WORK_DIR/.ai-memory/`.
+The raw database is `.ai-memory/raw/artifacts.sqlite3`.
+The object store is `.ai-memory/raw/objects/`.
+Backups, migration data, provider state, indexes, and logs use adjacent directories.
+
+The hidden directory keeps implementation data outside the visible Markdown structure.
+The active SQLite database must use a filesystem that supports the SQLite locking contract.
+
 ## Raw artifacts
 
 The canonical artifact database stores conversations, messages, meetings, recordings, transcripts, transcript cues, attachments, revisions, and tombstones.

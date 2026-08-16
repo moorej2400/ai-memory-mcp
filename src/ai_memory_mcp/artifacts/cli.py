@@ -309,8 +309,10 @@ def _backup(settings: Settings, args: argparse.Namespace) -> Any:
 
 
 def _init(settings: Settings, args: argparse.Namespace) -> Any:
+    from ..config import initialize_data_layout
     from .schema import migrate_artifact_db
 
+    initialize_data_layout(settings)
     return migrate_artifact_db(settings)
 
 

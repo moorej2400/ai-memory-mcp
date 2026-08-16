@@ -7,19 +7,41 @@ import pytest
 from ai_memory_mcp.config import Settings
 
 
-def test_artifact_paths_follow_the_state_parent(
+def test_internal_paths_follow_the_memory_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state = tmp_path / "state"
-    monkeypatch.setenv("AI_MEMORY_MCP_STATE_DIR", str(state))
-    monkeypatch.delenv("AI_MEMORY_ARTIFACT_DB", raising=False)
-    monkeypatch.delenv("AI_MEMORY_ARTIFACT_OBJECTS_DIR", raising=False)
-    monkeypatch.delenv("AI_MEMORY_ARTIFACT_BACKUP_DIR", raising=False)
+    root = tmp_path / "vault"
+    monkeypatch.setenv("AI_MEMORY_WORK_DIR", str(root))
+    for name in (
+        "AI_MEMORY_MCP_STATE_DIR",
+        "AI_MEMORY_GRAPHIFY_STATE_DIR",
+        "AI_MEMORY_GRAPH_PATH",
+        "AI_MEMORY_LOG_DIR",
+        "AI_MEMORY_ARTIFACT_DB",
+        "AI_MEMORY_ARTIFACT_OBJECTS_DIR",
+        "AI_MEMORY_ARTIFACT_BACKUP_DIR",
+    ):
+        monkeypatch.setenv(name, "")
     settings = Settings.from_env()
-    assert settings.artifact_db == Path.home() / ".ai-memory" / "artifacts.sqlite3"
-    assert settings.artifact_objects_dir == Path.home() / ".ai-memory" / "objects"
-    assert settings.artifact_backup_dir == Path.home() / ".ai-memory" / "backups"
+    data_root = root / ".ai-memory"
+    assert settings.data_root == data_root
+    assert settings.state_dir == data_root / "indexes"
+    assert settings.resolved_log_dir == data_root / "logs"
+    assert settings.artifact_db == data_root / "raw" / "artifacts.sqlite3"
+    assert settings.artifact_objects_dir == data_root / "raw" / "objects"
+    assert settings.artifact_backup_dir == data_root / "backups"
+    assert settings.migration_dir == data_root / "migration"
+    assert settings.provider_state_dir == data_root / "provider-state"
+    assert settings.graph_path == (
+        data_root
+        / "provider-state"
+        / "graphify"
+        / "corpora"
+        / "ai-memory"
+        / "graphify-out"
+        / "graph.json"
+    )
     assert settings.artifact_batch_max_bytes == 268_435_456
 
 

@@ -146,13 +146,17 @@ class Settings:
         _load_dotenv(project_root() / ".env")
         home = _default_home()
         root = _configured_path("AI_MEMORY_WORK_DIR", home / "AI-Memory")
+        data_root = root / ".ai-memory"
         state = _configured_path(
-            "AI_MEMORY_MCP_STATE_DIR", home / ".ai-memory-mcp"
+            "AI_MEMORY_MCP_STATE_DIR", data_root / "indexes"
+        )
+        graphify_state = _configured_path(
+            "AI_MEMORY_GRAPHIFY_STATE_DIR",
+            data_root / "provider-state" / "graphify",
         )
         graph = _configured_path(
             "AI_MEMORY_GRAPH_PATH",
-            home
-            / ".graphify"
+            graphify_state
             / "corpora"
             / "ai-memory"
             / "graphify-out"
@@ -186,7 +190,7 @@ class Settings:
             graph_depth=int(os.getenv("AI_MEMORY_MCP_GRAPH_DEPTH", "2")),
             log_dir=_configured_path(
                 "AI_MEMORY_LOG_DIR",
-                state / "logs",
+                data_root / "logs",
             ),
             audit_logging_enabled=_configured_bool(
                 "AI_MEMORY_AUDIT_LOGGING",
@@ -207,15 +211,15 @@ class Settings:
             embedding_model=os.getenv("AI_MEMORY_MCP_EMBEDDING_MODEL", ""),
             artifact_db=_configured_path(
                 "AI_MEMORY_ARTIFACT_DB",
-                home / ".ai-memory" / "artifacts.sqlite3",
+                data_root / "raw" / "artifacts.sqlite3",
             ),
             artifact_objects_dir=_configured_path(
                 "AI_MEMORY_ARTIFACT_OBJECTS_DIR",
-                home / ".ai-memory" / "objects",
+                data_root / "raw" / "objects",
             ),
             artifact_backup_dir=_configured_path(
                 "AI_MEMORY_ARTIFACT_BACKUP_DIR",
-                home / ".ai-memory" / "backups",
+                data_root / "backups",
             ),
             artifact_batch_max_bytes=artifact_batch_max_bytes,
         )
@@ -231,6 +235,18 @@ class Settings:
     @property
     def resolved_log_dir(self) -> Path:
         return self.log_dir or self.state_dir / "logs"
+
+    @property
+    def data_root(self) -> Path:
+        return self.memory_root / ".ai-memory"
+
+    @property
+    def migration_dir(self) -> Path:
+        return self.data_root / "migration"
+
+    @property
+    def provider_state_dir(self) -> Path:
+        return self.data_root / "provider-state"
 
     @property
     def memory_sources(self) -> tuple[MemorySource, ...]:
@@ -257,3 +273,22 @@ class Settings:
             seen_ids.add(source.source_id)
             seen_roots.add(resolved)
         return sources
+
+
+def initialize_data_layout(settings: Settings) -> None:
+    """Create private implementation directories without creating note folders."""
+    directories = {
+        settings.data_root,
+        settings.artifact_db.parent,
+        settings.artifact_objects_dir,
+        settings.artifact_backup_dir,
+        settings.migration_dir,
+        settings.provider_state_dir,
+        settings.state_dir,
+        settings.resolved_log_dir,
+    }
+    for directory in sorted(directories, key=lambda path: len(path.parts)):
+        directory.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            # The hidden data tree can contain raw external content and logs.
+            directory.chmod(0o700)

@@ -130,12 +130,28 @@ def test_environment_file_does_not_override_explicit_values(
     assert os.environ["AI_MEMORY_SCRIPT_SECOND"] == "from-process"
 
 
-def test_setup_initializes_explicit_artifact_paths(project_root: Path) -> None:
+def test_setup_uses_one_configured_memory_root(project_root: Path) -> None:
     setup = _load("setup", "scripts/setup.py", project_root)
 
-    assert "AI_MEMORY_ARTIFACT_DB=" in setup.ENV_TEMPLATE
-    assert "AI_MEMORY_ARTIFACT_OBJECTS_DIR=" in setup.ENV_TEMPLATE
-    assert "AI_MEMORY_ARTIFACT_BACKUP_DIR=" in setup.ENV_TEMPLATE
+    assert "AI_MEMORY_WORK_DIR=" in setup.ENV_TEMPLATE
+    assert "AI_MEMORY_MCP_STATE_DIR=" not in setup.ENV_TEMPLATE
+    assert "AI_MEMORY_GRAPHIFY_STATE_DIR=" not in setup.ENV_TEMPLATE
+    assert "AI_MEMORY_GRAPH_PATH=" not in setup.ENV_TEMPLATE
+    assert "AI_MEMORY_ARTIFACT_DB=" not in setup.ENV_TEMPLATE
+    assert "AI_MEMORY_ARTIFACT_OBJECTS_DIR=" not in setup.ENV_TEMPLATE
+    assert "AI_MEMORY_ARTIFACT_BACKUP_DIR=" not in setup.ENV_TEMPLATE
+
+
+def test_graphify_state_defaults_inside_memory_root(
+    common, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "vault"
+    monkeypatch.setenv("AI_MEMORY_WORK_DIR", str(root))
+    monkeypatch.setenv("AI_MEMORY_GRAPHIFY_STATE_DIR", "")
+
+    assert common.graphify_state_root() == (
+        root / ".ai-memory" / "provider-state" / "graphify"
+    )
 
 
 def test_setup_uses_the_installed_artifact_initializer(
@@ -306,6 +322,41 @@ def test_refresh_writes_a_transcript_including_the_failure(
     body = transcripts[0].read_text(encoding="utf-8")
     assert "started." in body
     assert "FAILED:" in body
+
+
+def test_refresh_accepts_progress_before_json(project_root: Path) -> None:
+    refresh = _load(
+        "refresh_graph_json",
+        "scripts/graphify/refresh_graph.py",
+        project_root,
+    )
+
+    assert refresh.json_summary(
+        "Fetching files: 100%\n{\n  \"documents\": 12\n}\n"
+    ) == {"documents": 12}
+
+
+def test_graph_health_parser_requires_a_node_count(project_root: Path) -> None:
+    validator = _load(
+        "validate_graph_stats",
+        "scripts/graphify/validate-ai-memory-graph.py",
+        project_root,
+    )
+
+    assert validator.graph_stats_node_count("Nodes: 141\nEdges: 94\n") == 141
+    with pytest.raises(ValueError, match="invalid graph statistics"):
+        validator.graph_stats_node_count("Edges: 94\n")
+
+
+def test_graph_retrieval_eval_has_no_user_specific_default(
+    project_root: Path,
+) -> None:
+    source = (
+        project_root / "scripts" / "graphify" / "run-ai-memory-retrieval-eval.py"
+    ).read_text(encoding="utf-8")
+
+    assert "DEFAULT_CASES" not in source
+    assert "return ()" in source
 
 
 def test_refresh_lock_prevents_a_concurrent_publication(

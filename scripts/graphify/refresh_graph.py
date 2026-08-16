@@ -35,6 +35,21 @@ from _common import (  # noqa: E402
 )
 
 
+def json_summary(output: str) -> dict[str, object]:
+    for offset in range(len(output) - 1, -1, -1):
+        if output[offset] != "{":
+            continue
+        try:
+            value = json.loads(output[offset:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    # Some embedding providers write progress to the merged command stream.
+    # The refresh must accept that prefix but never guess a non-JSON result.
+    raise ScriptError("The command did not end with a JSON object.")
+
+
 @contextlib.contextmanager
 def exclusive_lock(lock_path: Path):
     """Hold an advisory lock so two refreshes cannot publish at once.
@@ -379,7 +394,7 @@ class Refresh:
                 [sys.executable, "-m", "ai_memory_mcp.cli"],
                 "AI Memory index synchronization failed.",
             )
-            index_summary = json.loads(index_output)
+            index_summary = json_summary(index_output)
             self.event(
                 "index-sync-completed",
                 snapshot=index_summary.get("snapshot"),
@@ -406,7 +421,7 @@ class Refresh:
                 ],
                 "AI Memory provider graph build failed.",
             )
-            graph_summary = json.loads(graph_output)
+            graph_summary = json_summary(graph_output)
             self.event(
                 "provider-graph-build-completed",
                 indexSnapshot=graph_summary.get("index_snapshot"),

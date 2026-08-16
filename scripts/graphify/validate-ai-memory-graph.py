@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -49,7 +50,14 @@ def mcp_post(url: str, payload: dict[str, Any], session_id: str | None = None) -
         return parse_sse(body), response.headers.get("Mcp-Session-Id") or session_id
 
 
-def validate_mcp(url: str) -> dict[str, Any]:
+def graph_stats_node_count(text: str) -> int:
+    match = re.search(r"(?m)^Nodes:\s*(\d+)\s*$", text)
+    if not match:
+        raise ValueError("Graphify MCP returned invalid graph statistics.")
+    return int(match.group(1))
+
+
+def validate_mcp(url: str, expected_nodes: int) -> dict[str, Any]:
     init, session_id = mcp_post(url, {
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {
@@ -66,18 +74,35 @@ def validate_mcp(url: str) -> dict[str, Any]:
     required = {"query_graph", "graph_stats"}
     if not required.issubset(tool_names):
         raise ValueError(f"MCP tools missing: {sorted(required - tool_names)}")
+    stats, _ = mcp_post(url, {
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {"name": "graph_stats", "arguments": {}},
+    }, session_id)
+    stats_content = stats.get("result", {}).get("content", [])
+    stats_text = "\n".join(
+        item.get("text", "")
+        for item in stats_content
+        if item.get("type") == "text"
+    )
+    node_count = graph_stats_node_count(stats_text)
+    if node_count < expected_nodes:
+        raise ValueError("Graphify MCP returned fewer nodes than the corpus.")
     # query_ai_memory was a local 0.9.5 extension. The facade now owns corpus
     # scoping, while stock Graphify 0.9.26 remains a provider with query_graph.
     query_tool = "query_ai_memory" if "query_ai_memory" in tool_names else "query_graph"
     query, _ = mcp_post(url, {
-        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-        "params": {"name": query_tool, "arguments": {"question": "Memory Map", "depth": 1}},
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": {"name": query_tool, "arguments": {"question": "memory", "depth": 1}},
     }, session_id)
     content = query.get("result", {}).get("content", [])
     text = "\n".join(item.get("text", "") for item in content if item.get("type") == "text")
-    if "Indexes/Memory Map.md" not in text:
-        raise ValueError(f"MCP AI-Memory retrieval failed: {text[:500]}")
-    return {"toolCount": len(tool_names), "queryPreview": text[:500]}
+    if query.get("result", {}).get("isError") or not text.strip():
+        raise ValueError("Graphify MCP retrieval returned no text.")
+    return {
+        "toolCount": len(tool_names),
+        "nodeCount": node_count,
+        "queryReturnedText": True,
+    }
 
 
 def main() -> int:
@@ -113,7 +138,7 @@ def main() -> int:
             )
         result.update(globalNodes=global_nodes, globalEdges=global_edges, aiMemoryNodes=memory_nodes)
     if args.mcp_url:
-        result["mcp"] = validate_mcp(args.mcp_url)
+        result["mcp"] = validate_mcp(args.mcp_url, corpus_nodes)
 
     serialized = json.dumps(result, indent=2)
     if args.output:

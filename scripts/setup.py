@@ -26,12 +26,6 @@ MINIMUM_PYTHON = (3, 11)
 ENV_TEMPLATE = """AI_MEMORY_WORK_DIR="{memory_root}"
 AI_MEMORY_PRIMARY_SOURCE_ID="core"
 AI_MEMORY_RETRIEVAL_SOURCES="{{}}"
-AI_MEMORY_MCP_STATE_DIR="{home}/.ai-memory-mcp"
-AI_MEMORY_GRAPHIFY_STATE_DIR="{home}/.graphify"
-AI_MEMORY_GRAPH_PATH="{home}/.graphify/corpora/ai-memory/graphify-out/graph.json"
-AI_MEMORY_ARTIFACT_DB="{home}/.ai-memory/artifacts.sqlite3"
-AI_MEMORY_ARTIFACT_OBJECTS_DIR="{home}/.ai-memory/objects"
-AI_MEMORY_ARTIFACT_BACKUP_DIR="{home}/.ai-memory/backups"
 AI_MEMORY_ARTIFACT_BATCH_MAX_BYTES="268435456"
 GRAPHIFY_GLOBAL_MCP_URL="http://127.0.0.1:4324/mcp"
 GRAPHIFY_OPENAI_BASE_URL=""
@@ -174,7 +168,6 @@ def main() -> None:
         env_path.write_text(
             ENV_TEMPLATE.format(
                 memory_root=memory_root.as_posix(),
-                home=Path.home().as_posix(),
             ),
             encoding="utf-8",
             newline="\n",

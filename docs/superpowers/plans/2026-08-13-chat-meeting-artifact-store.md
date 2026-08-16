@@ -508,9 +508,9 @@ Use these environment variables:
 
 | Variable | Default |
 |---|---|
-| `AI_MEMORY_ARTIFACT_DB` | `~/.ai-memory/artifacts.sqlite3` |
-| `AI_MEMORY_ARTIFACT_OBJECTS_DIR` | `~/.ai-memory/objects` |
-| `AI_MEMORY_ARTIFACT_BACKUP_DIR` | `~/.ai-memory/backups` |
+| `AI_MEMORY_ARTIFACT_DB` | `AI_MEMORY_WORK_DIR/.ai-memory/raw/artifacts.sqlite3` |
+| `AI_MEMORY_ARTIFACT_OBJECTS_DIR` | `AI_MEMORY_WORK_DIR/.ai-memory/raw/objects` |
+| `AI_MEMORY_ARTIFACT_BACKUP_DIR` | `AI_MEMORY_WORK_DIR/.ai-memory/backups` |
 | `AI_MEMORY_ARTIFACT_BATCH_MAX_BYTES` | `268435456` |
 
 Expand variables and user-home markers through the existing path helper.
@@ -1878,8 +1878,8 @@ git commit -m "feat: define artifact distillation into Markdown"
 
 - `group_bursts(records) -> list[ArtifactBurst]`
 - `build_artifact_vector_index(settings, force=False) -> ArtifactIndexResult`
-- Derived pointer: `AI_MEMORY_MCP_STATE_DIR/current-artifact-index.json`
-- Derived snapshots: `AI_MEMORY_MCP_STATE_DIR/artifact-index-<timestamp>-<pid>.sqlite`
+- Derived pointer: `AI_MEMORY_WORK_DIR/.ai-memory/indexes/current-artifact-index.json`
+- Derived snapshots: `AI_MEMORY_WORK_DIR/.ai-memory/indexes/artifact-index-<timestamp>-<pid>.sqlite`
 
 - [ ] **Step 1: Write failing burst tests**
 

@@ -4,23 +4,26 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 from networkx.readwrite import json_graph
 
 from graphify.serve import _query_graph_text
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-DEFAULT_CASES = (
-    ("Memory Map", "Indexes/Memory Map.md"),
-    ("durable memory", "Memory Map"),
+from _common import (  # noqa: E402
+    graphify_state_root,
+    load_environment,
+    repository_root,
 )
 
 
 def retrieval_cases() -> tuple[tuple[str, str], ...]:
     raw = os.getenv("GRAPHIFY_MEMORY_RETRIEVAL_EVAL_CASES", "").strip()
     if not raw:
-        return DEFAULT_CASES
+        return ()
     configured = json.loads(raw)
     if not isinstance(configured, list):
         raise ValueError("Retrieval evaluation cases must be a JSON list.")
@@ -39,12 +42,8 @@ def retrieval_cases() -> tuple[tuple[str, str], ...]:
 
 
 def main() -> int:
-    state_root = Path(
-        os.getenv(
-            "AI_MEMORY_GRAPHIFY_STATE_DIR",
-            Path.home() / ".graphify",
-        )
-    ).expanduser()
+    load_environment(repository_root())
+    state_root = graphify_state_root()
     path = state_root / "global-graph.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     try:
@@ -62,13 +61,24 @@ def main() -> int:
     memory_graph = graph.subgraph(memory_nodes).copy()
 
     cases = retrieval_cases()
+    if not cases:
+        # A public installation cannot assume one user-specific note exists.
+        # Use one live label to keep the retrieval gate deterministic and local.
+        labels = sorted(
+            str(attributes.get("label", "")).strip()
+            for _, attributes in memory_graph.nodes(data=True)
+            if str(attributes.get("label", "")).strip()
+        )
+        if not labels:
+            raise ValueError("The AI Memory graph has no searchable labels.")
+        cases = ((labels[0], labels[0]),)
     failures: list[str] = []
-    for question, expected in cases:
+    for index, (question, expected) in enumerate(cases, start=1):
         result = _query_graph_text(
             memory_graph, question, depth=1, token_budget=600
         )
         if expected not in result:
-            failures.append(f"{question!r} did not retrieve {expected!r}")
+            failures.append(f"Retrieval case {index} did not return its marker.")
 
     summary = {
         "cases": len(cases),

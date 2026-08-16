@@ -38,6 +38,7 @@ shell access is available. Resolve configuration in this order:
 10. Use the configured Graphify backend values only for full extraction.
 
 Write new memories only under `AI_MEMORY_WORK_DIR`. Never write to an additional retrieval source.
+Use `AI_MEMORY_WORK_DIR/.ai-memory/` for raw data, backups, indexes, provider state, migration data, and logs.
 
 Before writing, verify that the selected root exists or that creating the narrow required folder is within the user's authorized scope. Do not create an empty taxonomy.
 

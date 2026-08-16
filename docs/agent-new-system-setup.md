@@ -43,6 +43,7 @@ macOS or Linux:
 ```
 
 The setup creates `.env`, installs the application, initializes artifact schema version 3, and registers selected clients.
+The setup stores internal data under `AI_MEMORY_WORK_DIR/.ai-memory/`.
 
 4. Verify the raw artifact database.
 
@@ -72,9 +73,10 @@ The command archives an installed adapter before it installs a replacement.
 
 3. Set `TEAMS_CLI_SOURCE_INSTANCE` in the provider `.env` file.
 4. Keep this value stable after the first published batch.
-5. Load the printed browser extension path in a supported Chromium browser.
-6. Keep the browser signed in to the required provider services.
-7. Run the doctor command below.
+5. Put local provider state under `AI_MEMORY_WORK_DIR/.ai-memory/provider-state/`.
+6. Load the printed browser extension path in a supported Chromium browser.
+7. Keep the browser signed in to the required provider services.
+8. Run the doctor command below.
 
 Run provider commands from the provider repository:
 

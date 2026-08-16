@@ -33,6 +33,7 @@ The default wait limit is 300 seconds.
 
 Put the artifact database and object directory on local storage.
 Do not put the active SQLite database on a network file system.
+The default paths are under `AI_MEMORY_WORK_DIR/.ai-memory/raw/`.
 
 Initialize a new artifact database:
 
@@ -337,7 +338,7 @@ Read these files under `AI_MEMORY_LOG_DIR`:
 - `index.jsonl`
 - `retrieval.jsonl`
 
-The default directory is `AI_MEMORY_MCP_STATE_DIR\logs`.
+The default directory is `AI_MEMORY_WORK_DIR\.ai-memory\logs`.
 The logger moves a full active log to a timestamped local archive.
 
 Graphify refresh events use a separate local directory.
@@ -403,7 +404,7 @@ that `systemctl` exists, because containers and some sessions ship the binary
 without a working user manager. It falls back to the XDG entry in that case.
 
 The installer preserves the previous launcher in a timestamped backup under
-`~/.graphify/backups/startup`.
+`AI_MEMORY_WORK_DIR/.ai-memory/provider-state/graphify/backups/startup`.
 
 ## Check health
 

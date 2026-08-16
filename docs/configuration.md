@@ -24,6 +24,25 @@ Copy `.env.example` when you create the configuration manually.
 | `AI_MEMORY_ARTIFACT_BACKUP_DIR` | Sets the artifact backup directory. |
 | `AI_MEMORY_ARTIFACT_BATCH_MAX_BYTES` | Sets the maximum uncompressed intake batch size. |
 
+`AI_MEMORY_WORK_DIR` also sets the default internal data root.
+The default internal data root is `AI_MEMORY_WORK_DIR/.ai-memory/`.
+
+| Internal path | Default |
+|---|---|
+| Raw artifact database | `.ai-memory/raw/artifacts.sqlite3` |
+| Attachment objects | `.ai-memory/raw/objects/` |
+| Artifact backups | `.ai-memory/backups/` |
+| Migration data | `.ai-memory/migration/` |
+| Provider state | `.ai-memory/provider-state/` |
+| Derived indexes | `.ai-memory/indexes/` |
+| Logs | `.ai-memory/logs/` |
+
+The setup command derives these paths from `AI_MEMORY_WORK_DIR`.
+Do not set individual path variables for a standard installation.
+Use individual path variables only for compatibility or an advanced storage layout.
+An existing `.env` keeps each explicit path override.
+Do not remove an override until you create and verify the applicable migration backup.
+
 Use a JSON object for `AI_MEMORY_RETRIEVAL_SOURCES`:
 
 ```dotenv
@@ -41,6 +60,7 @@ them only to point at a Graphify installed somewhere else.
 The server writes no Markdown files.
 The AI Memory skill writes new records only under `AI_MEMORY_WORK_DIR`.
 The indexer reads all configured sources without changing them.
+The indexer excludes the hidden `.ai-memory` directory.
 
 The default artifact batch limit is 268435456 bytes.
 Set a positive integer when you override this limit.

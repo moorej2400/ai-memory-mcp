@@ -76,6 +76,28 @@ def test_changed_note_rebuilds_only_one_document(
     assert second["added"] == 0
 
 
+def test_index_excludes_internal_data_markdown(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    internal = vault / ".ai-memory" / "migration"
+    internal.mkdir(parents=True)
+    (internal / "legacy.md").write_text(
+        "# This is not a memory record.\n",
+        encoding="utf-8",
+    )
+    settings = Settings(
+        memory_root=vault,
+        state_dir=vault / ".ai-memory" / "indexes",
+        graph_path=vault / ".ai-memory" / "provider-state" / "graph.json",
+        graphify_mcp_url="",
+        embedding_provider="hashed",
+    )
+
+    result = build_index(settings, force=True)
+
+    assert result["documents"] == 0
+    assert result["parse_errors"] == []
+
+
 def test_semantic_vector_is_deterministic() -> None:
     first = semantic_vector("hidden background process", 1024)
     second = semantic_vector("hidden background process", 1024)
