@@ -4,8 +4,10 @@ import copy
 import re
 import sqlite3
 import time
+from collections import defaultdict
 from dataclasses import asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from .artifacts.models import ArtifactSearchHit
@@ -13,6 +15,7 @@ from .artifacts.models import ArtifactSearchHit
 from .config import Settings
 from .embedding import EmbeddingProvider, EmbeddingUnavailable, resolve_provider
 from .graphify import GraphifyAdapter
+from .generation import current_graph_path
 from .index import MemoryIndex, scope_sql
 from .models import EvidencePacket, ScopeFilter, SearchHit
 from .text import cosine_sparse, fts_expression, query_identifiers, tokenize
@@ -92,7 +95,9 @@ def merge_artifact_evidence(
     if not artifact_hits and markdown_packet is not None:
         return markdown_packet
 
+    fusion_started = time.perf_counter()
     combined: dict[str, SearchHit] = {}
+    raw_by_uri: dict[str, ArtifactSearchHit] = {}
     if markdown_packet is not None:
         for rank, original in enumerate(markdown_packet.results, start=1):
             hit = copy.deepcopy(original)
@@ -111,32 +116,8 @@ def merge_artifact_evidence(
         # later producer lists weaker only because the caller concatenated them.
         producer_ranks[ranking] += 1
         rank = producer_ranks[ranking]
-        reason = _raw_exact_reason(query, raw)
         score = 1.0 / (settings.rrf_k + rank)
         score += min(0.04, raw.score * 0.04)
-        if reason is not None:
-            score += 0.20
-        occurred_at = raw.occurred_at
-        occurred = occurred_at
-        if occurred is not None:
-            if occurred.tzinfo is None:
-                occurred = occurred.replace(tzinfo=timezone.utc)
-            age_days = max(
-                0.0,
-                (now - occurred.astimezone(timezone.utc)).total_seconds()
-                / 86400.0,
-            )
-            half_life = (
-                RAW_MEETING_HALF_LIFE_DAYS
-                if raw.entity in {"meeting", "recording", "transcript", "transcript-cue"}
-                else RAW_CHAT_HALF_LIFE_DAYS
-            )
-            freshness = (
-                RAW_FRESHNESS_CAP
-                if reason is not None
-                else RAW_FRESHNESS_CAP * 0.5 ** (age_days / half_life)
-            )
-            score += freshness
         hit = SearchHit(
             memory_id=raw.artifact_id,
             source_id=f"artifact-{raw.source}",
@@ -147,7 +128,7 @@ def merge_artifact_evidence(
             score=score,
             ranks={ranking: rank},
             signals={ranking: raw.score},
-            reasons=[reason] if reason else [],
+            reasons=[],
             evidence_class=raw.evidence_class,
             artifact_uri=raw.artifact_uri,
             source_label=raw.source,
@@ -159,6 +140,11 @@ def merge_artifact_evidence(
             external_id=raw.external_id,
         )
         existing = combined.get(raw.artifact_uri)
+        prior_raw = raw_by_uri.get(raw.artifact_uri)
+        if prior_raw is None or (
+            prior_raw.evidence_class != "raw" and raw.evidence_class == "raw"
+        ):
+            raw_by_uri[raw.artifact_uri] = raw
         if existing is None:
             combined[raw.artifact_uri] = hit
             continue
@@ -166,22 +152,49 @@ def merge_artifact_evidence(
         # the raw record because only it carries the external ID answer gate.
         winner, secondary = (
             (existing, hit)
-            if (
-                bool(existing.reasons),
-                existing.evidence_class == "raw",
-                existing.score,
-            )
-            >= (
-                bool(hit.reasons),
-                hit.evidence_class == "raw",
-                hit.score,
-            )
+            if existing.evidence_class == "raw" or hit.evidence_class != "raw"
             else (hit, existing)
         )
         winner.ranks.update(secondary.ranks)
         winner.signals.update(secondary.signals)
+        # Each producer contributes one independent RRF vote when both
+        # producers point to the same canonical artifact.
+        winner.score += secondary.score
         combined[raw.artifact_uri] = winner
 
+    artifact_fusion_ms = round(
+        (time.perf_counter() - fusion_started) * 1000,
+        3,
+    )
+    rerank_started = time.perf_counter()
+    for uri, raw in raw_by_uri.items():
+        hit = combined[uri]
+        reason = _raw_exact_reason(query, raw)
+        if reason is not None:
+            hit.score += 0.20
+            hit.reasons.append(reason)
+        occurred = raw.occurred_at
+        if occurred is None:
+            continue
+        if occurred.tzinfo is None:
+            occurred = occurred.replace(tzinfo=timezone.utc)
+        age_days = max(
+            0.0,
+            (now - occurred.astimezone(timezone.utc)).total_seconds()
+            / 86400.0,
+        )
+        half_life = (
+            RAW_MEETING_HALF_LIFE_DAYS
+            if raw.entity
+            in {"meeting", "recording", "transcript", "transcript-cue"}
+            else RAW_CHAT_HALF_LIFE_DAYS
+        )
+        freshness = (
+            RAW_FRESHNESS_CAP
+            if reason is not None
+            else RAW_FRESHNESS_CAP * 0.5 ** (age_days / half_life)
+        )
+        hit.score += freshness
     ranked = sorted(
         combined.values(),
         key=lambda hit: (
@@ -241,6 +254,15 @@ def merge_artifact_evidence(
     )
     diagnostics.setdefault("candidate_counts", {})["artifact"] = len(
         artifact_hits
+    )
+    diagnostics.setdefault("provider_latency_ms", {}).update(
+        {
+            "artifact_fusion": artifact_fusion_ms,
+            "artifact_rerank": round(
+                (time.perf_counter() - rerank_started) * 1000,
+                3,
+            ),
+        }
     )
     return EvidencePacket(
         query=query,
@@ -309,10 +331,18 @@ def _row_hit(row: sqlite3.Row, score: float, source: str, rank: int) -> SearchHi
 
 
 class RetrievalEngine:
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        index_path: Path | None = None,
+        graph_path: Path | None = None,
+        generation_id: str | None = None,
+    ):
         self.settings = settings
+        self.generation_id = generation_id
         self.now = lambda: datetime.now(timezone.utc)
-        self.index = MemoryIndex(settings)
+        self.index = MemoryIndex(settings, path=index_path)
         metadata = self.index.metadata()
         self.provider: EmbeddingProvider | None
         try:
@@ -336,7 +366,7 @@ class RetrievalEngine:
                 "Install the provider or run memory_sync to rebuild."
             )
         self.graph = GraphifyAdapter(
-            settings.graph_path,
+            graph_path or current_graph_path(settings),
             primary_source_id=settings.primary_source_id,
             source_ids=tuple(
                 source.source_id for source in settings.retrieval_sources
@@ -358,14 +388,25 @@ class RetrievalEngine:
         with self.index.connection() as connection:
             rows = connection.execute(
                 f"""
-                SELECT c.*, d.identifiers_json, d.updated, d.review_after, bm25(
-                    chunks_fts, 0.0, 4.0, 2.0, 1.0, 7.0
-                ) AS lexical_score
-                FROM chunks_fts f
-                JOIN chunks c ON c.chunk_id = f.chunk_id
-                JOIN documents d USING(memory_id)
-                WHERE chunks_fts MATCH ?
-                {scope_clause}
+                WITH candidates AS (
+                    SELECT c.*, d.identifiers_json, d.updated, d.review_after,
+                           bm25(
+                               chunks_fts, 0.0, 4.0, 2.0, 1.0, 7.0
+                           ) AS lexical_score
+                    FROM chunks_fts f
+                    JOIN chunks c ON c.chunk_id = f.chunk_id
+                    JOIN documents d USING(memory_id)
+                    WHERE chunks_fts MATCH ?
+                    {scope_clause}
+                ), ranked AS (
+                    SELECT *, row_number() OVER (
+                        PARTITION BY memory_id
+                        ORDER BY lexical_score, ordinal, chunk_id
+                    ) AS document_rank
+                    FROM candidates
+                )
+                SELECT * FROM ranked
+                WHERE document_rank = 1
                 ORDER BY lexical_score
                 LIMIT ?
                 """,
@@ -377,15 +418,32 @@ class RetrievalEngine:
         ]
 
     def _semantic(
-        self, query: str, scope: ScopeFilter, limit: int
+        self,
+        query: str,
+        scope: ScopeFilter,
+        limit: int,
+        *,
+        details: dict[str, Any] | None = None,
     ) -> list[SearchHit]:
         if self.provider is None:
             return []
         vector = self.provider.embed(query)
-        scored = [
-            (cosine_sparse(vector, candidate), row)
-            for row, candidate in self.index.all_vectors(scope)
-        ]
+        candidates, backend = self.index.vector_candidates(
+            scope,
+            vector,
+            limit,
+        )
+        if details is not None:
+            details["backend"] = backend
+            details["candidates"] = len(candidates)
+        by_memory: dict[str, tuple[float, Any]] = {}
+        for row, candidate in candidates:
+            score = cosine_sparse(vector, candidate)
+            memory_id = str(row["memory_id"])
+            current = by_memory.get(memory_id)
+            if current is None or score > current[0]:
+                by_memory[memory_id] = (score, row)
+        scored = list(by_memory.values())
         scored.sort(key=lambda item: item[0], reverse=True)
         return [
             _row_hit(row, score, "semantic", rank)
@@ -400,8 +458,27 @@ class RetrievalEngine:
         seeds: list[SearchHit],
         limit: int,
     ) -> list[SearchHit]:
+        allowed_paths = self._scoped_paths(scope)
+        seed_scores: dict[str, float] = defaultdict(float)
+        canonical_paths: dict[str, str] = {}
+        for seed in seeds:
+            key = seed.path.casefold()
+            canonical_paths.setdefault(key, seed.path)
+            for rank in seed.ranks.values():
+                seed_scores[key] += 1.0 / (self.settings.rrf_k + rank)
+        ranked_seeds = [
+            canonical_paths[key]
+            for key in sorted(
+                seed_scores,
+                key=lambda item: (-seed_scores[item], item),
+            )[:20]
+        ]
         ranked_paths = self.graph.rank(
-            query, [seed.path for seed in seeds[:20]], limit=limit
+            query,
+            ranked_seeds,
+            limit=limit,
+            allowed_paths=allowed_paths,
+            max_depth=self.settings.graph_depth,
         )
         if not ranked_paths:
             return []
@@ -432,17 +509,37 @@ class RetrievalEngine:
                 )
         return results
 
+    def _scoped_paths(self, scope: ScopeFilter) -> set[str]:
+        where, parameters = scope_sql(scope)
+        with self.index.connection() as connection:
+            return {
+                str(row[0])
+                for row in connection.execute(
+                    f"SELECT d.path FROM documents d {where}",
+                    parameters,
+                )
+            }
+
+    @staticmethod
+    def _declared_target_keys(value: object) -> set[str]:
+        target = str(value or "").strip()
+        if target.startswith("[[") and target.endswith("]]"):
+            target = target[2:-2]
+        destination, separator, label = target.partition("|")
+        destination = destination.strip().replace("\\", "/")
+        keys = {
+            destination.casefold(),
+            destination.rsplit("/", 1)[-1].removesuffix(".md").casefold(),
+        }
+        if separator and label.strip():
+            keys.add(label.strip().casefold())
+        return {key for key in keys if key}
+
     def _fuse(
         self,
-        query: str,
         rankings: dict[str, list[SearchHit]],
-        limit: int,
     ) -> list[SearchHit]:
         by_memory: dict[str, SearchHit] = {}
-        query_casefold = query.casefold()
-        query_tokens = set(tokenize(query))
-        intent_expansions = _intent_expansions(query_tokens)
-        identifiers = [value.casefold() for value in query_identifiers(query)]
         for source, hits in rankings.items():
             for rank, hit in enumerate(hits, 1):
                 fused = by_memory.get(hit.memory_id)
@@ -463,13 +560,6 @@ class RetrievalEngine:
                 # gets one RRF vote per memory so document length cannot swamp
                 # several independent sources that agree on a shorter note.
                 if source in fused.ranks:
-                    current_text = f"{fused.title} {fused.heading} {fused.text}"
-                    candidate_text = f"{hit.title} {hit.heading} {hit.text}"
-                    current_overlap = len(query_tokens & set(tokenize(current_text)))
-                    candidate_overlap = len(query_tokens & set(tokenize(candidate_text)))
-                    if candidate_overlap > current_overlap:
-                        fused.heading = hit.heading
-                        fused.text = hit.text
                     fused.signals[source] = max(
                         fused.signals.get(source, 0.0), hit.score
                     )
@@ -477,8 +567,20 @@ class RetrievalEngine:
                 fused.score += 1.0 / (self.settings.rrf_k + rank)
                 fused.ranks[source] = rank
                 fused.signals[source] = hit.score
+        return list(by_memory.values())
+
+    def _rerank(
+        self,
+        query: str,
+        hits: list[SearchHit],
+        limit: int,
+    ) -> list[SearchHit]:
+        query_casefold = query.casefold()
+        query_tokens = set(tokenize(query))
+        intent_expansions = _intent_expansions(query_tokens)
+        identifiers = [value.casefold() for value in query_identifiers(query)]
         now = self.now()
-        for hit in by_memory.values():
+        for hit in hits:
             searchable = f"{hit.memory_id} {hit.path} {hit.title} {hit.heading} {hit.text}".casefold()
             title = hit.title.casefold()
             matched_ids = [identifier for identifier in identifiers if identifier in searchable]
@@ -534,17 +636,22 @@ class RetrievalEngine:
                 hit.score -= REVIEW_OVERDUE_PENALTY
                 hit.reasons.append("review overdue")
         ranked = sorted(
-            by_memory.values(),
+            hits,
             key=lambda hit: (hit.score, -min(hit.ranks.values()), hit.title.casefold()),
             reverse=True,
         )
         return ranked[:limit]
 
-    def _expand_context(self, hits: list[SearchHit]) -> None:
+    def _expand_context(
+        self,
+        hits: list[SearchHit],
+        scope: ScopeFilter,
+    ) -> None:
         # One query avoids a database round trip for each fused result.
         chunks_by_memory = self.index.chunks_for_memories(
             [hit.memory_id for hit in hits]
         )
+        allowed_paths = self._scoped_paths(scope)
         for hit in hits:
             chunks = chunks_by_memory.get(hit.memory_id, [])
             selected = next(
@@ -565,7 +672,10 @@ class RetrievalEngine:
             hit.graph_neighbors = [
                 str(item.get("path") or item.get("label"))
                 for item in self.graph.neighbors(
-                    hit.path, depth=self.settings.graph_depth, limit=6
+                    hit.path,
+                    depth=self.settings.graph_depth,
+                    limit=6,
+                    allowed_paths=allowed_paths,
                 )
                 if item.get("path") or item.get("label")
             ]
@@ -593,7 +703,13 @@ class RetrievalEngine:
             3,
         )
         provider_started = time.perf_counter()
-        semantic = self._semantic(query, planned_scope, candidate_limit)
+        semantic_details: dict[str, Any] = {}
+        semantic = self._semantic(
+            query,
+            planned_scope,
+            candidate_limit,
+            details=semantic_details,
+        )
         provider_latency_ms["semantic"] = round(
             (time.perf_counter() - provider_started) * 1000,
             3,
@@ -607,17 +723,21 @@ class RetrievalEngine:
             3,
         )
         provider_started = time.perf_counter()
-        hits = self._fuse(
-            query,
+        fused = self._fuse(
             {"lexical": lexical, "semantic": semantic, "graph": graph},
-            requested_limit,
         )
         provider_latency_ms["fusion"] = round(
             (time.perf_counter() - provider_started) * 1000,
             3,
         )
         provider_started = time.perf_counter()
-        self._expand_context(hits)
+        hits = self._rerank(query, fused, requested_limit)
+        provider_latency_ms["rerank"] = round(
+            (time.perf_counter() - provider_started) * 1000,
+            3,
+        )
+        provider_started = time.perf_counter()
+        self._expand_context(hits, planned_scope)
         provider_latency_ms["context"] = round(
             (time.perf_counter() - provider_started) * 1000,
             3,
@@ -691,6 +811,8 @@ class RetrievalEngine:
                 "provider_latency_ms": provider_latency_ms,
                 "latency_ms": round((time.perf_counter() - started) * 1000, 3),
                 "index_snapshot": self.index.path.name,
+                "generation_id": self.generation_id,
+                "semantic_search": semantic_details,
                 "graphify": self.graph.health(),
             },
         )
@@ -721,6 +843,8 @@ class RetrievalEngine:
         document = self.index.document(identity, scope)
         if not document:
             return {"found": False, "identity": identity, "neighbors": []}
+        selected_scope = scope or ScopeFilter(status="")
+        scoped_identities = self.index.scoped_identities(selected_scope)
         return {
             "found": True,
             "memory": {
@@ -728,9 +852,15 @@ class RetrievalEngine:
                 "path": document["path"],
                 "title": document["title"],
             },
-            "declared_related": document["related"],
+            "declared_related": [
+                value
+                for value in document["related"]
+                if self._declared_target_keys(value) & scoped_identities
+            ],
             "graph_neighbors": self.graph.neighbors(
-                str(document["path"]), depth=max(1, min(depth, 4))
+                str(document["path"]),
+                depth=max(1, min(depth, 4)),
+                allowed_paths=self._scoped_paths(selected_scope),
             ),
         }
 
@@ -751,7 +881,12 @@ class RetrievalEngine:
                     if value is None
                 ],
             }
-        chain = self.graph.path(str(left["path"]), str(right["path"]))
+        selected_scope = scope or ScopeFilter(status="")
+        chain = self.graph.path(
+            str(left["path"]),
+            str(right["path"]),
+            allowed_paths=self._scoped_paths(selected_scope),
+        )
         return {
             "found": bool(chain),
             "source": {"memory_id": left["memory_id"], "path": left["path"]},

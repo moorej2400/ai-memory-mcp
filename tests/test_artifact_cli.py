@@ -99,11 +99,17 @@ def test_ingest_status_search_and_read_write_json_objects(
     assert main(["ingest", "--input", str(batch_path)]) == 0
     receipt = _one_json(capsys)
     assert receipt["accepted"] == 2
+    assert receipt["committed"] is True
+    assert receipt["input_sha256"] == sha256(batch_path.read_bytes()).hexdigest()
+
+    assert main(["ingest", "--input", str(batch_path)]) == 0
+    replay = _one_json(capsys)
+    assert replay == receipt
 
     assert main(["status"]) == 0
     status = _one_json(capsys)
     assert status["available"] is True
-    assert status["schema_version"] == 3
+    assert status["schema_version"] == 4
     assert status["artifacts"] == 2
     assert status["active_artifacts"] == 2
     assert status["batches"] == 1
@@ -155,8 +161,8 @@ def test_init_creates_current_artifact_database_and_is_repeatable(
 
     assert main(["init"]) == 0
     first = _one_json(capsys)
-    assert first["to_version"] == 3
-    assert first["applied"] == [1, 2, 3]
+    assert first["to_version"] == 4
+    assert first["applied"] == [1, 2, 3, 4]
     data_root = tmp_path / "vault" / ".ai-memory"
     for relative in ("migration", "provider-state"):
         assert (data_root / relative).is_dir()
@@ -166,7 +172,7 @@ def test_init_creates_current_artifact_database_and_is_repeatable(
 
     assert main(["init"]) == 0
     second = _one_json(capsys)
-    assert second["to_version"] == 3
+    assert second["to_version"] == 4
     assert second["applied"] == []
 
 

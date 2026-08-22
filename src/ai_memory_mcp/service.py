@@ -5,10 +5,14 @@ import hashlib
 import json
 import platform
 import sqlite3
+import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .artifacts.identity import parse_artifact_uri
 from .artifacts.models import ArtifactReadResponse, ArtifactScope
@@ -21,10 +25,20 @@ from .artifacts.search import ArtifactSearch
 from .audit import append_event, logging_status
 from .config import Settings
 from .graphify import GraphifyAdapter
-from .index import MemoryIndex, build_index, current_index_path
+from .generation import (
+    current_graph_path,
+    generation_health,
+    lease_current_generation,
+    load_current_generation,
+    manifest_component_path,
+)
+from .index import MemoryIndex, current_index_path
 from .models import (
+    ArtifactIndexResult,
     CanonicalMemoryStatus,
     ArtifactDatabaseStatus,
+    ArtifactVectorStatus,
+    GenerationStatus,
     GraphifyRuntimeStatus,
     GraphifyStatus,
     IndexStatus,
@@ -71,16 +85,278 @@ ARTIFACT_PROVIDER_ERRORS = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class RecallGeneration:
+    generation_id: str | None
+    engine: RetrievalEngine | None
+    artifact_search: ArtifactSearch | None
+    artifact_vector_path: Path | None
+    artifact_change_counter: int | None
+    warnings: tuple[str, ...] = ()
+
+
 class MemoryService:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or Settings.from_env()
         self._engine: RetrievalEngine | None = None
+        self._pinned_engine: ContextVar[RetrievalEngine | None] = ContextVar(
+            "ai_memory_pinned_engine",
+            default=None,
+        )
+        self._artifact_schema_verified: Path | None = None
+        self._artifact_schema_lock = threading.Lock()
 
     @property
     def engine(self) -> RetrievalEngine:
+        pinned = self._pinned_engine.get()
+        if pinned is not None:
+            return pinned
         if self._engine is None:
             self._engine = RetrievalEngine(self.settings)
         return self._engine
+
+    @staticmethod
+    def _graph_matches_generation(
+        generation: dict[str, Any],
+        graph_path: Path,
+        graph_health: dict[str, Any],
+    ) -> bool:
+        layers = generation.get("layers")
+        expected = layers.get("graphify") if isinstance(layers, dict) else None
+        if not isinstance(expected, dict):
+            return False
+        digest = hashlib.sha256()
+        try:
+            with graph_path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            return bool(
+                int(expected.get("bytes", -1)) == graph_path.stat().st_size
+                and int(expected.get("corpus_size", -1))
+                == int(graph_health.get("nodes", -2))
+                and int(expected.get("edges", -1))
+                == int(graph_health.get("edges", -2))
+                and str(expected.get("sha256", "")) == digest.hexdigest()
+            )
+        except (OSError, TypeError, ValueError):
+            return False
+
+    def _engine_for_generation(
+        self,
+        generation: dict[str, Any] | None,
+    ) -> RetrievalEngine | None:
+        markdown_path = (
+            manifest_component_path(
+                self.settings,
+                generation,
+                "markdown_snapshot",
+            )
+            if generation is not None
+            else current_index_path(self.settings)
+        )
+        if markdown_path is None:
+            return None
+        generation_id = (
+            str(generation["generation_id"])
+            if generation is not None
+            else None
+        )
+        graph_path = (
+            manifest_component_path(
+                self.settings,
+                generation,
+                "graph_snapshot",
+            )
+            if generation is not None
+            else current_graph_path(self.settings)
+        )
+        if generation is not None and graph_path is None:
+            # A missing generation component must not fall back to a graph from
+            # another generation. The adapter reports this sentinel as absent.
+            graph_path = self.settings.state_dir / ".missing-generation-graph"
+        if graph_path is not None:
+            try:
+                graph_health = GraphifyAdapter(
+                    graph_path,
+                    primary_source_id=self.settings.primary_source_id,
+                    source_ids=tuple(
+                        source.source_id
+                        for source in self.settings.retrieval_sources
+                    ),
+                ).health()
+                if generation is not None and not self._graph_matches_generation(
+                    generation,
+                    graph_path,
+                    graph_health,
+                ):
+                    graph_path = (
+                        self.settings.state_dir / ".missing-generation-graph"
+                    )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                graph_path = self.settings.state_dir / ".missing-generation-graph"
+        if (
+            self._engine is None
+            or self._engine.generation_id != generation_id
+            or self._engine.index.path != markdown_path
+            or self._engine.graph.graph_path != graph_path
+        ):
+            self._engine = RetrievalEngine(
+                self.settings,
+                index_path=markdown_path,
+                graph_path=graph_path,
+                generation_id=generation_id,
+            )
+        try:
+            self._engine.index.metadata()
+        except (OSError, TypeError, ValueError, sqlite3.DatabaseError):
+            return None
+        return self._engine
+
+    @contextmanager
+    def _pin_recall_generation(
+        self,
+        *,
+        artifact_only: bool = False,
+    ) -> Iterator[RecallGeneration]:
+        with lease_current_generation(self.settings) as generation:
+            engine = self._engine_for_generation(generation)
+            token = self._pinned_engine.set(engine)
+            generation_id = (
+                str(generation["generation_id"])
+                if generation is not None
+                else None
+            )
+            artifact_vector_path = (
+                manifest_component_path(
+                    self.settings,
+                    generation,
+                    "artifact_snapshot",
+                )
+                if generation is not None
+                else None
+            )
+            if generation is None and (artifact_only or engine is None):
+                from .artifacts.vector_index import current_artifact_index_path
+
+                artifact_vector_path = current_artifact_index_path(
+                    self.settings
+                )
+            expected_counter = (
+                int(generation["artifact_change_counter"])
+                if generation is not None
+                else None
+            )
+            component_warnings: list[str] = []
+            health = generation_health(self.settings)
+            failure_at = str(health.get("last_failure", {}).get("at") or "")
+            success_at = str(health.get("last_success", {}).get("at") or "")
+            if failure_at and failure_at > success_at:
+                component_warnings.append(
+                    "The latest coordinated refresh failed. Recall uses the "
+                    "previous verified generation."
+                )
+            if generation is None and engine is not None and not artifact_only:
+                component_warnings.append(
+                    "A coordinated retrieval generation is not available. "
+                    "Run memory_sync."
+                )
+            elif generation is not None and engine is None:
+                component_warnings.append(
+                    "The Markdown component is missing from the active generation. "
+                    "Run memory_sync."
+                )
+            elif engine is not None:
+                try:
+                    markdown_stale = engine.index.canonical_stale()
+                except (OSError, TypeError, ValueError, sqlite3.DatabaseError):
+                    markdown_stale = True
+                if markdown_stale:
+                    component_warnings.append(
+                        "Canonical Markdown is newer than the active retrieval "
+                        "generation. Run memory_sync."
+                    )
+            if generation is not None and artifact_vector_path is None:
+                component_warnings.append(
+                    "The artifact semantic component is missing from the active "
+                    "generation. Run memory_sync."
+                )
+            if generation is not None and manifest_component_path(
+                self.settings,
+                generation,
+                "graph_snapshot",
+            ) is None:
+                component_warnings.append(
+                    "The graph component is missing from the active generation. "
+                    "Run memory_sync."
+                )
+            elif (
+                engine is not None
+                and engine.graph.graph_path.name == ".missing-generation-graph"
+            ):
+                component_warnings.append(
+                    "The graph component is unavailable. Scoped lexical and "
+                    "semantic recall remain available."
+                )
+            try:
+                if generation is None and engine is not None and not artifact_only:
+                    yield RecallGeneration(
+                        generation_id=None,
+                        engine=engine,
+                        artifact_search=None,
+                        artifact_vector_path=None,
+                        artifact_change_counter=None,
+                        warnings=tuple(component_warnings),
+                    )
+                    return
+                if not self._artifact_schema_available():
+                    yield RecallGeneration(
+                        generation_id=generation_id,
+                        engine=engine,
+                        artifact_search=None,
+                        artifact_vector_path=artifact_vector_path,
+                        artifact_change_counter=expected_counter,
+                        warnings=tuple(component_warnings),
+                    )
+                    return
+                with connect_artifact_db(
+                    self.settings.artifact_db,
+                    read_only=True,
+                ) as connection:
+                    # The first read starts one SQLite snapshot that remains stable
+                    # for every raw artifact query in this recall.
+                    connection.execute("BEGIN")
+                    row = connection.execute(
+                        "SELECT value FROM artifact_metadata "
+                        "WHERE key = 'change_counter'"
+                    ).fetchone()
+                    current_counter = int(row[0]) if row is not None else -1
+                    if expected_counter is not None and current_counter != expected_counter:
+                        yield RecallGeneration(
+                            generation_id=generation_id,
+                            engine=engine,
+                            artifact_search=None,
+                            artifact_vector_path=artifact_vector_path,
+                            artifact_change_counter=expected_counter,
+                            warnings=(
+                                *component_warnings,
+                                "Artifact data is newer than the active retrieval "
+                                "generation. Run memory_sync.",
+                            ),
+                        )
+                        return
+                    yield RecallGeneration(
+                        generation_id=generation_id,
+                        engine=engine,
+                        artifact_search=ArtifactSearch(
+                            self.settings,
+                            connection=connection,
+                        ),
+                        artifact_vector_path=artifact_vector_path,
+                        artifact_change_counter=current_counter,
+                        warnings=tuple(component_warnings),
+                    )
+            finally:
+                self._pinned_engine.reset(token)
 
     def recall(
         self,
@@ -101,19 +377,20 @@ class MemoryService:
         limit: int | None = None,
     ) -> RecallResponse:
         started = time.perf_counter()
+        # Retrieval telemetry records filter use, not private filter values.
         scope_payload = {
-            "source_id": source_id,
-            "root_scope": root_scope,
-            "repository": repository,
-            "project": project,
-            "ticket": ticket,
-            "status": status,
-            "path_prefix": path_prefix,
-            "source_label": source_label,
-            "source_instance": source_instance,
-            "artifact_kind": artifact_kind,
-            "date_from": date_from,
-            "date_to": date_to,
+            "source_id": source_id is not None,
+            "root_scope": root_scope is not None,
+            "repository": repository is not None,
+            "project": project is not None,
+            "ticket": ticket is not None,
+            "status_nondefault": status != "active",
+            "path_prefix": path_prefix is not None,
+            "source_label": source_label is not None,
+            "source_instance": source_instance is not None,
+            "artifact_kind": artifact_kind is not None,
+            "date_from": date_from is not None,
+            "date_to": date_to is not None,
             "limit": limit,
         }
         artifact_scope_requested = any(
@@ -138,33 +415,33 @@ class MemoryService:
             )
         ) or status != "active"
         artifact_schema_available = self._artifact_schema_available()
-        # Select privacy from the requested route. A failed or empty artifact
-        # search has no returned raw evidence from which to infer this policy.
-        artifact_audit_route = bool(
-            query.strip().startswith("artifact://")
-            or artifact_scope_requested
-            or (
-                not markdown_scope_requested
-                and artifact_schema_available
-            )
-        )
+        # All retrieval telemetry uses one privacy boundary. Markdown queries
+        # and scope values can contain the same private data as raw artifacts.
+        artifact_audit_route = True
         try:
-            response, diagnostics = self._recall(
-                query,
-                source_id=source_id,
-                root_scope=root_scope,
-                repository=repository,
-                project=project,
-                ticket=ticket,
-                status=status,
-                path_prefix=path_prefix,
-                source_label=source_label,
-                source_instance=source_instance,
-                artifact_kind=artifact_kind,
-                date_from=date_from,
-                date_to=date_to,
-                limit=limit,
-            )
+            with self._pin_recall_generation(
+                artifact_only=(
+                    artifact_scope_requested
+                    or query.strip().startswith("artifact://")
+                ),
+            ) as pinned:
+                response, diagnostics = self._recall(
+                    query,
+                    source_id=source_id,
+                    root_scope=root_scope,
+                    repository=repository,
+                    project=project,
+                    ticket=ticket,
+                    status=status,
+                    path_prefix=path_prefix,
+                    source_label=source_label,
+                    source_instance=source_instance,
+                    artifact_kind=artifact_kind,
+                    date_from=date_from,
+                    date_to=date_to,
+                    limit=limit,
+                    pinned=pinned,
+                )
         except Exception as exc:
             append_event(
                 self.settings,
@@ -178,15 +455,9 @@ class MemoryService:
                         3,
                     ),
                     "error_type": type(exc).__name__,
-                    **(
-                        {
-                            "error_sha256": hashlib.sha256(
-                                str(exc).encode("utf-8")
-                            ).hexdigest()
-                        }
-                        if artifact_audit_route
-                        else {"error": str(exc)}
-                    ),
+                    "error_sha256": hashlib.sha256(
+                        str(exc).encode("utf-8")
+                    ).hexdigest(),
                 },
             )
             raise
@@ -229,10 +500,13 @@ class MemoryService:
         date_from: str | datetime | None = None,
         date_to: str | datetime | None = None,
         limit: int | None = None,
+        pinned: RecallGeneration,
     ) -> tuple[RecallResponse, dict[str, Any]]:
         query = query.strip()
         if not query:
             raise ValueError("Query must not be empty.")
+        artifact_latency_ms: dict[str, float] = {}
+        artifact_semantic_details: dict[str, Any] = {}
         requested_limit = max(1, min(limit or self.settings.result_limit, 20))
         scope = ScopeFilter(
             source_id=source_id,
@@ -264,8 +538,8 @@ class MemoryService:
                 path_prefix,
             )
         ) or status != "active"
-        artifact_available = self._artifact_schema_available()
-        index_available = current_index_path(self.settings) is not None
+        artifact_available = pinned.artifact_search is not None
+        index_available = pinned.engine is not None
 
         if artifact_filters and markdown_filters:
             raise ValueError(
@@ -279,14 +553,20 @@ class MemoryService:
                     "Markdown filters cannot be used with an artifact reference."
                 )
             if not artifact_available:
+                warnings = list(pinned.warnings)
+                if not warnings:
+                    warnings.append("Artifact database is not available.")
                 return (
                     RecallResponse(
                         status="no_answer",
                         intent="exact",
                         query=query,
-                        warnings=["Artifact database is not available."],
+                        warnings=warnings,
                     ),
-                    {"route": "artifact-missing"},
+                    {
+                        "route": "artifact-missing",
+                        "generation_id": pinned.generation_id,
+                    },
                 )
             artifact_scope = ArtifactScope(
                 source=source_label,
@@ -296,7 +576,8 @@ class MemoryService:
                 date_to=date_to,
             )
             try:
-                exact_hit = ArtifactSearch(self.settings).get(query, artifact_scope)
+                provider_started = time.perf_counter()
+                exact_hit = pinned.artifact_search.get(query, artifact_scope)
             except ARTIFACT_PROVIDER_ERRORS:
                 return (
                     RecallResponse(
@@ -307,6 +588,10 @@ class MemoryService:
                     ),
                     {"route": "artifact-unavailable"},
                 )
+            artifact_latency_ms["artifact_fts"] = round(
+                (time.perf_counter() - provider_started) * 1000,
+                3,
+            )
             packet = merge_artifact_evidence(
                 query,
                 None,
@@ -323,6 +608,11 @@ class MemoryService:
                 markdown_used=False,
             )
             diagnostics["artifact_searched"] = True
+            diagnostics["generation_id"] = pinned.generation_id
+            diagnostics.setdefault("provider_latency_ms", {}).update(
+                artifact_latency_ms
+            )
+            response.warnings.extend(pinned.warnings)
             return response, diagnostics
 
         artifact_hits = []
@@ -338,7 +628,8 @@ class MemoryService:
                 date_to=date_to,
             )
             try:
-                artifact_hits = ArtifactSearch(self.settings).search(
+                provider_started = time.perf_counter()
+                artifact_hits = pinned.artifact_search.search(
                     query,
                     artifact_scope,
                     limit=max(40, requested_limit * 8),
@@ -350,27 +641,48 @@ class MemoryService:
                     else "Artifact database is not available."
                 )
             else:
+                artifact_latency_ms["artifact_fts"] = round(
+                    (time.perf_counter() - provider_started) * 1000,
+                    3,
+                )
                 from .artifacts.vector_index import search_artifact_vectors
 
-                try:
-                    semantic = search_artifact_vectors(
-                        self.settings,
-                        query,
-                        artifact_scope,
-                        limit=max(40, requested_limit * 8),
-                    )
-                except ARTIFACT_PROVIDER_ERRORS:
+                if pinned.artifact_vector_path is None:
                     artifact_semantic_warning = (
                         "Artifact semantic index is not available. "
                         "Raw artifact search remains available."
                     )
                 else:
-                    artifact_hits.extend(semantic.hits)
-                    if semantic.stale:
-                        artifact_semantic_warning = (
-                            "Artifact semantic index is stale. Raw artifact search "
-                            "remains available."
+                    try:
+                        provider_started = time.perf_counter()
+                        semantic = search_artifact_vectors(
+                            self.settings,
+                            query,
+                            artifact_scope,
+                            limit=max(40, requested_limit * 8),
+                            index_path=pinned.artifact_vector_path,
+                            expected_change_counter=pinned.artifact_change_counter,
                         )
+                    except ARTIFACT_PROVIDER_ERRORS:
+                        artifact_semantic_warning = (
+                            "Artifact semantic index is not available. "
+                            "Raw artifact search remains available."
+                        )
+                    else:
+                        artifact_latency_ms["artifact_vector"] = round(
+                            (time.perf_counter() - provider_started) * 1000,
+                            3,
+                        )
+                        artifact_hits.extend(semantic.hits)
+                        artifact_semantic_details = {
+                            "backend": semantic.backend,
+                            "candidates": semantic.candidate_count,
+                        }
+                        if semantic.stale:
+                            artifact_semantic_warning = (
+                                "Artifact semantic index is stale. Raw artifact search "
+                                "remains available."
+                            )
         elif artifact_filters and not artifact_available:
             artifact_warning = "Artifact database is not available for this filter."
 
@@ -385,6 +697,7 @@ class MemoryService:
                 warnings.append(artifact_warning)
             if artifact_semantic_warning:
                 warnings.append(artifact_semantic_warning)
+            warnings.extend(pinned.warnings)
             return (
                 RecallResponse(
                     status="no_answer",
@@ -395,6 +708,8 @@ class MemoryService:
                 {
                     "route": "no-provider",
                     "artifact_searched": bool(use_artifacts and artifact_available),
+                    "generation_id": pinned.generation_id,
+                    "provider_latency_ms": artifact_latency_ms,
                 },
             )
 
@@ -406,11 +721,13 @@ class MemoryService:
                     response.warnings.append(artifact_warning)
                 if artifact_semantic_warning:
                     response.warnings.append(artifact_semantic_warning)
+                response.warnings.extend(pinned.warnings)
                 return (
                     response,
                     {
                         "route": "exact",
                         "graphify": self.engine.graph.health(),
+                        "generation_id": pinned.generation_id,
                     },
                 )
 
@@ -430,12 +747,14 @@ class MemoryService:
                     response.warnings.append(artifact_warning)
                 if artifact_semantic_warning:
                     response.warnings.append(artifact_semantic_warning)
+                response.warnings.extend(pinned.warnings)
                 return (
                     response,
                     {
                         "route": "relationship",
                         "mentioned_documents": len(mentioned),
                         "graphify": self.engine.graph.health(),
+                        "generation_id": pinned.generation_id,
                     },
                 )
             markdown_packet = self.engine.search(
@@ -464,9 +783,18 @@ class MemoryService:
             response.warnings.append(artifact_warning)
         if artifact_semantic_warning:
             response.warnings.append(artifact_semantic_warning)
+        response.warnings.extend(pinned.warnings)
         diagnostics["artifact_searched"] = bool(
             use_artifacts and artifact_available
         )
+        diagnostics["generation_id"] = pinned.generation_id
+        diagnostics.setdefault("provider_latency_ms", {}).update(
+            artifact_latency_ms
+        )
+        if artifact_semantic_details:
+            diagnostics["artifact_semantic_search"] = (
+                artifact_semantic_details
+            )
         return response, diagnostics
 
     def _packet_response(
@@ -564,12 +892,20 @@ class MemoryService:
         )
 
     def _artifact_schema_available(self) -> bool:
+        if self._artifact_schema_verified == self.settings.artifact_db:
+            return True
         if not self.settings.artifact_db.is_file():
             return False
-        try:
-            require_current_artifact_schema(self.settings)
-        except ARTIFACT_PROVIDER_ERRORS:
-            return False
+        with self._artifact_schema_lock:
+            if self._artifact_schema_verified == self.settings.artifact_db:
+                return True
+            try:
+                require_current_artifact_schema(self.settings)
+            except ARTIFACT_PROVIDER_ERRORS:
+                return False
+            # Schema migrations are explicit. Cache only a successful check so a
+            # database created later in this process can still become available.
+            self._artifact_schema_verified = self.settings.artifact_db
         return True
 
     @staticmethod
@@ -579,115 +915,198 @@ class MemoryService:
         *,
         protect_query: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        payload = response.model_dump(mode="json")
-        raw_paths: set[str] = set()
+        payload: dict[str, Any] = {
+            "status": response.status,
+            "intent": response.intent,
+            "evidence_count": len(response.evidence),
+            "citation_count": len(response.citations),
+            "warning_count": len(response.warnings),
+        }
         sanitized: list[dict[str, Any]] = []
-        contains_raw = False
         for evidence in response.evidence:
-            if evidence.evidence_class == "distilled":
-                sanitized.append(evidence.model_dump(mode="json"))
-                continue
-            contains_raw = True
-            if evidence.artifact_uri:
-                raw_paths.add(evidence.artifact_uri)
             sanitized.append(
                 {
-                    "artifact_uri": evidence.artifact_uri,
                     "evidence_class": evidence.evidence_class,
-                    "source_label": evidence.source_label,
                     "score": evidence.score,
                     "text_sha256": hashlib.sha256(
                         evidence.text.encode("utf-8")
                     ).hexdigest(),
                     "text_characters": len(evidence.text),
+                    "identity_sha256": hashlib.sha256(
+                        str(
+                            evidence.artifact_uri
+                            or evidence.memory_id
+                            or ""
+                        ).encode("utf-8")
+                    ).hexdigest(),
                 }
             )
         payload["evidence"] = sanitized
-        if not contains_raw and not protect_query:
-            return {"query": query}, payload
-        payload.pop("query", None)
         payload["query_sha256"] = hashlib.sha256(query.encode("utf-8")).hexdigest()
         payload["query_characters"] = len(query)
-        payload["citations"] = [
-            ({"artifact_uri": citation.path}
-             if citation.path in raw_paths
-             else citation.model_dump(mode="json"))
-            for citation in response.citations
-        ]
         return MemoryService._audit_query_payload(query, True), payload
 
     @staticmethod
     def _audit_query_payload(query: str, protect: bool) -> dict[str, Any]:
-        if not protect:
-            return {"query": query}
         return {
             "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
             "query_characters": len(query),
         }
 
     def sync(self) -> SyncResponse:
-        from .artifacts.vector_index import build_artifact_vector_index
+        from .generation import refresh_generation
 
-        index_result = None
-        artifact_result = None
-        errors: list[str] = []
         try:
-            indexed = build_index(self.settings, force=False)
-            index_result = SyncIndexResult.model_validate(indexed)
-            self._engine = RetrievalEngine(self.settings)
+            generation = refresh_generation(self.settings)
         except Exception as exc:
-            errors.append(f"Markdown index: {type(exc).__name__}: {exc}")
-        if self.settings.artifact_db.is_file():
-            try:
-                artifact_result = build_artifact_vector_index(self.settings)
-            except Exception as exc:
-                errors.append(
-                    f"Artifact index: {type(exc).__name__}: {exc}"
-                )
+            return SyncResponse(
+                ok=False,
+                errors=[f"Generation: {type(exc).__name__}: {exc}"],
+            )
+        index_result = SyncIndexResult.model_validate(
+            generation.pop("_index_result")
+        )
+        artifact_result = ArtifactIndexResult.model_validate(
+            generation.pop("_artifact_result")
+        )
+        self._engine = RetrievalEngine(self.settings)
+        retention = generation["retention"]
         return SyncResponse(
-            ok=index_result is not None or artifact_result is not None,
+            ok=True,
+            generation_id=str(generation["generation_id"]),
+            graph_snapshot=str(generation["graph_snapshot"]),
             index=index_result,
             artifact_index=artifact_result,
-            errors=errors,
+            retention_removed_files=int(retention["removed_files"]),
+            retention_removed_bytes=int(retention["removed_bytes"]),
         )
 
     def status(self) -> StatusResponse:
-        index_path = current_index_path(self.settings)
+        from .artifacts.vector_index import current_artifact_index_path
+        from .generation import generation_health
+
+        generation = load_current_generation(self.settings)
+        health_state = generation_health(self.settings)
+        last_success = health_state.get("last_success", {})
+        last_failure = health_state.get("last_failure", {})
+        generation_id = (
+            str(generation["generation_id"])
+            if generation is not None
+            else None
+        )
+        last_success_at = (
+            str(last_success.get("at")) if last_success.get("at") else None
+        )
+        last_failure_at = (
+            str(last_failure.get("at")) if last_failure.get("at") else None
+        )
+        layer_health = health_state.get("layers", {})
+        retention_health = last_success.get("retention", {})
+
+        def layer_failure_at(name: str) -> str | None:
+            failure = layer_health.get(name, {}).get("last_failure", {})
+            return str(failure.get("at")) if failure.get("at") else None
+
+        unresolved_failure = bool(
+            last_failure_at
+            and (last_success_at is None or last_failure_at > last_success_at)
+        )
+        index_path = (
+            manifest_component_path(
+                self.settings,
+                generation,
+                "markdown_snapshot",
+            )
+            if generation is not None
+            else current_index_path(self.settings)
+        )
         index_status = IndexStatus(available=False)
         if index_path:
-            index = MemoryIndex(self.settings)
-            metadata = index.metadata()
-            index_status = IndexStatus(
-                available=True,
-                path=str(index.path),
-                schema_version=metadata.get("schema_version"),
-                built_at=metadata.get("built_at"),
-                memory_root=metadata.get("memory_root"),
-                memory_sources=json.loads(
-                    metadata.get("memory_sources", "[]")
-                ),
-                semantic_dimensions=metadata.get("semantic_dimensions"),
-                embedding_provider=metadata.get("embedding_provider"),
-                embedding_model=metadata.get("embedding_model"),
-                documents=metadata.get("documents"),
-                chunks=metadata.get("chunks"),
+            try:
+                index = MemoryIndex(self.settings, path=index_path)
+                metadata = index.metadata()
+                index_status = IndexStatus(
+                    available=True,
+                    stale=generation is None or index.canonical_stale(),
+                    generation_id=generation_id,
+                    path=str(index.path),
+                    schema_version=metadata.get("schema_version"),
+                    built_at=metadata.get("built_at"),
+                    memory_root=metadata.get("memory_root"),
+                    memory_sources=json.loads(
+                        metadata.get("memory_sources", "[]")
+                    ),
+                    semantic_dimensions=metadata.get("semantic_dimensions"),
+                    embedding_provider=metadata.get("embedding_provider"),
+                    embedding_model=metadata.get("embedding_model"),
+                    ann_backend=metadata.get("ann_backend"),
+                    documents=metadata.get("documents"),
+                    chunks=metadata.get("chunks"),
+                    byte_count=index.path.stat().st_size,
+                    age_seconds=max(
+                        0.0,
+                        time.time() - index.path.stat().st_mtime,
+                    ),
+                    last_success_at=last_success_at,
+                    last_failure_at=layer_failure_at("markdown"),
+                )
+            except (OSError, ValueError, TypeError, sqlite3.DatabaseError):
+                index_status = IndexStatus(
+                    available=False,
+                    stale=True,
+                    generation_id=generation_id,
+                    path=str(index_path),
+                    last_success_at=last_success_at,
+                    last_failure_at=layer_failure_at("markdown"),
+                )
+        graph_path = (
+            manifest_component_path(
+                self.settings,
+                generation,
+                "graph_snapshot",
             )
-        graph_health = GraphifyAdapter(
-            self.settings.graph_path,
-            primary_source_id=self.settings.primary_source_id,
-            source_ids=tuple(
-                source.source_id
-                for source in self.settings.retrieval_sources
-            ),
-        ).health()
+            if generation is not None
+            else current_graph_path(self.settings)
+        )
+        if graph_path is None:
+            graph_path = self.settings.state_dir / ".missing-generation-graph"
+        try:
+            graph_health = GraphifyAdapter(
+                graph_path,
+                primary_source_id=self.settings.primary_source_id,
+                source_ids=tuple(
+                    source.source_id
+                    for source in self.settings.retrieval_sources
+                ),
+            ).health()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            graph_health = {
+                "available": False,
+                "path": str(graph_path),
+                "nodes": 0,
+                "edges": 0,
+                "modified_ns": None,
+                "build_mode": None,
+                "index_snapshot": None,
+            }
         graph_age_seconds = (
-            max(0.0, time.time() - self.settings.graph_path.stat().st_mtime)
-            if self.settings.graph_path.exists()
+            max(0.0, time.time() - graph_path.stat().st_mtime)
+            if graph_path.exists()
             else None
         )
         graph_index_snapshot = graph_health.get("index_snapshot")
+        graph_content_matches = bool(
+            generation is not None
+            and self._graph_matches_generation(
+                generation,
+                graph_path,
+                graph_health,
+            )
+        )
         graph_stale = bool(
-            index_path
+            generation is not None
+            and not graph_content_matches
+            or index_path
             and (
                 (
                     graph_index_snapshot
@@ -695,16 +1114,115 @@ class MemoryService:
                 )
                 or (
                     not graph_index_snapshot
-                    and self.settings.graph_path.exists()
-                    and self.settings.graph_path.stat().st_mtime_ns
+                    and graph_path.exists()
+                    and graph_path.stat().st_mtime_ns
                     < index_path.stat().st_mtime_ns
                 )
             )
         )
         mcp_version = importlib.metadata.version("mcp")
         artifact_status = self._artifact_status()
+        artifact_vector_path = (
+            manifest_component_path(
+                self.settings,
+                generation,
+                "artifact_snapshot",
+            )
+            if generation is not None
+            else current_artifact_index_path(self.settings)
+        )
+        artifact_vector_status = ArtifactVectorStatus(
+            available=False,
+            stale=True,
+            generation_id=generation_id,
+            path=str(artifact_vector_path) if artifact_vector_path else None,
+            last_success_at=last_success_at,
+            last_failure_at=layer_failure_at("artifact-vector"),
+        )
+        if artifact_vector_path is not None:
+            try:
+                with sqlite3.connect(
+                    f"file:{artifact_vector_path.resolve().as_posix()}?mode=ro",
+                    uri=True,
+                ) as connection:
+                    integrity = str(
+                        connection.execute("PRAGMA quick_check").fetchone()[0]
+                    )
+                    if integrity != "ok":
+                        raise sqlite3.DatabaseError(
+                            "The artifact vector index failed quick-check."
+                        )
+                    metadata = {
+                        str(key): str(value)
+                        for key, value in connection.execute(
+                            "SELECT key, value FROM metadata"
+                        )
+                    }
+                vector_counter = int(
+                    metadata.get("artifact_change_counter", "-1")
+                )
+                vector_stale = bool(
+                    generation is None
+                    or vector_counter != artifact_status.change_counter
+                    or vector_counter
+                    != int(generation["artifact_change_counter"])
+                )
+                artifact_vector_status = ArtifactVectorStatus(
+                    available=True,
+                    stale=vector_stale,
+                    generation_id=generation_id,
+                    path=str(artifact_vector_path),
+                    change_counter=vector_counter,
+                    bursts=int(metadata.get("bursts", "0")),
+                    embedded_bursts=int(
+                        metadata.get("embedded_bursts", "0")
+                    ),
+                    ann_backend=metadata.get("ann_backend"),
+                    byte_count=artifact_vector_path.stat().st_size,
+                    age_seconds=max(
+                        0.0,
+                        time.time() - artifact_vector_path.stat().st_mtime,
+                    ),
+                    last_success_at=last_success_at,
+                    last_failure_at=layer_failure_at("artifact-vector"),
+                )
+            except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+                pass
+        generation_consistent = bool(
+            generation is not None
+            and index_status.available
+            and not index_status.stale
+            and artifact_status.available
+            and artifact_vector_status.available
+            and not artifact_vector_status.stale
+            and graph_health["available"]
+            and not graph_stale
+            and not unresolved_failure
+        )
+        published_at = (
+            str(generation.get("published_at"))
+            if generation is not None
+            else None
+        )
+        generation_age = None
+        if published_at:
+            try:
+                generation_age = max(
+                    0.0,
+                    (
+                        datetime.now(timezone.utc)
+                        - datetime.fromisoformat(
+                            published_at.replace("Z", "+00:00")
+                        )
+                    ).total_seconds(),
+                )
+            except ValueError:
+                generation_consistent = False
         return StatusResponse(
-            ok=index_status.available or artifact_status.available,
+            ok=(
+                generation_consistent
+                and self.settings.memory_root.is_dir()
+            ),
             canonical_memory_root=CanonicalMemoryStatus(
                 source_id=self.settings.primary_source_id,
                 path=str(self.settings.memory_root),
@@ -724,6 +1242,7 @@ class MemoryService:
             ],
             index=index_status,
             artifact_database=artifact_status,
+            artifact_vector=artifact_vector_status,
             graphify=GraphifyStatus(
                 available=bool(graph_health["available"]),
                 stale=graph_stale,
@@ -734,8 +1253,40 @@ class MemoryService:
                 age_seconds=graph_age_seconds,
                 build_mode=graph_health.get("build_mode"),
                 index_snapshot=graph_index_snapshot,
+                generation_id=generation_id,
+                last_success_at=last_success_at,
+                last_failure_at=layer_failure_at("graphify"),
                 provider_role="internal-graph-signal",
                 runtime=self._graphify_runtime(),
+            ),
+            generation=GenerationStatus(
+                available=generation is not None,
+                consistent=generation_consistent,
+                generation_id=generation_id,
+                published_at=published_at,
+                manifest_path=(
+                    str(generation.get("manifest_path"))
+                    if generation is not None
+                    else None
+                ),
+                age_seconds=generation_age,
+                last_success_at=last_success_at,
+                last_failure_at=last_failure_at,
+                last_failure_layer=(
+                    str(last_failure.get("layer"))
+                    if last_failure.get("layer")
+                    else None
+                ),
+                storage_bytes=int(last_success.get("storage_bytes", 0)),
+                storage_growth_bytes=int(
+                    last_success.get("storage_growth_bytes", 0)
+                ),
+                verified_generations=int(
+                    retention_health.get("verified_generations", 0)
+                ),
+                last_good_available=bool(
+                    retention_health.get("last_good_available", False)
+                ),
             ),
             logging=LoggingStatus.model_validate(
                 logging_status(self.settings)
@@ -785,11 +1336,15 @@ class MemoryService:
                     "SELECT 1 FROM sqlite_master "
                     "WHERE type = 'table' AND name = 'artifacts_fts'"
                 ).fetchone() is not None
+                last_batch_at = connection.execute(
+                    "SELECT MAX(completed_at) FROM artifact_batches "
+                    "WHERE status = 'ok'"
+                ).fetchone()[0]
         except Exception as exc:
             return ArtifactDatabaseStatus(
                 available=False,
                 path=str(path),
-                integrity=f"{type(exc).__name__}: {exc}",
+                integrity=type(exc).__name__,
             )
         return ArtifactDatabaseStatus(
             available=health.integrity == "ok",
@@ -801,6 +1356,9 @@ class MemoryService:
             batches=batches,
             fts_available=fts_available,
             pending_distillations=pending,
+            change_counter=health.change_counter,
+            byte_count=health.byte_count,
+            last_success_at=last_batch_at,
         )
 
     @staticmethod

@@ -547,7 +547,7 @@ git commit -m "feat: define artifact identity and configuration"
 
 **Interfaces:**
 
-- `ARTIFACT_SCHEMA_VERSION = 3`
+- `ARTIFACT_SCHEMA_VERSION = 4`
 - `connect_artifact_db(path, *, read_only=False) -> sqlite3.Connection`
 - `migrate_artifact_db(settings) -> MigrationResult`
 - `artifact_database_status(settings) -> ArtifactDatabaseStatus`
@@ -560,8 +560,8 @@ Create tests for these behaviors:
 def test_migration_creates_schema_and_fts(artifact_settings: Settings) -> None:
     result = migrate_artifact_db(artifact_settings)
     assert result.from_version == 0
-    assert result.to_version == 3
-    assert result.applied == [1, 2, 3]
+    assert result.to_version == 4
+    assert result.applied == [1, 2, 3, 4]
     with connect_artifact_db(artifact_settings.artifact_db) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
@@ -577,8 +577,8 @@ def test_migration_creates_schema_and_fts(artifact_settings: Settings) -> None:
 def test_repeated_migration_is_a_no_op(artifact_settings: Settings) -> None:
     migrate_artifact_db(artifact_settings)
     result = migrate_artifact_db(artifact_settings)
-    assert result.from_version == 3
-    assert result.to_version == 3
+    assert result.from_version == 4
+    assert result.to_version == 4
     assert result.applied == []
 ```
 
@@ -819,7 +819,13 @@ Read tools must reject an old schema without changing the database.
 All artifact SQLite paths must reject a known network filesystem.
 This rule covers canonical, backup, restore, migration source, and vector snapshot paths.
 
-- [ ] **Step 7: Make migrations recoverable**
+- [ ] **Step 7: Add migration 4**
+
+Migration 4 adds durable dirty-parent tracking for incremental artifact-vector refreshes.
+Artifact changes mark only the affected conversation or transcript root.
+The vector builder clears a marker only after the matching generation is durable.
+
+- [ ] **Step 8: Make migrations recoverable**
 
 Before a non-empty database migration, create a timestamped SQLite backup.
 Use `sqlite3.Connection.backup()`.
@@ -1349,7 +1355,7 @@ The `status` command reports these fields:
 ```json
 {
   "available": true,
-  "schema_version": 3,
+  "schema_version": 4,
   "database_path": "<configured path>",
   "journal_mode": "wal",
   "artifacts": 0,

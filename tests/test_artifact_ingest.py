@@ -155,6 +155,9 @@ def test_replayed_batch_id_returns_stored_receipt(
     first = artifact_store.apply_batch(batch)
     second = artifact_store.apply_batch(batch)
     assert second == first
+    assert first.committed is True
+    assert first.input_sha256 == batch.input_sha256
+    assert second.committed_at == first.committed_at
 
 
 def test_replayed_object_batch_returns_receipt_before_reading_source_again(

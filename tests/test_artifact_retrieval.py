@@ -144,6 +144,38 @@ def test_artifact_producers_receive_independent_fusion_ranks(
     assert packet.plan["retrievers"] == ["artifact-fts", "artifact-vector"]
 
 
+def test_artifact_producer_agreement_adds_both_fusion_votes(
+    artifact_settings: Settings,
+) -> None:
+    common = {
+        "artifact_id": "shared-1",
+        "artifact_uri": "artifact://message/shared-1",
+        "entity": "message",
+        "source": "chat-source",
+        "source_instance": "workspace",
+        "score": 1.0,
+    }
+    raw = ArtifactSearchHit(
+        **common,
+        external_id="shared-1",
+        evidence_class="raw",
+    )
+    burst = ArtifactSearchHit(**common, evidence_class="burst")
+
+    packet = merge_artifact_evidence(
+        "paraphrase query",
+        None,
+        [raw, burst],
+        settings=artifact_settings,
+        now=datetime.now(timezone.utc),
+        limit=10,
+    )
+
+    hit = packet.results[0]
+    assert hit.ranks == {"artifact-fts": 1, "artifact-vector": 1}
+    assert hit.score >= (2.0 / (artifact_settings.rrf_k + 1))
+
+
 def test_empty_exact_candidate_does_not_answer_from_a_burst(
     artifact_settings: Settings,
 ) -> None:
@@ -370,6 +402,8 @@ def test_markdown_recall_survives_raw_artifact_search_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ArtifactStore(benchmark_settings).apply_batch(_raw_batch())
+    service = MemoryService(benchmark_settings)
+    assert service.sync().ok is True
 
     def fail_raw_search(*_: object, **__: object) -> None:
         raise sqlite3.DatabaseError("synthetic FTS failure")
@@ -378,8 +412,6 @@ def test_markdown_recall_survives_raw_artifact_search_failure(
         "ai_memory_mcp.service.ArtifactSearch.search",
         fail_raw_search,
     )
-    service = MemoryService(benchmark_settings)
-
     markdown = service.recall("ALPHA-142", limit=1)
     artifact = service.recall("ALPHA-142", source_label="chat-source", limit=1)
 
@@ -435,9 +467,8 @@ def test_raw_audit_log_contains_digests_instead_of_text(
     assert sensitive_marker not in serialized
     raw = record["response"]["evidence"][0]
     assert set(raw) == {
-        "artifact_uri",
         "evidence_class",
-        "source_label",
+        "identity_sha256",
         "score",
         "text_sha256",
         "text_characters",
@@ -508,7 +539,7 @@ def test_status_and_ordered_read_include_artifact_state(
     service = MemoryService(artifact_settings)
     status = service.status()
     assert status.artifact_database.available is True
-    assert status.artifact_database.schema_version == 3
+    assert status.artifact_database.schema_version == 4
     assert status.artifact_database.artifacts == 1
 
     reference = artifact_uri(

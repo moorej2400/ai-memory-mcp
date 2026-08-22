@@ -4,8 +4,9 @@ import base64
 import json
 import re
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Iterator, Literal
 
 from ai_memory_mcp.config import Settings
 from ai_memory_mcp.text import fts_expression, tokenize
@@ -108,9 +109,26 @@ def _utc_iso(value: datetime) -> str:
 class ArtifactSearch:
     """Search and read canonical raw artifacts without using Markdown state."""
 
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ):
         self.settings = settings
+        self._external_connection = connection
         require_current_artifact_schema(settings)
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        if self._external_connection is not None:
+            yield self._external_connection
+            return
+        with connect_artifact_db(
+            self.settings.artifact_db,
+            read_only=True,
+        ) as connection:
+            yield connection
 
     def search(
         self,
@@ -152,10 +170,7 @@ class ArtifactSearch:
             parameters.append(_utc_iso(selected_scope.date_to))
         parameters.append(limit)
 
-        with connect_artifact_db(
-            self.settings.artifact_db,
-            read_only=True,
-        ) as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 f"""
                 SELECT a.*, bm25(
@@ -206,10 +221,7 @@ class ArtifactSearch:
         if selected_scope.date_to is not None:
             conditions.append("occurred_at <= ?")
             parameters.append(_utc_iso(selected_scope.date_to))
-        with connect_artifact_db(
-            self.settings.artifact_db,
-            read_only=True,
-        ) as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM artifacts WHERE " + " AND ".join(conditions),
                 parameters,
@@ -263,10 +275,7 @@ class ArtifactSearch:
             raise ValueError("The artifact read limit must be positive.")
         limit = min(limit, 200)
         entity, artifact_value = parse_artifact_uri(reference)
-        with connect_artifact_db(
-            self.settings.artifact_db,
-            read_only=True,
-        ) as connection:
+        with self._connection() as connection:
             focus = connection.execute(
                 f"""
                 SELECT * FROM artifacts

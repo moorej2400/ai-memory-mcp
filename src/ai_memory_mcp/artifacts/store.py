@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from ai_memory_mcp.config import Settings
+from ai_memory_mcp.audit import append_event
 
 from .context import active_context_rows
 from .identity import artifact_id, canonical_json, event_id, sha256_text
@@ -106,6 +108,63 @@ class ArtifactStore:
         migrate_artifact_db(settings)
 
     def apply_batch(self, batch: ParsedArtifactBatch) -> ArtifactIngestReceipt:
+        started = time.perf_counter()
+        before_bytes = (
+            self.settings.artifact_db.stat().st_size
+            if self.settings.artifact_db.is_file()
+            else 0
+        )
+        try:
+            receipt = self._apply_batch(batch)
+        except BaseException as exc:
+            append_event(
+                self.settings,
+                "artifact-intake",
+                "artifact_intake_failed",
+                {
+                    "batch_id": batch.manifest.batch_id,
+                    "input_sha256": batch.input_sha256,
+                    "event_count": batch.manifest.event_count,
+                    "elapsed_ms": round(
+                        (time.perf_counter() - started) * 1000,
+                        3,
+                    ),
+                    "error_type": type(exc).__name__,
+                    "error_sha256": hashlib.sha256(
+                        str(exc).encode("utf-8")
+                    ).hexdigest(),
+                },
+            )
+            raise
+        after_bytes = self.settings.artifact_db.stat().st_size
+        append_event(
+            self.settings,
+            "artifact-intake",
+            "artifact_intake_completed",
+            {
+                "batch_id": receipt.batch_id,
+                "input_sha256": receipt.input_sha256,
+                "committed_at": receipt.committed_at.isoformat(),
+                "event_count": batch.manifest.event_count,
+                "accepted": receipt.accepted,
+                "unchanged": receipt.unchanged,
+                "stale": receipt.stale,
+                "conflicts": receipt.conflicts,
+                "tombstones": receipt.tombstones,
+                "redactions": receipt.redactions,
+                "artifacts_changed": receipt.artifacts_changed,
+                "active_artifacts": self.count(),
+                "storage_bytes": after_bytes,
+                "storage_growth_bytes": after_bytes - before_bytes,
+                "elapsed_ms": round(
+                    (time.perf_counter() - started) * 1000,
+                    3,
+                ),
+            },
+        )
+        return receipt
+
+    def _apply_batch(self, batch: ParsedArtifactBatch) -> ArtifactIngestReceipt:
         replayed = self._replayed_batch_receipt(batch)
         if replayed is not None:
             return replayed
@@ -319,6 +378,8 @@ class ArtifactStore:
 
         return ArtifactIngestReceipt(
             batch_id=manifest.batch_id,
+            input_sha256=batch.input_sha256,
+            committed_at=completed_at,
             artifacts_changed=changed,
             **counters,
         )
@@ -1899,6 +1960,8 @@ class ArtifactStore:
     def _receipt_from_batch(row: sqlite3.Row) -> ArtifactIngestReceipt:
         return ArtifactIngestReceipt(
             batch_id=str(row["batch_id"]),
+            input_sha256=str(row["input_sha256"]),
+            committed_at=str(row["completed_at"]),
             accepted=int(row["accepted_events"]),
             unchanged=int(row["unchanged_events"]),
             stale=int(row["stale_events"]),

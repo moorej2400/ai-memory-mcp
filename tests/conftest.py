@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from ai_memory_mcp.config import Settings
+from ai_memory_mcp.artifacts.schema import migrate_artifact_db
 from ai_memory_mcp.index import build_index
 
 
@@ -34,6 +35,7 @@ def benchmark_settings(project_root: Path) -> Settings:
             benchmark / "runs" / f"pytest-backups-{stamp}"
         ),
     )
+    migrate_artifact_db(settings)
     build_index(settings, force=True)
     return settings
 

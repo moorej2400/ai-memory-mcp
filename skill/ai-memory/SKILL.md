@@ -21,6 +21,14 @@ Read [architecture.md](../../docs/architecture.md) when changing the retrieval s
 - Never permanently delete memory or skill content. Preserve prior truth through `superseded`, `archived`, or recoverable trash only when the user explicitly requests removal.
 - Keep memory writes and Graphify indexing as separate verified outcomes.
 
+## Dedicated AI Memory MCP Routing
+
+When a user asks to save, remember, update, or retrieve AI memory, treat the dedicated **AI Memory MCP** as the canonical system. Use its `memory_recall`, `memory_sync`, and `memory_status` tools together with the configured `AI_MEMORY_WORK_DIR`.
+
+- Do not substitute a Codex internal note, session artifact, or `.codex/memories` extension for a user-requested AI Memory MCP write.
+- Write canonical Markdown only under `AI_MEMORY_WORK_DIR`; then call `memory_sync` and report a sync failure separately from the successful canonical save.
+- If the MCP is unavailable, report that limitation instead of silently saving the requested memory somewhere else.
+
 ## Load Configuration
 
 Read `.env` at the repository root (two directories above this `SKILL.md`) when
@@ -67,7 +75,7 @@ Run this workflow at meaningful checkpoints and before the final response of sub
 7. **Find the links.** Before you write, identify the existing notes that give context. Use the step 4 recall results.
 8. **Write a small verified batch.** Apply concise Markdown changes that meet the note content rules. Preserve identity, provenance, links, and predecessor state.
 9. **Update navigation surfaces.** Touch only the relevant anchor, map, review queue, conflict, or stale-memory index.
-10. **Refresh once.** After the material batch, run the narrow AI-Memory refresh and verify Graphify health.
+10. **Refresh once.** After the material batch, publish one coordinated generation and verify each layer.
 11. **Report separate outcomes.** State what was written, merged or superseded, and whether indexing succeeded.
 
 An explicit user request to save memory enters at step 1; it does not bypass search, scope, safety, deduplication, or verification.
@@ -235,17 +243,18 @@ When a finding changes how agents should repeatedly perform a workflow, invoke `
 
 Do not duplicate skill-authoring instructions inside ordinary memory notes.
 
-## Refresh Graphify
+## Refresh Derived Retrieval
 
 After one or more material memory writes:
 
-1. Call `memory_sync` after an ordinary Markdown batch.
+1. Call `memory_sync` after a Markdown batch or raw artifact change.
 2. Confirm that synchronization reads all configured sources without writing to them.
-3. Run the Graphify maintenance script only when the Graphify graph must be rebuilt.
-4. Do not run the global or all-corpora extractor for routine memory writes.
-5. Verify the configured Graphify endpoint or query path after the refresh finishes.
-6. Confirm that each configured memory source is registered.
-7. If refresh fails, report `saved, not indexed` and keep all Markdown unchanged.
+3. Confirm that Markdown vectors, artifact vectors, and Graphify use one generation ID.
+4. Run the Graphify maintenance script only for isolated maintenance.
+5. Do not run the global or all-corpora extractor for routine memory writes.
+6. Call `memory_status` and verify every required layer.
+7. Confirm that each configured memory source is registered.
+8. If refresh fails, report `saved, not indexed` and keep all canonical data unchanged.
 
 Pure retrievals, no-op deduplication, and non-material timestamp-only changes do not require refresh.
 

@@ -1,4 +1,4 @@
-"""Small, deterministic retrieval gate for the live AI-Memory corpus."""
+"""Run a bounded gate through the public AI Memory recall pipeline."""
 
 from __future__ import annotations
 
@@ -7,17 +7,13 @@ import os
 import sys
 from pathlib import Path
 
-from networkx.readwrite import json_graph
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from graphify.serve import _query_graph_text
+from ai_memory_mcp.config import Settings  # noqa: E402
+from ai_memory_mcp.service import MemoryService  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from _common import (  # noqa: E402
-    graphify_state_root,
-    load_environment,
-    repository_root,
-)
+from _common import load_environment, repository_root  # noqa: E402
 
 
 def retrieval_cases() -> tuple[tuple[str, str], ...]:
@@ -43,47 +39,37 @@ def retrieval_cases() -> tuple[tuple[str, str], ...]:
 
 def main() -> int:
     load_environment(repository_root())
-    state_root = graphify_state_root()
-    path = state_root / "global-graph.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
-    try:
-        graph = json_graph.node_link_graph(data, edges="links")
-    except TypeError:
-        graph = json_graph.node_link_graph(data)
-    # Graphify 0.9.26 removed the local `repo=` query parameter. Scope the
-    # provider graph before traversal; the MCP facade applies the same boundary
-    # before hybrid ranking.
-    memory_nodes = [
-        node_id
-        for node_id, attributes in graph.nodes(data=True)
-        if attributes.get("repo") == "ai-memory"
-    ]
-    memory_graph = graph.subgraph(memory_nodes).copy()
-
+    settings = Settings.from_env()
+    service = MemoryService(settings)
     cases = retrieval_cases()
     if not cases:
-        # A public installation cannot assume one user-specific note exists.
-        # Use one live label to keep the retrieval gate deterministic and local.
-        labels = sorted(
-            str(attributes.get("label", "")).strip()
-            for _, attributes in memory_graph.nodes(data=True)
-            if str(attributes.get("label", "")).strip()
+        raise ValueError(
+            "Set GRAPHIFY_MEMORY_RETRIEVAL_EVAL_CASES to real questions and "
+            "expected evidence markers."
         )
-        if not labels:
-            raise ValueError("The AI Memory graph has no searchable labels.")
-        cases = ((labels[0], labels[0]),)
     failures: list[str] = []
     for index, (question, expected) in enumerate(cases, start=1):
-        result = _query_graph_text(
-            memory_graph, question, depth=1, token_budget=600
+        response = service.recall(question, limit=5)
+        evidence = json.dumps(
+            {
+                "evidence": [
+                    item.model_dump(mode="json") for item in response.evidence
+                ],
+                "citations": [
+                    item.model_dump(mode="json") for item in response.citations
+                ],
+            }
         )
-        if expected not in result:
+        if response.status != "answered" or expected not in evidence:
             failures.append(f"Retrieval case {index} did not return its marker.")
 
+    status = service.status()
     summary = {
         "cases": len(cases),
         "passed": len(cases) - len(failures),
-        "scopedNodes": memory_graph.number_of_nodes(),
+        "pipeline": "memory_recall",
+        "generationId": status.generation.generation_id,
+        "generationConsistent": status.generation.consistent,
         "failures": failures,
     }
     print(json.dumps(summary, indent=2))

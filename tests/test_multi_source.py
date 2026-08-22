@@ -8,7 +8,10 @@ import sys
 from pathlib import Path
 
 from ai_memory_mcp.config import MemorySource, Settings
-from ai_memory_mcp.index import build_index, current_index_path
+from ai_memory_mcp.graphify import GraphifyAdapter
+from ai_memory_mcp.index import MemoryIndex, build_index, current_index_path
+from ai_memory_mcp.models import ScopeFilter
+from ai_memory_mcp.retrieval import RetrievalEngine
 from ai_memory_mcp.service import MemoryService
 
 
@@ -19,26 +22,21 @@ def _write_memory(
     memory_id: str,
     title: str,
     text: str,
+    related: list[str] | None = None,
 ) -> None:
     path = root / relative
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "\n".join(
-            (
-                "---",
-                f"memory_id: {memory_id}",
-                f"title: {title}",
-                "status: active",
-                "---",
-                "",
-                f"# {title}",
-                "",
-                text,
-                "",
-            )
-        ),
-        encoding="utf-8",
-    )
+    lines = [
+        "---",
+        f"memory_id: {memory_id}",
+        f"title: {title}",
+        "status: active",
+    ]
+    if related:
+        lines.append("related:")
+        lines.extend(f"  - {value}" for value in related)
+    lines.extend(("---", "", f"# {title}", "", text, ""))
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def _tree_digest(root: Path) -> str:
@@ -272,3 +270,210 @@ def test_graphify_extraction_excludes_restricted_directories(
 
     assert '"**/Restricted/**"' in script
     assert '"**/.trash/**"' in script
+
+
+def test_scope_filters_treat_like_metacharacters_as_literals(
+    tmp_path: Path,
+) -> None:
+    core = tmp_path / "core"
+    _write_memory(
+        core,
+        "Repos/a%b/Percent.md",
+        memory_id="mem-percent",
+        title="Percent repository",
+        text="The literal wildcard marker belongs to percent.",
+    )
+    _write_memory(
+        core,
+        "Repos/axb/Other.md",
+        memory_id="mem-other",
+        title="Other repository",
+        text="The literal wildcard marker belongs to another repository.",
+    )
+    _write_memory(
+        core,
+        "Repos/a_b/Underscore.md",
+        memory_id="mem-underscore",
+        title="Underscore repository",
+        text="The literal underscore marker belongs here.",
+    )
+    _write_memory(
+        core,
+        "Repos/acb/Letter.md",
+        memory_id="mem-letter",
+        title="Letter repository",
+        text="The literal underscore marker belongs elsewhere.",
+    )
+    settings = Settings(
+        memory_root=core,
+        state_dir=tmp_path / "state",
+        graph_path=tmp_path / "graph.json",
+        graphify_mcp_url="",
+        embedding_provider="hashed",
+    )
+    build_index(settings, force=True)
+    service = MemoryService(settings)
+
+    percent = service.recall(
+        "literal wildcard marker",
+        repository="a%b",
+        limit=10,
+    )
+    underscore = service.recall(
+        "literal underscore marker",
+        repository="a_b",
+        limit=10,
+    )
+
+    assert {item.memory_id for item in percent.evidence} == {"mem-percent"}
+    assert {item.memory_id for item in underscore.evidence} == {"mem-underscore"}
+
+
+def test_exact_document_lookup_treats_like_metacharacters_as_literals(
+    benchmark_settings: Settings,
+) -> None:
+    build_index(benchmark_settings, force=True)
+    index = MemoryIndex(benchmark_settings)
+
+    assert index.document("%") is None
+    assert index.document("_") is None
+
+
+def test_graph_traversal_cannot_cross_a_scoped_source(tmp_path: Path) -> None:
+    core = tmp_path / "core"
+    archive = tmp_path / "archive"
+    _write_memory(
+        core,
+        "Notes/A.md",
+        memory_id="mem-core-a",
+        title="Core A",
+        text="First scoped graph endpoint.",
+        related=["[[Archive bridge]]"],
+    )
+    _write_memory(
+        core,
+        "Notes/B.md",
+        memory_id="mem-core-b",
+        title="Core B",
+        text="Second scoped graph endpoint.",
+    )
+    _write_memory(
+        archive,
+        "Notes/Bridge.md",
+        memory_id="mem-archive-bridge",
+        title="Archive bridge",
+        text="This document must not bridge scoped traversal.",
+    )
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {
+                        "id": "a",
+                        "label": "Core A",
+                        "source_file": "core/Notes/A.md",
+                    },
+                    {
+                        "id": "bridge",
+                        "label": "Archive bridge",
+                        "source_file": "archive/Notes/Bridge.md",
+                    },
+                    {
+                        "id": "b",
+                        "label": "Core B",
+                        "source_file": "core/Notes/B.md",
+                    },
+                ],
+                "links": [
+                    {"source": "a", "target": "bridge"},
+                    {"source": "bridge", "target": "b"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = Settings(
+        memory_root=core,
+        state_dir=tmp_path / "state",
+        graph_path=graph_path,
+        graphify_mcp_url="",
+        retrieval_sources=(
+            MemorySource(source_id="archive", root=archive),
+        ),
+        embedding_provider="hashed",
+    )
+    build_index(settings, force=True)
+    engine = RetrievalEngine(settings)
+    scope = ScopeFilter(source_id="core", status="active")
+
+    neighbors = engine.neighbors("mem-core-a", depth=4, scope=scope)
+    relationship_path = engine.path("mem-core-a", "mem-core-b", scope=scope)
+
+    assert neighbors["graph_neighbors"] == []
+    assert neighbors["declared_related"] == []
+    assert relationship_path["found"] is False
+    assert relationship_path["path"] == []
+
+
+def test_weighted_multi_hop_decay_applies_once_per_edge(tmp_path: Path) -> None:
+    graph_path = tmp_path / "weighted-graph.json"
+    graph_path.write_text(
+        json.dumps(
+            {
+                "graph": {},
+                "nodes": [
+                    {"id": "a", "label": "A", "source_file": "core/A.md"},
+                    {"id": "x", "label": "Scope node"},
+                    {"id": "b", "label": "B", "source_file": "core/B.md"},
+                    {"id": "c", "label": "C", "source_file": "core/C.md"},
+                ],
+                "links": [
+                    {"source": "a", "target": "x", "confidence": "high"},
+                    {"source": "x", "target": "b", "confidence": "high"},
+                    {"source": "a", "target": "c", "confidence": "low"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    adapter = GraphifyAdapter(graph_path, source_ids=("core",))
+
+    ranked = adapter.rank("", ["core/A.md"], limit=4, max_depth=2)
+
+    assert ranked.index("core/B.md") < ranked.index("core/C.md")
+
+
+def test_weighted_traversal_replaces_a_weaker_path_found_first(
+    tmp_path: Path,
+) -> None:
+    graph_path = tmp_path / "weighted-relaxation.json"
+    graph_path.write_text(
+        json.dumps(
+            {
+                "graph": {},
+                "nodes": [
+                    {"id": "a", "label": "A", "source_file": "core/A.md"},
+                    {"id": "x", "label": "X"},
+                    {"id": "y", "label": "Y"},
+                    {"id": "u", "label": "U"},
+                    {"id": "z", "label": "Z", "source_file": "core/Z.md"},
+                    {"id": "w", "label": "W", "source_file": "core/W.md"},
+                ],
+                "links": [
+                    {"source": "a", "target": "x", "confidence": "low"},
+                    {"source": "a", "target": "y", "confidence": "high"},
+                    {"source": "y", "target": "x", "confidence": "high"},
+                    {"source": "x", "target": "z", "confidence": "high"},
+                    {"source": "a", "target": "u", "confidence": "high"},
+                    {"source": "u", "target": "w", "confidence": "low"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    adapter = GraphifyAdapter(graph_path, source_ids=("core",))
+
+    ranked = adapter.rank("", ["core/A.md"], limit=6, max_depth=3)
+
+    assert ranked.index("core/Z.md") < ranked.index("core/W.md")

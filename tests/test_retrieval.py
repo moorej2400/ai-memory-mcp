@@ -5,8 +5,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from ai_memory_mcp.benchmark import _benchmark_settings, verify_contract
+from ai_memory_mcp.benchmark import (
+    _benchmark_settings,
+    run_benchmark,
+    verify_contract,
+)
 from ai_memory_mcp.config import Settings
+from ai_memory_mcp.index import build_index
+from ai_memory_mcp.models import ScopeFilter
+from ai_memory_mcp.retrieval import RetrievalEngine
 from ai_memory_mcp.service import MemoryService
 
 
@@ -24,6 +31,24 @@ def test_frozen_benchmark_uses_isolated_artifact_paths(tmp_path: Path) -> None:
     assert settings.artifact_db == state_dir / "artifacts.sqlite3"
     assert settings.artifact_objects_dir == state_dir / "artifact-objects"
     assert settings.artifact_backup_dir == state_dir / "artifact-backups"
+
+
+def test_frozen_benchmark_exercises_the_recall_pipeline(
+    tmp_path: Path,
+) -> None:
+    report = run_benchmark("pytest", output_root=tmp_path)
+    metrics = report["metrics"]
+
+    assert metrics["pass_rate"] == 1.0
+    assert metrics["recall_at_5"] == 1.0
+    assert metrics["mrr"] == 1.0
+    assert metrics["no_answer_accuracy"] == 1.0
+    assert metrics["scope_leakage_rate"] == 0.0
+    assert metrics["citation_failure_rate"] == 0.0
+    assert metrics["document_diversity_at_5"] == 1.0
+    assert metrics["stale_layer_behavior"] is True
+    assert "rerank" in metrics["per_layer_latency_ms"]
+    assert metrics["generation_id"]
 
 
 def test_all_frozen_cases_pass(
@@ -98,7 +123,13 @@ def test_recall_routes_exact_neighbors_and_relationship_path(
     )
     assert relationship.intent == "relationship"
     assert relationship.status == "answered"
-    assert len(relationship.relationships) == 2
+    assert relationship.relationships
+    assert relationship.relationships[0].source_path.endswith(
+        "Repos/demo/Tickets/DEMO-777/_ticket.md"
+    )
+    assert relationship.relationships[-1].target_path.endswith(
+        "Decisions/Memory Authority.md"
+    )
 
 
 def test_parallel_recall_is_consistent_and_fast(
@@ -132,3 +163,61 @@ def test_no_answer_returns_best_effort_leads(
     assert packet.evidence, "low-confidence recall must still return leads"
     assert packet.citations
     assert any("best-effort" in warning for warning in packet.warnings)
+
+
+def test_candidate_limits_count_documents_not_repeated_chunks(
+    tmp_path: Path,
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    repeated_sections = "\n\n".join(
+        f"## Section {index}\nshared deduplication phrase"
+        for index in range(12)
+    )
+    (vault / "Long.md").write_text(
+        "\n".join(
+            (
+                "---",
+                "memory_id: mem-long",
+                "title: Long record",
+                "status: active",
+                "---",
+                "",
+                "# Long record",
+                repeated_sections,
+            )
+        ),
+        encoding="utf-8",
+    )
+    (vault / "Short.md").write_text(
+        "\n".join(
+            (
+                "---",
+                "memory_id: mem-short",
+                "title: Short record",
+                "status: active",
+                "---",
+                "",
+                "# Short record",
+                "",
+                "shared deduplication phrase",
+            )
+        ),
+        encoding="utf-8",
+    )
+    settings = Settings(
+        memory_root=vault,
+        state_dir=tmp_path / "state",
+        graph_path=tmp_path / "graph.json",
+        graphify_mcp_url="",
+        embedding_provider="hashed",
+    )
+    build_index(settings, force=True)
+    engine = RetrievalEngine(settings)
+    scope = ScopeFilter(status="active")
+
+    lexical = engine._lexical("shared deduplication phrase", scope, 2)
+    semantic = engine._semantic("shared deduplication phrase", scope, 2)
+
+    assert {hit.memory_id for hit in lexical} == {"mem-long", "mem-short"}
+    assert {hit.memory_id for hit in semantic} == {"mem-long", "mem-short"}

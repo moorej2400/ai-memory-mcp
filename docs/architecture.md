@@ -83,6 +83,9 @@ It skips unchanged content.
 It publishes a versioned SQLite snapshot.
 It prefixes each indexed path with its source ID.
 It does not modify a configured vault.
+It updates vectors only for changed Markdown chunks.
+Large vector searches use an ANN candidate index before exact reranking.
+Portable installations use exact search when the ANN backend is unavailable.
 
 ### Exact and lexical retrieval
 
@@ -123,6 +126,8 @@ It does not control routine memory availability.
 
 The provider adapter hides Graphify file formats from MCP clients.
 The adapter keeps Graphify replaceable.
+Graph traversal applies all requested scopes before it follows an edge.
+Weighted traversal permits controlled multi-hop evidence inside that scope.
 
 ### MCP facade
 
@@ -134,20 +139,22 @@ The facade returns source paths and retrieval evidence.
 |---|---|
 | `memory_recall` | Returns cited Markdown and artifact evidence. |
 | `memory_artifact_read` | Returns ordered raw context for one artifact reference. |
-| `memory_sync` | Updates the derived indexes. |
-| `memory_status` | Reports source, index, Graphify, and runtime status. |
+| `memory_sync` | Publishes one coordinated derived generation. |
+| `memory_status` | Reports strict health for each required layer. |
 
 ## Query procedure
 
-1. Resolve the optional source and domain scope.
-2. Apply repository, project, ticket, status, and path filters.
-3. Select the required retrieval providers.
-4. Run the selected providers.
-5. Fuse ranked results with reciprocal rank fusion.
-6. Remove duplicate memory results.
-7. Rerank a bounded result set.
-8. Add the necessary context.
-9. Return evidence with source paths.
+1. Pin one current generation manifest.
+2. Open one artifact database read snapshot.
+3. Resolve the optional source and domain scope.
+4. Apply repository, project, ticket, status, and path filters.
+5. Select the required retrieval providers.
+6. Run each provider from the pinned generation.
+7. Fuse ranked results with reciprocal rank fusion.
+8. Remove duplicate memory results.
+9. Rerank a bounded result set.
+10. Add the necessary context.
+11. Return evidence with source paths.
 
 Graph traversal is one retrieval signal.
 Graph traversal is not the only retrieval method.
@@ -158,16 +165,19 @@ An expired `review_after` date applies a bounded penalty and adds a `review over
 ## Refresh procedure
 
 1. Validate all configured memory sources.
-2. Update the SQLite index.
-3. Build the Graphify provider graph from the index.
-4. Validate the staged graph.
-5. Publish the staged graph atomically.
-6. Reload the Graphify service.
+2. Stage the Markdown vector snapshot.
+3. Stage the artifact vector snapshot.
+4. Stage the Graphify snapshot from the Markdown snapshot.
+5. Validate all staged components.
+6. Publish one generation manifest atomically.
 7. Run a retrieval health check.
+8. Retain the active and verified previous generations.
 
-The update keeps the last satisfactory data after a failure.
+The update keeps the previous generation after any component failure.
 An ordinary Markdown change uses `memory_sync`.
-The maintenance script records each phase in a local JSONL log.
+An artifact data change also uses `memory_sync`.
+Each recall keeps one generation lease until retrieval finishes.
+Retention removes only derived snapshots that no active lease uses.
 
 ## Provider boundary
 
@@ -187,7 +197,9 @@ Examples include unsafe updates, unstable serialization, or insufficient provena
 - Keep normal recall responses compact.
 - Process only changed Markdown files during normal refreshes.
 - Keep full graph clustering as a maintenance task.
-- Skip snapshot publication when no Markdown file changed.
+- Update only changed Markdown chunks and artifact bursts.
+- Use ANN candidates before exact vector reranking for large corpora.
+- Use exact vector search when ANN support is unavailable.
 - Store semantic vectors in a compact binary form.
 - Combine adjacent short sections before indexing chat exports.
 - Load Graphify candidate documents in one index query.
@@ -195,12 +207,15 @@ Examples include unsafe updates, unstable serialization, or insufficient provena
 ## Reliability rules
 
 - Pin one Graphify version.
+- Pin every recall to one coordinated generation.
+- Keep one artifact database read snapshot for each recall.
 - Keep the CLI, library, MCP server, and health data consistent.
 - Validate staged data before publication.
-- Preserve the last satisfactory graph.
-- Record Markdown and index results separately.
+- Preserve the last satisfactory generation.
+- Report health and freshness for every required layer.
+- Record privacy-safe latency, corpus, storage, growth, and failure metrics.
 - Return source paths for evidence.
-- Do not remove recovery files without authorization.
+- Remove only derived snapshots through the approved retention process.
 
 ## Public tools
 
@@ -208,8 +223,8 @@ Examples include unsafe updates, unstable serialization, or insufficient provena
 |---|---|
 | `memory_recall` | Returns cited evidence and applicable relationships. |
 | `memory_artifact_read` | Returns ordered raw context for one artifact reference. |
-| `memory_sync` | Updates the derived indexes after canonical Markdown or artifact data changes. |
-| `memory_status` | Reports source, index, Graphify, and runtime status. |
+| `memory_sync` | Publishes one coordinated generation after canonical data changes. |
+| `memory_status` | Reports strict health for each required layer and generation. |
 
 `memory_recall` selects its internal behavior from the query.
 An exact identity returns the complete record.

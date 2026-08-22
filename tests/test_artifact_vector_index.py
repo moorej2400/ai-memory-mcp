@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 import ai_memory_mcp.artifacts.schema as schema_module
+from ai_memory_mcp.ann import ANN_BANDS, available as ann_available
 from ai_memory_mcp.artifacts.models import (
     ArtifactBatchManifest,
     ArtifactEvent,
@@ -134,6 +135,155 @@ def test_vector_index_publishes_revisioned_snapshot(
     repeated = build_artifact_vector_index(artifact_settings)
     assert repeated.snapshot == first.snapshot
     assert repeated.unchanged is True
+
+
+def test_vector_index_reuses_unchanged_burst_embeddings(
+    artifact_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ai_memory_mcp.embedding import HashedProvider
+
+    provider = HashedProvider(dimensions=artifact_settings.semantic_dimensions)
+    original_embed = provider.embed
+    calls: list[str] = []
+
+    def counted_embed(text: str) -> dict[int, float]:
+        calls.append(text)
+        return original_embed(text)
+
+    monkeypatch.setattr(provider, "embed", counted_embed)
+    monkeypatch.setattr(
+        "ai_memory_mcp.artifacts.vector_index.resolve_provider",
+        lambda *_args, **_kwargs: provider,
+    )
+    _populate(artifact_settings)
+    first = build_artifact_vector_index(artifact_settings)
+    first_call_count = len(calls)
+    assert first_call_count == first.embedded_bursts == 1
+
+    ArtifactStore(artifact_settings).apply_batch(
+        _batch(
+            "vector-incremental-batch",
+            [
+                _event(
+                    "conversation",
+                    "conversation-incremental",
+                    "Additional operations",
+                    "2026-01-03T10:00:00Z",
+                ),
+                _event(
+                    "message",
+                    "message-incremental",
+                    "A separate durable procedure needs semantic retrieval. " * 5,
+                    "2026-01-03T10:01:00Z",
+                    parent=("conversation", "conversation-incremental"),
+                ),
+            ],
+        )
+    )
+    second = build_artifact_vector_index(artifact_settings)
+
+    assert second.unchanged is False
+    assert second.embedded_updates == 1
+    assert second.reused_bursts == first.bursts
+    assert len(calls) == first_call_count + 1
+
+
+def test_vector_index_groups_only_dirty_parents_after_the_first_build(
+    artifact_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ai_memory_mcp.artifacts.vector_index as vector_index
+
+    _populate(artifact_settings)
+    ArtifactStore(artifact_settings).apply_batch(
+        _batch(
+            "vector-second-parent",
+            [
+                _event(
+                    "conversation",
+                    "conversation-2",
+                    "Second conversation",
+                    "2026-01-02T11:00:00Z",
+                ),
+                _event(
+                    "message",
+                    "message-3",
+                    "A separate semantic record exists in this conversation. " * 5,
+                    "2026-01-02T11:01:00Z",
+                    parent=("conversation", "conversation-2"),
+                ),
+            ],
+        )
+    )
+    build_artifact_vector_index(artifact_settings)
+    grouped_parents: list[set[str]] = []
+    original_group = vector_index.group_bursts
+
+    def capture(records):
+        grouped_parents.append({record.parent_artifact_id for record in records})
+        return original_group(records)
+
+    monkeypatch.setattr(vector_index, "group_bursts", capture)
+    ArtifactStore(artifact_settings).apply_batch(
+        _batch(
+            "vector-one-parent-change",
+            [
+                _event(
+                    "message",
+                    "message-4",
+                    "Only the first conversation receives this semantic update. " * 5,
+                    "2026-01-02T10:31:00Z",
+                    parent=("conversation", "conversation-1"),
+                )
+            ],
+        )
+    )
+
+    build_artifact_vector_index(artifact_settings)
+
+    assert len(grouped_parents) == 1
+    assert len(grouped_parents[0]) == 1
+
+
+@pytest.mark.skipif(not ann_available(), reason="NumPy ANN backend is unavailable")
+def test_artifact_backend_transition_rebuilds_all_ann_buckets(
+    artifact_settings: Settings,
+) -> None:
+    _populate(artifact_settings)
+    first = build_artifact_vector_index(artifact_settings)
+    with sqlite3.connect(first.snapshot) as connection:
+        connection.execute(
+            "UPDATE metadata SET value = 'exact' WHERE key = 'ann_backend'"
+        )
+        connection.execute("DELETE FROM burst_ann_buckets")
+        connection.commit()
+    ArtifactStore(artifact_settings).apply_batch(
+        _batch(
+            "vector-backend-transition",
+            [
+                _event(
+                    "message",
+                    "message-transition",
+                    "A second semantic procedure needs complete ANN coverage. " * 5,
+                    "2026-01-02T10:02:00Z",
+                    parent=("conversation", "conversation-1"),
+                )
+            ],
+        )
+    )
+
+    second = build_artifact_vector_index(artifact_settings)
+    with sqlite3.connect(second.snapshot) as connection:
+        vectors = int(
+            connection.execute(
+                "SELECT count(*) FROM bursts WHERE vector_blob IS NOT NULL"
+            ).fetchone()[0]
+        )
+        buckets = int(
+            connection.execute("SELECT count(*) FROM burst_ann_buckets").fetchone()[0]
+        )
+    assert buckets == vectors * ANN_BANDS
 
 
 def test_vector_index_rejects_a_network_filesystem_snapshot(
@@ -388,7 +538,7 @@ def test_sync_preserves_an_exact_external_id_raw_match(
     assert after.evidence[0].reasons == ["exact identifier"]
 
 
-def test_sync_reports_artifact_index_independently(
+def test_sync_does_not_publish_a_partial_generation(
     artifact_settings: Settings,
 ) -> None:
     _populate(artifact_settings)
@@ -397,8 +547,8 @@ def test_sync_reports_artifact_index_independently(
         memory_root=artifact_settings.memory_root.with_name("vault-unavailable"),
     )
     result = MemoryService(settings).sync()
-    assert result.ok is True
+    assert result.ok is False
     assert result.index is None
-    assert result.artifact_index is not None
-    assert result.artifact_index.embedded_bursts == 1
+    assert result.artifact_index is None
     assert result.errors
+    assert not settings.generation_pointer_path.exists()

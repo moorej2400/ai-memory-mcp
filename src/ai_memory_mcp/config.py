@@ -140,6 +140,8 @@ class Settings:
     artifact_objects_dir: Path = Path.home() / ".ai-memory" / "objects"
     artifact_backup_dir: Path = Path.home() / ".ai-memory" / "backups"
     artifact_batch_max_bytes: int = 268_435_456
+    generation_retention_count: int = 2
+    generation_lease_ttl_seconds: int = 86_400
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -222,6 +224,19 @@ class Settings:
                 data_root / "backups",
             ),
             artifact_batch_max_bytes=artifact_batch_max_bytes,
+            generation_retention_count=max(
+                2,
+                int(os.getenv("AI_MEMORY_GENERATION_RETENTION_COUNT", "2")),
+            ),
+            generation_lease_ttl_seconds=max(
+                300,
+                int(
+                    os.getenv(
+                        "AI_MEMORY_GENERATION_LEASE_TTL_SECONDS",
+                        "86400",
+                    )
+                ),
+            ),
         )
 
     @property
@@ -231,6 +246,14 @@ class Settings:
     @property
     def artifact_pointer_path(self) -> Path:
         return self.state_dir / "current-artifact-index.json"
+
+    @property
+    def generation_pointer_path(self) -> Path:
+        return self.state_dir / "current-generation.json"
+
+    @property
+    def generation_health_path(self) -> Path:
+        return self.state_dir / "generation-health.json"
 
     @property
     def resolved_log_dir(self) -> Path:

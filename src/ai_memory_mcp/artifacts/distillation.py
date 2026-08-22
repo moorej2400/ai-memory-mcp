@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
+import time
 import unicodedata
 from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -10,6 +12,7 @@ from typing import Any
 import yaml
 
 from ai_memory_mcp.config import Settings
+from ai_memory_mcp.audit import append_event
 
 from .context import active_ancestor_predicate, active_context_ids
 from .identity import artifact_uri as make_artifact_uri
@@ -91,7 +94,7 @@ def recommended_distilled_note_path(candidate: DistillationCandidate) -> Path:
     return Path("References") / "Conversations" / f"{title}-{suffix}.md"
 
 
-def list_pending_distillations(
+def _list_pending_distillations(
     settings: Settings,
     scope: ArtifactScope | None = None,
     limit: int = 20,
@@ -160,6 +163,56 @@ def list_pending_distillations(
         )
         for row in rows
     ]
+
+
+def list_pending_distillations(
+    settings: Settings,
+    scope: ArtifactScope | None = None,
+    limit: int = 20,
+) -> list[DistillationCandidate]:
+    started = time.perf_counter()
+    selected = scope or ArtifactScope()
+    try:
+        candidates = _list_pending_distillations(settings, selected, limit)
+    except BaseException as exc:
+        append_event(
+            settings,
+            "distillation",
+            "distillation_pending_failed",
+            {
+                "latency_ms": round(
+                    (time.perf_counter() - started) * 1000,
+                    3,
+                ),
+                "error_type": type(exc).__name__,
+                "error_sha256": hashlib.sha256(
+                    str(exc).encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+        raise
+    append_event(
+        settings,
+        "distillation",
+        "distillation_pending_listed",
+        {
+            "latency_ms": round(
+                (time.perf_counter() - started) * 1000,
+                3,
+            ),
+            "candidate_count": len(candidates),
+            "limit": min(max(limit, 0), 200),
+            "source_filtered": selected.source is not None,
+            "source_instance_filtered": selected.source_instance is not None,
+            "entity_filter_count": len(selected.entities),
+            "artifact_database_bytes": (
+                settings.artifact_db.stat().st_size
+                if settings.artifact_db.is_file()
+                else 0
+            ),
+        },
+    )
+    return candidates
 
 
 def _safe_markdown_path(settings: Settings, memory_path: str) -> Path:
@@ -413,7 +466,7 @@ def _require_current(
         raise ValueError("The artifact source changed after this distillation began.")
 
 
-def mark_distilled(
+def _mark_distilled(
     settings: Settings,
     artifact_uri: str,
     memory_id: str,
@@ -490,7 +543,59 @@ def mark_distilled(
             connection.commit()
 
 
-def mark_no_durable_memory(
+def mark_distilled(
+    settings: Settings,
+    artifact_uri: str,
+    memory_id: str,
+    memory_source_id: str,
+    memory_path: str,
+    event_id: str,
+    source_digest: str,
+) -> None:
+    started = time.perf_counter()
+    try:
+        _mark_distilled(
+            settings,
+            artifact_uri,
+            memory_id,
+            memory_source_id,
+            memory_path,
+            event_id,
+            source_digest,
+        )
+    except BaseException as exc:
+        append_event(
+            settings,
+            "distillation",
+            "distillation_mark_failed",
+            {
+                "artifact_uri": artifact_uri,
+                "latency_ms": round(
+                    (time.perf_counter() - started) * 1000,
+                    3,
+                ),
+                "error_type": type(exc).__name__,
+                "error_sha256": hashlib.sha256(
+                    str(exc).encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+        raise
+    append_event(
+        settings,
+        "distillation",
+        "distillation_mark_completed",
+        {
+            "artifact_uri": artifact_uri,
+            "latency_ms": round(
+                (time.perf_counter() - started) * 1000,
+                3,
+            ),
+        },
+    )
+
+
+def _mark_no_durable_memory(
     settings: Settings,
     artifact_uri: str,
     event_id: str,
@@ -532,3 +637,51 @@ def mark_no_durable_memory(
             raise
         else:
             connection.commit()
+
+
+def mark_no_durable_memory(
+    settings: Settings,
+    artifact_uri: str,
+    event_id: str,
+    source_digest: str,
+    reason: str,
+) -> None:
+    started = time.perf_counter()
+    try:
+        _mark_no_durable_memory(
+            settings,
+            artifact_uri,
+            event_id,
+            source_digest,
+            reason,
+        )
+    except BaseException as exc:
+        append_event(
+            settings,
+            "distillation",
+            "distillation_no_memory_failed",
+            {
+                "artifact_uri": artifact_uri,
+                "latency_ms": round(
+                    (time.perf_counter() - started) * 1000,
+                    3,
+                ),
+                "error_type": type(exc).__name__,
+                "error_sha256": hashlib.sha256(
+                    str(exc).encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+        raise
+    append_event(
+        settings,
+        "distillation",
+        "distillation_no_memory_completed",
+        {
+            "artifact_uri": artifact_uri,
+            "latency_ms": round(
+                (time.perf_counter() - started) * 1000,
+                3,
+            ),
+        },
+    )

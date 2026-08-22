@@ -23,6 +23,8 @@ Copy `.env.example` when you create the configuration manually.
 | `AI_MEMORY_ARTIFACT_OBJECTS_DIR` | Sets the attachment object directory. |
 | `AI_MEMORY_ARTIFACT_BACKUP_DIR` | Sets the artifact backup directory. |
 | `AI_MEMORY_ARTIFACT_BATCH_MAX_BYTES` | Sets the maximum uncompressed intake batch size. |
+| `AI_MEMORY_GENERATION_RETENTION_COUNT` | Sets the minimum derived generation count. The effective minimum is two. |
+| `AI_MEMORY_GENERATION_LEASE_TTL_SECONDS` | Sets the stale recall lease limit. The default is 86400 seconds. |
 
 `AI_MEMORY_WORK_DIR` also sets the default internal data root.
 The default internal data root is `AI_MEMORY_WORK_DIR/.ai-memory/`.
@@ -65,6 +67,10 @@ The indexer excludes the hidden `.ai-memory` directory.
 The default artifact batch limit is 268435456 bytes.
 Set a positive integer when you override this limit.
 
+The system retains the active derived generation and one verified previous generation.
+An active recall lease can temporarily retain an additional generation.
+Generation retention never removes canonical artifacts or required attachment objects.
+
 ## Graphify
 
 | Variable | Function |
@@ -79,7 +85,7 @@ Set a positive integer when you override this limit.
 | `GRAPHIFY_OPENAI_MAX_CONCURRENCY` | Sets the extraction concurrency limit. |
 | `GRAPHIFY_OPENAI_API_TIMEOUT` | Sets the extraction timeout. |
 | `GRAPHIFY_MAX_RETRIES` | Sets the extraction retry limit. |
-| `GRAPHIFY_MEMORY_RETRIEVAL_EVAL_CASES` | Sets optional local retrieval evaluation cases as JSON pairs. |
+| `GRAPHIFY_MEMORY_RETRIEVAL_EVAL_CASES` | Sets required local retrieval evaluation cases as JSON pairs. |
 
 The normal index refresh does not need an extraction API.
 A full Graphify refresh can need the optional API values.

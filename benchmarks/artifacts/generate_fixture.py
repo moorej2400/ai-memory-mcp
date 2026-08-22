@@ -19,7 +19,7 @@ from ai_memory_mcp.artifacts.ingest import (
 from ai_memory_mcp.artifacts.models import ArtifactScope
 from ai_memory_mcp.artifacts.search import ArtifactSearch
 from ai_memory_mcp.artifacts.store import ArtifactStore
-from ai_memory_mcp.artifacts.vector_index import build_artifact_vector_index
+from ai_memory_mcp.artifacts.vector_index import search_artifact_vectors
 from ai_memory_mcp.config import Settings
 from ai_memory_mcp.service import MemoryService
 
@@ -377,7 +377,7 @@ def run_benchmark(
         artifact_db=run_dir / "artifacts.sqlite3",
         artifact_objects_dir=run_dir / "objects",
         artifact_backup_dir=run_dir / "backups",
-        audit_logging_enabled=False,
+        audit_logging_enabled=True,
     )
 
     started = time.perf_counter()
@@ -445,15 +445,43 @@ def run_benchmark(
             raise RuntimeError("The ordered artifact read returned no records.")
 
     read_p50, read_p95 = _latencies(read_action, repeats)
-    started = time.perf_counter()
-    burst_result = build_artifact_vector_index(settings, force=True)
-    burst_seconds = time.perf_counter() - started
-
     service = MemoryService(settings)
+    started = time.perf_counter()
+    sync = service.sync()
+    generation_seconds = time.perf_counter() - started
+    if not sync.ok or sync.artifact_index is None:
+        raise RuntimeError("The artifact benchmark generation did not publish.")
+    burst_result = sync.artifact_index
+    vector_case_passes = 0
+    vector_candidate_counts: list[int] = []
+    for case in cases:
+        vector_result = search_artifact_vectors(
+            settings,
+            str(case["semantic_query"]),
+            ArtifactScope(
+                source=SOURCE,
+                source_instance=SOURCE_INSTANCE,
+                entities=(str(case["entity"]),),
+            ),
+            limit=5,
+        )
+        vector_candidate_counts.append(vector_result.candidate_count)
+        vector_case_passes += int(
+            any(
+                hit.title == str(case["vector_parent_title"])
+                for hit in vector_result.hits
+            )
+        )
+    vector_recall_at_5 = vector_case_passes / len(cases)
+    if vector_recall_at_5 < float(contract["minimum_vector_recall_at_5"]):
+        raise RuntimeError("Artifact vector recall did not meet the contract.")
     recall_index = 0
+    recall_ranks: list[int] = []
+    citation_failures = 0
+    diversity: list[float] = []
 
     def recall_action() -> None:
-        nonlocal recall_index
+        nonlocal citation_failures, recall_index
         case = cases[recall_index % len(cases)]
         recall_index += 1
         response = service.recall(
@@ -471,8 +499,27 @@ def run_benchmark(
         )
         if not response.evidence or response.evidence[0].memory_id != expected:
             raise RuntimeError("A warm fused-recall result changed.")
+        ids = [item.memory_id for item in response.evidence]
+        recall_ranks.append(ids.index(expected) + 1)
+        citation_failures += int(
+            not response.citations
+            or not response.citations[0].path.startswith("artifact://")
+        )
+        diversity.append(len(set(ids)) / len(ids))
 
     recall_p50, recall_p95 = _latencies(recall_action, repeats)
+    absent = service.recall(
+        '"absent synthetic benchmark marker"',
+        source_label=SOURCE,
+        source_instance=SOURCE_INSTANCE,
+        limit=5,
+    )
+    scoped_out = service.recall(
+        f'"{cases[0]["query"]}"',
+        source_label="other-synthetic-source",
+        source_instance=SOURCE_INSTANCE,
+        limit=5,
+    )
     report.update(
         {
             "validation_seconds": round(validation_seconds, 3),
@@ -482,11 +529,28 @@ def run_benchmark(
             "warm_fts_p95_ms": round(fts_p95, 3),
             "ordered_read_p50_ms": round(read_p50, 3),
             "ordered_read_p95_ms": round(read_p95, 3),
-            "burst_index_seconds": round(burst_seconds, 3),
+            "generation_seconds": round(generation_seconds, 3),
+            "generation_id": sync.generation_id,
+            "burst_index_seconds": round(generation_seconds, 3),
             "bursts": burst_result.bursts,
             "embedded_bursts": burst_result.embedded_bursts,
+            "ann_backend": burst_result.ann_backend,
+            "artifact_vector_recall_at_5": vector_recall_at_5,
+            "artifact_vector_candidate_minimum": min(vector_candidate_counts),
             "warm_fused_recall_p50_ms": round(recall_p50, 3),
             "warm_fused_recall_p95_ms": round(recall_p95, 3),
+            "memory_recall_pipeline": True,
+            "recall_at_1": statistics.mean(
+                rank == 1 for rank in recall_ranks
+            ),
+            "recall_at_5": statistics.mean(
+                rank <= 5 for rank in recall_ranks
+            ),
+            "mrr": statistics.mean(1.0 / rank for rank in recall_ranks),
+            "no_answer_accuracy": float(absent.status == "no_answer"),
+            "scope_leakage_rate": float(bool(scoped_out.evidence)),
+            "citation_failure_rate": citation_failures / len(recall_ranks),
+            "document_diversity_at_5": statistics.mean(diversity),
             "counts": actual_counts,
         }
     )

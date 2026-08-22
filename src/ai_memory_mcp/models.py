@@ -176,13 +176,21 @@ class ArtifactIndexResult(StrictOutput):
     embedding_model: str
     embedding_fingerprint: str
     unchanged: bool = False
+    embedded_updates: int = Field(default=0, ge=0)
+    reused_bursts: int = Field(default=0, ge=0)
+    removed_bursts: int = Field(default=0, ge=0)
+    ann_backend: str = "exact"
     elapsed_ms: float = Field(ge=0.0)
 
 
 class SyncResponse(StrictOutput):
     ok: bool
+    generation_id: str | None = None
+    graph_snapshot: str | None = None
     index: SyncIndexResult | None = None
     artifact_index: ArtifactIndexResult | None = None
+    retention_removed_files: int = Field(default=0, ge=0)
+    retention_removed_bytes: int = Field(default=0, ge=0)
     errors: list[str] = Field(default_factory=list)
 
 
@@ -196,6 +204,8 @@ class CanonicalMemoryStatus(StrictOutput):
 
 class IndexStatus(StrictOutput):
     available: bool
+    stale: bool = False
+    generation_id: str | None = None
     path: str | None = None
     schema_version: int | None = None
     built_at: str | None = None
@@ -204,8 +214,13 @@ class IndexStatus(StrictOutput):
     semantic_dimensions: int | None = None
     embedding_provider: str | None = None
     embedding_model: str | None = None
+    ann_backend: str | None = None
     documents: int | None = Field(default=None, ge=0)
     chunks: int | None = Field(default=None, ge=0)
+    byte_count: int = Field(default=0, ge=0)
+    age_seconds: float | None = Field(default=None, ge=0.0)
+    last_success_at: str | None = None
+    last_failure_at: str | None = None
 
 
 class ArtifactDatabaseStatus(StrictOutput):
@@ -218,6 +233,25 @@ class ArtifactDatabaseStatus(StrictOutput):
     batches: int = Field(default=0, ge=0)
     fts_available: bool = False
     pending_distillations: int = Field(default=0, ge=0)
+    change_counter: int = Field(default=0, ge=0)
+    byte_count: int = Field(default=0, ge=0)
+    last_success_at: str | None = None
+    last_failure_at: str | None = None
+
+
+class ArtifactVectorStatus(StrictOutput):
+    available: bool
+    stale: bool
+    generation_id: str | None = None
+    path: str | None = None
+    change_counter: int | None = Field(default=None, ge=0)
+    bursts: int = Field(default=0, ge=0)
+    embedded_bursts: int = Field(default=0, ge=0)
+    ann_backend: str | None = None
+    byte_count: int = Field(default=0, ge=0)
+    age_seconds: float | None = Field(default=None, ge=0.0)
+    last_success_at: str | None = None
+    last_failure_at: str | None = None
 
 
 class GraphifyRuntimeStatus(StrictOutput):
@@ -241,6 +275,9 @@ class GraphifyStatus(StrictOutput):
     age_seconds: float | None = Field(default=None, ge=0.0)
     build_mode: str | None = None
     index_snapshot: str | None = None
+    generation_id: str | None = None
+    last_success_at: str | None = None
+    last_failure_at: str | None = None
     provider_role: Literal["internal-graph-signal"]
     runtime: GraphifyRuntimeStatus
 
@@ -265,13 +302,31 @@ class RuntimeStatus(StrictOutput):
     mcp_supported: bool
 
 
+class GenerationStatus(StrictOutput):
+    available: bool
+    consistent: bool
+    generation_id: str | None = None
+    published_at: str | None = None
+    manifest_path: str | None = None
+    age_seconds: float | None = Field(default=None, ge=0.0)
+    last_success_at: str | None = None
+    last_failure_at: str | None = None
+    last_failure_layer: str | None = None
+    storage_bytes: int = Field(default=0, ge=0)
+    storage_growth_bytes: int = 0
+    verified_generations: int = Field(default=0, ge=0)
+    last_good_available: bool = False
+
+
 class StatusResponse(StrictOutput):
     ok: bool
     canonical_memory_root: CanonicalMemoryStatus
     retrieval_sources: list[CanonicalMemoryStatus] = Field(default_factory=list)
     index: IndexStatus
     artifact_database: ArtifactDatabaseStatus
+    artifact_vector: ArtifactVectorStatus
     graphify: GraphifyStatus
+    generation: GenerationStatus
     logging: LoggingStatus
     runtime: RuntimeStatus
     checked_at: str

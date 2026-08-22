@@ -167,6 +167,9 @@ class ParsedArtifactBatch(StrictModel):
 
 class ArtifactIngestReceipt(StrictModel):
     batch_id: str
+    input_sha256: str = Field(min_length=64, max_length=64)
+    committed_at: datetime
+    committed: Literal[True] = True
     accepted: int = 0
     unchanged: int = 0
     stale: int = 0
@@ -288,6 +291,8 @@ class ArtifactVectorSearchResult(StrictModel):
     hits: list[ArtifactSearchHit] = Field(default_factory=list)
     available: bool = False
     stale: bool = False
+    backend: str = "exact"
+    candidate_count: int = Field(default=0, ge=0)
 
 
 class ArtifactIntegrityResult(StrictModel):

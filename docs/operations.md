@@ -9,9 +9,14 @@ produces the same result on any supported platform.
 The console scripts live in `.venv\Scripts` on Windows and `.venv/bin` on macOS
 and Linux.
 
-## Update the local index
+## Update the coordinated generation
 
-Run this command after a normal Markdown change:
+Use `memory_sync` after canonical Markdown or raw artifact data changes.
+The tool stages Markdown vectors, artifact vectors, and Graphify together.
+The tool validates every component before it changes the generation pointer.
+The previous generation stays active when one component fails.
+
+Use `ai-memory-index` only for isolated Markdown index maintenance:
 
 ```powershell
 .\.venv\Scripts\ai-memory-index.exe
@@ -22,9 +27,11 @@ Run this command after a normal Markdown change:
 ```
 
 The command reads Markdown from all configured memory sources.
-The command publishes a new SQLite index snapshot.
+The command publishes one Markdown SQLite snapshot.
 The command does not change the Markdown files.
 The command skips publication when no Markdown file changed.
+
+This maintenance command does not publish a coordinated generation.
 
 Concurrent commands wait for the current index publisher.
 The default wait limit is 300 seconds.
@@ -59,8 +66,10 @@ Ingest one complete JSONL batch:
 
 Use `--input -` to read the complete batch from standard input.
 The command validates the complete batch before it changes SQLite.
-The intake receipt confirms storage only.
-The receipt is not a provider cursor.
+The intake receipt confirms a durable database commit.
+The receipt contains the exact batch ID and input hash.
+An idempotent retry returns the stored receipt.
+The receipt is not a provider fetch cursor.
 
 Check the database status:
 
@@ -204,13 +213,14 @@ Before the switch, complete the legacy migration dry run.
 
 1. Run the provider fetch.
 2. Publish one complete JSONL batch.
-3. Ingest the batch with `ai-memory-artifact ingest`.
-4. Save the intake receipt outside the repository.
+3. Let the provider call `ai-memory-artifact ingest`.
+4. Verify the exact receipt in provider state.
 5. If message or cue data changed, run `memory_sync`.
 6. Queue agent distillation for pending meetings and conversations.
 
-Do not use the intake receipt as a provider cursor.
+Do not use the intake receipt as a provider fetch cursor.
 Do not point the provider at the canonical artifact database.
+Do not remove the handoff before receipt validation.
 Keep the old scheduled process available for rollback.
 
 Test one provider batch before the scheduled switch.
@@ -242,7 +252,9 @@ Run the frozen retrieval benchmark:
 ./.venv/bin/ai-memory-benchmark --label artifact-store-validation
 ```
 
-The artifact benchmark writes generated data under the ignored `benchmarks/runs/` directory.
+The benchmark calls the complete `memory_recall` pipeline.
+It reports recall, MRR, no-answer accuracy, scope leakage, citations, diversity, freshness, and layer latency.
+The benchmark writes generated data under the ignored `benchmarks/runs/` directory.
 The benchmark does not use live messages, meetings, or memory notes.
 Do not use one benchmark run as a strict performance limit.
 
@@ -287,16 +299,24 @@ The installer updates each command path.
 The installer preserves the previous configuration in a timestamped backup.
 Restart each configured client after the command finishes.
 
-## Refresh Graphify
+## Manage derived generation retention
 
 Use `memory_sync` after canonical Markdown or artifact data changes.
-The tool updates the independent Markdown and artifact indexes.
+The tool publishes one generation for Markdown, artifact vectors, and Graphify.
+The system keeps the active generation and one verified previous generation.
+An active recall lease prevents removal of its pinned generation.
+Retention removes only old derived snapshots after pointer and integrity checks.
+Retention never removes raw artifacts, revisions, tombstones, or required attachment objects.
 
-Use the maintenance script when the Graphify graph must change.
+## Refresh Graphify for maintenance
+
+Use the maintenance script only for isolated Graphify maintenance.
 The script uses staging and validation.
 The script keeps the last satisfactory graph if validation fails.
 The script builds the provider graph from the current SQLite index.
 This procedure does not require an extraction API.
+Set `GRAPHIFY_MEMORY_RETRIEVAL_EVAL_CASES` before you run the script.
+Use real questions and expected evidence markers from the configured vault.
 
 Run this script for Graphify maintenance:
 
@@ -329,13 +349,18 @@ The transcript also records failures and rollback operations.
 
 ## Review local logs
 
+The generation log records component latency, corpus size, bytes, growth, generation IDs, and sanitized failures.
 The index log records source counts, changes, errors, lock waits, and elapsed time.
-The retrieval log records Markdown queries, results, citations, diagnostics, and elapsed time.
+The retrieval log records safe counts, digests, component latency, and generation IDs.
 Artifact routes record query hashes, evidence digests, and metadata.
+Intake and distillation logs record counts, latency, storage size, and sanitized failures.
 
 Read these files under `AI_MEMORY_LOG_DIR`:
 
 - `index.jsonl`
+- `generation.jsonl`
+- `artifact-intake.jsonl`
+- `distillation.jsonl`
 - `retrieval.jsonl`
 
 The default directory is `AI_MEMORY_WORK_DIR\.ai-memory\logs`.
@@ -344,7 +369,7 @@ The logger moves a full active log to a timestamped local archive.
 Graphify refresh events use a separate local directory.
 Read these files under `AI_MEMORY_GRAPHIFY_STATE_DIR\logs\ai-memory-refresh`.
 
-These logs can contain memory text.
+These structured logs do not contain raw artifact text or sensitive queries.
 Do not copy these logs into the repository.
 
 ## Control the Graphify MCP service

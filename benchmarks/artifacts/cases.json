@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "minimum_vector_recall_at_5": 1.0,
   "fixture": {
     "conversations": 100,
     "messages": 100000,
@@ -12,12 +13,16 @@
     {
       "id": "message-decision",
       "query": "violet checkpoint token qx-042-769",
+      "semantic_query": "violet qx-042-769 release team change sequence approval recovery",
+      "vector_parent_title": "Synthetic Conversation 042",
       "entity": "message",
       "external_id": "message-042-000769"
     },
     {
       "id": "meeting-cue",
       "query": "silver rollback beacon rb-037-273",
+      "semantic_query": "rollback silver rb-037-273 beacon",
+      "vector_parent_title": "Synthetic Transcript 037",
       "entity": "transcript-cue",
       "external_id": "cue-037-000273"
     }

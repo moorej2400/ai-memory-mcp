@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -11,12 +12,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .audit import append_event, file_lock
+from .ann import (
+    ANN_BACKEND,
+    available as ann_available,
+    bucket_clause,
+    multiprobe_buckets,
+    vector_buckets,
+)
 from .config import Settings
 from .embedding import fingerprint, resolve_provider
 from .models import MemoryChunk, MemoryDocument, ScopeFilter
 from .text import chunk_document, parse_document
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _VECTOR_ITEM = struct.Struct("<He")
 
 
@@ -74,6 +82,14 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             vector_blob BLOB NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_chunks_memory ON chunks(memory_id, ordinal);
+        CREATE TABLE IF NOT EXISTS chunk_ann_buckets (
+            chunk_id TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+            band INTEGER NOT NULL,
+            bucket INTEGER NOT NULL,
+            PRIMARY KEY(chunk_id, band)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunk_ann_lookup
+            ON chunk_ann_buckets(band, bucket, chunk_id);
         CREATE INDEX IF NOT EXISTS idx_documents_scope
             ON documents(source_id, root_scope, status, scope_kind, scope_id);
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -105,6 +121,8 @@ def _insert_document(
     connection: sqlite3.Connection,
     document: MemoryDocument,
     chunks: list[MemoryChunk],
+    *,
+    semantic_dimensions: int,
 ) -> None:
     values = asdict(document)
     connection.execute(
@@ -139,6 +157,17 @@ def _insert_document(
                 chunk.ordinal,
                 chunk.text,
                 encode_vector(chunk.vector),
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO chunk_ann_buckets(chunk_id, band, bucket) "
+            "VALUES (?, ?, ?)",
+            (
+                (chunk.chunk_id, band, bucket)
+                for band, bucket in vector_buckets(
+                    chunk.vector,
+                    semantic_dimensions,
+                )
             ),
         )
         connection.execute(
@@ -182,6 +211,11 @@ def _remove_document(connection: sqlite3.Connection, memory_id: str) -> None:
 
 
 def current_index_path(settings: Settings) -> Path | None:
+    from .generation import generation_component_path
+
+    generated = generation_component_path(settings, "markdown_snapshot")
+    if generated is not None and _schema_matches(generated):
+        return generated
     if settings.pointer_path.exists():
         try:
             payload = json.loads(settings.pointer_path.read_text(encoding="utf-8"))
@@ -216,7 +250,12 @@ def _index_metadata_value(path: Path, key: str) -> str | None:
         return None
 
 
-def _build_index(settings: Settings, *, force: bool = False) -> dict[str, object]:
+def _build_index(
+    settings: Settings,
+    *,
+    force: bool = False,
+    publish_pointer: bool = True,
+) -> dict[str, object]:
     started = time.perf_counter()
     sources = settings.memory_sources
     missing = [source for source in sources if not source.root.is_dir()]
@@ -237,6 +276,7 @@ def _build_index(settings: Settings, *, force: bool = False) -> dict[str, object
             dimensions=settings.semantic_dimensions,
         )
         provider_fingerprint = fingerprint(provider)
+        target_ann_backend = ANN_BACKEND if ann_available() else "exact"
         if current and _index_metadata_value(
             current, "embedding_fingerprint"
         ) != provider_fingerprint:
@@ -269,7 +309,11 @@ def _build_index(settings: Settings, *, force: bool = False) -> dict[str, object
                 for source in sources
                 for path in eligible_by_source[source.source_id]
             }
-            if current_mtimes == existing_mtimes:
+            if (
+                current_mtimes == existing_mtimes
+                and _index_metadata_value(current, "ann_backend")
+                == target_ann_backend
+            ):
                 source_stats = [
                     {
                         "source_id": source.source_id,
@@ -309,6 +353,11 @@ def _build_index(settings: Settings, *, force: bool = False) -> dict[str, object
                 source.backup(target)
         with _connect(snapshot) as connection:
             _create_schema(connection)
+            rebuild_ann = bool(
+                current
+                and _index_metadata_value(current, "ann_backend")
+                != target_ann_backend
+            )
             existing = {
                 row["path"]: (
                     row["memory_id"],
@@ -394,6 +443,7 @@ def _build_index(settings: Settings, *, force: bool = False) -> dict[str, object
                         connection,
                         document,
                         chunk_document(document, provider),
+                        semantic_dimensions=provider.dimensions,
                     )
                 source_stats.append(
                     {
@@ -420,6 +470,23 @@ def _build_index(settings: Settings, *, force: bool = False) -> dict[str, object
                     (SELECT COUNT(*) FROM chunks) AS chunks
                 """
             ).fetchone()
+            if rebuild_ann:
+                connection.execute("DELETE FROM chunk_ann_buckets")
+                for row in connection.execute(
+                    "SELECT chunk_id, vector_blob FROM chunks"
+                ):
+                    vector = decode_vector(bytes(row["vector_blob"]))
+                    connection.executemany(
+                        "INSERT INTO chunk_ann_buckets(chunk_id, band, bucket) "
+                        "VALUES (?, ?, ?)",
+                        (
+                            (str(row["chunk_id"]), band, bucket)
+                            for band, bucket in vector_buckets(
+                                vector,
+                                provider.dimensions,
+                            )
+                        ),
+                    )
             metadata = {
                 "schema_version": str(SCHEMA_VERSION),
                 "built_at": _utc_now(),
@@ -432,6 +499,7 @@ def _build_index(settings: Settings, *, force: bool = False) -> dict[str, object
                 "embedding_provider": provider.name,
                 "embedding_model": provider.model,
                 "embedding_fingerprint": provider_fingerprint,
+                "ann_backend": target_ann_backend,
                 "documents": str(counts["documents"]),
                 "chunks": str(counts["chunks"]),
             }
@@ -443,14 +511,8 @@ def _build_index(settings: Settings, *, force: bool = False) -> dict[str, object
             integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
             if integrity != "ok":
                 raise RuntimeError(f"SQLite integrity check failed: {integrity}")
-        pointer = {
-            "snapshot": snapshot.name,
-            "published_at": _utc_now(),
-            "schema_version": SCHEMA_VERSION,
-        }
-        settings.pointer_path.write_text(
-            json.dumps(pointer, indent=2), encoding="utf-8"
-        )
+        if publish_pointer:
+            _publish_index_pointer(settings, snapshot)
     return {
         "snapshot": str(snapshot),
         "documents": int(counts["documents"]),
@@ -466,7 +528,25 @@ def _build_index(settings: Settings, *, force: bool = False) -> dict[str, object
     }
 
 
-def build_index(settings: Settings, *, force: bool = False) -> dict[str, object]:
+def _publish_index_pointer(settings: Settings, snapshot: Path) -> None:
+    pointer = {
+        "snapshot": snapshot.name,
+        "published_at": _utc_now(),
+        "schema_version": SCHEMA_VERSION,
+    }
+    temporary = settings.pointer_path.with_name(
+        f".{settings.pointer_path.name}.partial-{os.getpid()}-{time.time_ns()}"
+    )
+    temporary.write_text(json.dumps(pointer, indent=2), encoding="utf-8")
+    os.replace(temporary, settings.pointer_path)
+
+
+def build_index(
+    settings: Settings,
+    *,
+    force: bool = False,
+    publish_pointer: bool = True,
+) -> dict[str, object]:
     started = time.perf_counter()
     append_event(
         settings,
@@ -480,7 +560,11 @@ def build_index(settings: Settings, *, force: bool = False) -> dict[str, object]
         },
     )
     try:
-        result = _build_index(settings, force=force)
+        result = _build_index(
+            settings,
+            force=force,
+            publish_pointer=publish_pointer,
+        )
     except Exception as exc:
         append_event(
             settings,
@@ -493,18 +577,26 @@ def build_index(settings: Settings, *, force: bool = False) -> dict[str, object]
                     3,
                 ),
                 "error_type": type(exc).__name__,
-                "error": str(exc),
+                "error_sha256": hashlib.sha256(
+                    str(exc).encode("utf-8")
+                ).hexdigest(),
             },
         )
         raise
     source_stats = result.pop("_source_stats")
     lock_wait_ms = result.pop("_lock_wait_ms")
+    telemetry_result = {
+        key: value
+        for key, value in result.items()
+        if key != "parse_errors"
+    }
+    telemetry_result["parse_error_count"] = len(result.get("parse_errors", []))
     append_event(
         settings,
         "index",
         "index_completed",
         {
-            **result,
+            **telemetry_result,
             "source_stats": source_stats,
             "lock_wait_ms": lock_wait_ms,
         },
@@ -513,12 +605,12 @@ def build_index(settings: Settings, *, force: bool = False) -> dict[str, object]
 
 
 class MemoryIndex:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, path: Path | None = None):
         self.settings = settings
         self._vector_cache: dict[
             tuple[str | None, ...], list[tuple[sqlite3.Row, dict[int, float]]]
         ] = {}
-        self.path = current_index_path(settings)
+        self.path = path or current_index_path(settings)
         if self.path is None:
             raise FileNotFoundError(
                 "Memory index is not available. Call memory_sync before recall."
@@ -536,6 +628,26 @@ class MemoryIndex:
                 for row in connection.execute("SELECT key, value FROM metadata")
             }
 
+    def canonical_stale(self) -> bool:
+        """Return true when canonical Markdown differs from this snapshot."""
+        try:
+            current = {
+                f"{source.source_id}/{path.relative_to(source.root).as_posix()}":
+                    path.stat().st_mtime_ns
+                for source in self.settings.memory_sources
+                for path in _eligible_markdown(source.root)
+            }
+        except OSError:
+            return True
+        with self.connection() as connection:
+            indexed = {
+                str(row["path"]): int(row["mtime_ns"])
+                for row in connection.execute(
+                    "SELECT path, mtime_ns FROM documents"
+                )
+            }
+        return current != indexed
+
     def document(
         self,
         identity: str,
@@ -549,10 +661,8 @@ class MemoryIndex:
                 SELECT d.* FROM documents d
                 WHERE (
                     d.memory_id = ?
-                    OR d.path = ?
+                    OR lower(d.path) = lower(?)
                     OR lower(d.title) = lower(?)
-                    OR d.path LIKE ?
-                    OR d.title LIKE ?
                 )
                 {scope_clause}
                 ORDER BY
@@ -569,8 +679,6 @@ class MemoryIndex:
                     identity,
                     identity,
                     identity,
-                    f"%{identity}%",
-                    f"%{identity}%",
                     *parameters,
                     identity,
                     identity,
@@ -626,6 +734,32 @@ class MemoryIndex:
             for _, _, document in matches[: max(1, limit)]
         ]
 
+    def scoped_identities(self, scope: ScopeFilter) -> set[str]:
+        """Return normalized document identities that are inside one scope."""
+        where, parameters = scope_sql(scope)
+        with self.connection() as connection:
+            rows = connection.execute(
+                f"SELECT d.* FROM documents d {where}",
+                parameters,
+            ).fetchall()
+        identities: set[str] = set()
+        for row in rows:
+            document = decode_document(row)
+            path = str(document["path"])
+            identities.update(
+                {
+                    str(document["memory_id"]).casefold(),
+                    path.casefold(),
+                    Path(path).stem.casefold(),
+                    str(document["title"]).casefold(),
+                }
+            )
+            identities.update(
+                str(value).casefold()
+                for value in document["identifiers"]
+            )
+        return identities
+
     def all_vectors(
         self, scope: ScopeFilter
     ) -> list[tuple[sqlite3.Row, dict[int, float]]]:
@@ -660,6 +794,60 @@ class MemoryIndex:
         # until MemoryService replaces the engine after the next refresh.
         self._vector_cache[cache_key] = decoded
         return decoded
+
+    def vector_candidates(
+        self,
+        scope: ScopeFilter,
+        query_vector: dict[int, float],
+        limit: int,
+    ) -> tuple[list[tuple[sqlite3.Row, dict[int, float]]], str]:
+        metadata = self.metadata()
+        if metadata.get("ann_backend") != ANN_BACKEND:
+            return self.all_vectors(scope), "exact-fallback"
+        dimensions = int(metadata.get("semantic_dimensions", "0"))
+        buckets = vector_buckets(query_vector, dimensions)
+        if not buckets:
+            return self.all_vectors(scope), "exact-fallback"
+        where, scope_parameters = scope_sql(scope)
+        scope_clause = where.replace("WHERE", "AND", 1) if where else ""
+        with self.connection() as connection:
+            total = int(
+                connection.execute(
+                    f"SELECT count(*) FROM chunks c "
+                    f"JOIN documents d USING(memory_id) {where}",
+                    scope_parameters,
+                ).fetchone()[0]
+            )
+            if total <= 2_000:
+                return self.all_vectors(scope), "exact-small-corpus"
+            match_clause, match_parameters = bucket_clause(
+                multiprobe_buckets(buckets),
+                table_alias="a",
+            )
+            candidate_limit = min(2_000, max(400, limit * 12))
+            rows = connection.execute(
+                f"""
+                SELECT c.*, d.status, d.root_scope, d.scope_kind, d.scope_id,
+                       d.projects_json, d.repos_json, d.updated, d.review_after,
+                       count(*) AS ann_matches
+                FROM chunk_ann_buckets a
+                JOIN chunks c USING(chunk_id)
+                JOIN documents d USING(memory_id)
+                WHERE ({match_clause})
+                {scope_clause}
+                GROUP BY c.chunk_id
+                ORDER BY ann_matches DESC, c.chunk_id
+                LIMIT ?
+                """,
+                [*match_parameters, *scope_parameters, candidate_limit],
+            ).fetchall()
+        minimum = min(total, 20)
+        if len(rows) < minimum:
+            return self.all_vectors(scope), "exact-fallback"
+        return (
+            [(row, decode_vector(row["vector_blob"])) for row in rows],
+            ANN_BACKEND,
+        )
 
     def chunks_for_memories(
         self,
@@ -711,8 +899,8 @@ def scope_sql(scope: ScopeFilter) -> tuple[str, list[str]]:
         clauses.append("d.status = ?")
         parameters.append(scope.status)
     if scope.path_prefix:
-        clauses.append("d.path LIKE ?")
-        parameters.append(f"{scope.path_prefix.rstrip('/')}%")
+        clauses.append("d.path LIKE ? ESCAPE '\\'")
+        parameters.append(f"{_like_literal(scope.path_prefix.rstrip('/'))}%")
     if scope.repository:
         clauses.append(
             """
@@ -722,7 +910,7 @@ def scope_sql(scope: ScopeFilter) -> tuple[str, list[str]]:
                     WHERE lower(value) = lower(?)
                 )
                 OR lower(d.scope_id) = lower(?)
-                OR lower(d.path) LIKE lower(?)
+                OR lower(d.path) LIKE lower(?) ESCAPE '\\'
             )
             """
         )
@@ -730,7 +918,7 @@ def scope_sql(scope: ScopeFilter) -> tuple[str, list[str]]:
             (
                 scope.repository,
                 scope.repository,
-                f"%/{scope.repository}/%",
+                f"%/{_like_literal(scope.repository)}/%",
             )
         )
     if scope.project:
@@ -742,7 +930,7 @@ def scope_sql(scope: ScopeFilter) -> tuple[str, list[str]]:
                     WHERE lower(value) = lower(?)
                 )
                 OR lower(d.scope_id) = lower(?)
-                OR lower(d.path) LIKE lower(?)
+                OR lower(d.path) LIKE lower(?) ESCAPE '\\'
             )
             """
         )
@@ -750,7 +938,7 @@ def scope_sql(scope: ScopeFilter) -> tuple[str, list[str]]:
             (
                 scope.project,
                 scope.project,
-                f"%/{scope.project}/%",
+                f"%/{_like_literal(scope.project)}/%",
             )
         )
     if scope.ticket:
@@ -762,7 +950,7 @@ def scope_sql(scope: ScopeFilter) -> tuple[str, list[str]]:
                     WHERE lower(value) = lower(?)
                 )
                 OR lower(d.scope_id) = lower(?)
-                OR lower(d.path) LIKE lower(?)
+                OR lower(d.path) LIKE lower(?) ESCAPE '\\'
             )
             """
         )
@@ -770,7 +958,12 @@ def scope_sql(scope: ScopeFilter) -> tuple[str, list[str]]:
             (
                 scope.ticket,
                 scope.ticket,
-                f"%/{scope.ticket}/%",
+                f"%/{_like_literal(scope.ticket)}/%",
             )
         )
     return (f"WHERE {' AND '.join(clauses)}" if clauses else "", parameters)
+
+
+def _like_literal(value: str) -> str:
+    """Escape user scope text before it enters a SQLite LIKE pattern."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

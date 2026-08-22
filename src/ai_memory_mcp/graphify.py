@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import json
 from collections import defaultdict, deque
 from pathlib import Path
@@ -22,6 +23,7 @@ class GraphifyAdapter:
         self.primary_source_id = primary_source_id
         self.source_ids = frozenset((primary_source_id, *source_ids))
         self._stamp: tuple[int, int] | None = None
+        self._available = False
         self.metadata: dict[str, Any] = {}
         self.nodes: dict[str, dict[str, Any]] = {}
         self.adjacency: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
@@ -43,12 +45,15 @@ class GraphifyAdapter:
             self.source_nodes = defaultdict(set)
             self.metadata = {}
             self._stamp = None
+            self._available = False
             return
         stat = self.graph_path.stat()
         stamp = (stat.st_mtime_ns, stat.st_size)
         if stamp == self._stamp:
             return
         payload = json.loads(self.graph_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("The graph snapshot must contain one JSON object.")
         metadata = payload.get("graph", {})
         self.metadata = metadata if isinstance(metadata, dict) else {}
         self.nodes = {str(node["id"]): node for node in payload.get("nodes", [])}
@@ -67,11 +72,12 @@ class GraphifyAdapter:
                 self.adjacency[source].append((target, edge))
                 self.adjacency[target].append((source, edge))
         self._stamp = stamp
+        self._available = True
 
     def health(self) -> dict[str, Any]:
         self._load()
         return {
-            "available": bool(self.nodes),
+            "available": self._available,
             "path": str(self.graph_path),
             "nodes": len(self.nodes),
             "edges": sum(len(values) for values in self.adjacency.values()) // 2,
@@ -80,42 +86,123 @@ class GraphifyAdapter:
             "index_snapshot": self.metadata.get("index_snapshot"),
         }
 
-    def rank(self, query: str, candidate_paths: list[str], limit: int = 30) -> list[str]:
+    @staticmethod
+    def _path_key(value: object) -> str:
+        return str(value or "").replace("\\", "/").casefold()
+
+    def _node_allowed(
+        self,
+        node_id: str,
+        allowed_paths: frozenset[str] | None,
+    ) -> bool:
+        if allowed_paths is None:
+            return True
+        source = self._path_key(self.nodes[node_id].get("source_file"))
+        # Scope nodes contain no source document. They can connect allowed
+        # documents, but a disallowed document can never become an intermediate.
+        return not source or source in allowed_paths
+
+    @staticmethod
+    def _edge_weight(edge: dict[str, Any]) -> float:
+        confidence = str(edge.get("confidence") or "").casefold()
+        return {
+            "declared": 1.0,
+            "high": 0.9,
+            "medium": 0.65,
+            "low": 0.35,
+        }.get(confidence, 0.5)
+
+    def rank(
+        self,
+        query: str,
+        candidate_paths: list[str],
+        limit: int = 30,
+        *,
+        allowed_paths: set[str] | frozenset[str] | None = None,
+        max_depth: int = 2,
+    ) -> list[str]:
         self._load()
+        allowed = (
+            frozenset(self._path_key(path) for path in allowed_paths)
+            if allowed_paths is not None
+            else None
+        )
         query_tokens = set(tokenize(query))
         path_priority = {
-            path.replace("\\", "/").casefold(): len(candidate_paths) - rank
+            self._path_key(path): len(candidate_paths) - rank
             for rank, path in enumerate(candidate_paths)
         }
-        scores: list[tuple[float, str]] = []
+        seed_scores: list[tuple[float, str]] = []
         for node_id, node in self.nodes.items():
+            if not self._node_allowed(node_id, allowed):
+                continue
             label_tokens = set(tokenize(str(node.get("label", ""))))
             overlap = len(query_tokens & label_tokens)
-            source = self._source_path(node.get("source_file")).casefold()
+            source = self._path_key(self._source_path(node.get("source_file")))
             path_score = path_priority.get(source, 0)
             if overlap or path_score:
-                scores.append((overlap * 4.0 + path_score * 0.25, node_id))
-        scores.sort(reverse=True)
-        ranked_paths: list[str] = []
-        seen: set[str] = set()
-        for _, node_id in scores[: max(limit * 3, limit)]:
-            node = self.nodes[node_id]
-            source = self._source_path(node.get("source_file"))
-            if source and source.casefold() not in seen:
-                ranked_paths.append(source)
-                seen.add(source.casefold())
-            for neighbor_id, _ in self.adjacency.get(node_id, []):
-                neighbor_source = self._source_path(
-                    self.nodes[neighbor_id].get("source_file")
+                seed_scores.append(
+                    (overlap * 4.0 + path_score * 0.25, node_id)
                 )
-                if neighbor_source and neighbor_source.casefold() not in seen:
-                    ranked_paths.append(neighbor_source)
-                    seen.add(neighbor_source.casefold())
-        return ranked_paths[:limit]
+        seed_scores.sort(reverse=True)
+        path_scores: dict[str, tuple[float, str]] = {}
+        bounded_depth = max(0, min(max_depth, 4))
+        for seed_score, seed_id in seed_scores[: max(limit * 3, limit)]:
+            queue = [(-seed_score, 0, seed_id)]
+            best_scores = {(seed_id, 0): seed_score}
+            while queue:
+                negative_score, distance, node_id = heapq.heappop(queue)
+                score = -negative_score
+                if score < best_scores.get((node_id, distance), 0.0):
+                    continue
+                source = self._source_path(
+                    self.nodes[node_id].get("source_file")
+                )
+                key = self._path_key(source)
+                if source and (
+                    key not in path_scores or score > path_scores[key][0]
+                ):
+                    path_scores[key] = (score, source)
+                if distance >= bounded_depth:
+                    continue
+                for neighbor_id, edge in self.adjacency.get(node_id, []):
+                    if not self._node_allowed(neighbor_id, allowed):
+                        continue
+                    next_score = (
+                        score
+                        * self._edge_weight(edge)
+                        * 0.45
+                    )
+                    state = (neighbor_id, distance + 1)
+                    if next_score <= best_scores.get(state, 0.0):
+                        continue
+                    # A stronger path must replace a weaker path discovered first.
+                    best_scores[state] = next_score
+                    heapq.heappush(
+                        queue,
+                        (-next_score, distance + 1, neighbor_id),
+                    )
+        ranked = sorted(
+            path_scores.values(),
+            key=lambda item: (-item[0], item[1].casefold()),
+        )
+        return [path for _, path in ranked[:limit]]
 
-    def neighbors(self, path: str, depth: int = 1, limit: int = 20) -> list[dict[str, Any]]:
+    def neighbors(
+        self,
+        path: str,
+        depth: int = 1,
+        limit: int = 20,
+        *,
+        allowed_paths: set[str] | frozenset[str] | None = None,
+    ) -> list[dict[str, Any]]:
         self._load()
-        starts = self.source_nodes.get(path.replace("\\", "/").casefold(), set())
+        allowed = (
+            frozenset(self._path_key(item) for item in allowed_paths)
+            if allowed_paths is not None
+            else None
+        )
+        starts = self.source_nodes.get(self._path_key(path), set())
         queue = deque((node_id, 0) for node_id in starts)
         visited = set(starts)
         results: list[dict[str, Any]] = []
@@ -124,7 +211,10 @@ class GraphifyAdapter:
             if distance >= depth:
                 continue
             for neighbor_id, edge in self.adjacency.get(node_id, []):
-                if neighbor_id in visited:
+                if (
+                    neighbor_id in visited
+                    or not self._node_allowed(neighbor_id, allowed)
+                ):
                     continue
                 visited.add(neighbor_id)
                 node = self.nodes[neighbor_id]
@@ -141,10 +231,22 @@ class GraphifyAdapter:
                 queue.append((neighbor_id, distance + 1))
         return results
 
-    def path(self, source_path: str, target_path: str, max_depth: int = 6) -> list[dict[str, Any]]:
+    def path(
+        self,
+        source_path: str,
+        target_path: str,
+        max_depth: int = 6,
+        *,
+        allowed_paths: set[str] | frozenset[str] | None = None,
+    ) -> list[dict[str, Any]]:
         self._load()
-        starts = self.source_nodes.get(source_path.replace("\\", "/").casefold(), set())
-        targets = self.source_nodes.get(target_path.replace("\\", "/").casefold(), set())
+        allowed = (
+            frozenset(self._path_key(item) for item in allowed_paths)
+            if allowed_paths is not None
+            else None
+        )
+        starts = self.source_nodes.get(self._path_key(source_path), set())
+        targets = self.source_nodes.get(self._path_key(target_path), set())
         if not starts or not targets:
             return []
         queue = deque(starts)
@@ -161,7 +263,10 @@ class GraphifyAdapter:
             if depths[node_id] >= max_depth:
                 continue
             for neighbor_id, edge in self.adjacency.get(node_id, []):
-                if neighbor_id in parents:
+                if (
+                    neighbor_id in parents
+                    or not self._node_allowed(neighbor_id, allowed)
+                ):
                     continue
                 parents[neighbor_id] = (node_id, edge)
                 depths[neighbor_id] = depths[node_id] + 1

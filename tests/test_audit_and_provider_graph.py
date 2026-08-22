@@ -35,18 +35,51 @@ def test_retrieval_audit_records_query_result_and_performance(
     ]
     record = records[-1]
     assert record["event"] == "retrieval_completed"
-    assert record["query"] == query
+    assert query not in json.dumps(record)
+    assert record["query_sha256"]
+    assert record["query_characters"] == len(query)
     assert record["elapsed_ms"] >= 0
     assert record["response"]["status"] == result.status
-    assert record["response"]["evidence"][0]["memory_id"] == "mem-alpha-retry"
+    assert record["response"]["evidence_count"] == 1
+    assert record["response"]["evidence"][0]["evidence_class"] == "distilled"
     assert record["diagnostics"]["route"] == "search"
     assert set(record["diagnostics"]["provider_latency_ms"]) == {
         "lexical",
         "semantic",
         "graphify",
         "fusion",
+        "rerank",
         "context",
     }
+
+
+def test_retrieval_audit_does_not_store_scope_values(
+    benchmark_settings: Settings,
+    tmp_path: Path,
+) -> None:
+    settings = replace(benchmark_settings, log_dir=tmp_path / "logs")
+    query = "private retrieval question marker"
+    repository = "private repository marker"
+    ticket = "PRIVATE-999"
+
+    MemoryService(settings).recall(
+        query,
+        repository=repository,
+        ticket=ticket,
+        limit=1,
+    )
+    record = json.loads(
+        (settings.resolved_log_dir / "retrieval.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[-1]
+    )
+    serialized = json.dumps(record)
+
+    assert query not in serialized
+    assert repository not in serialized
+    assert ticket not in serialized
+    assert record["scope"]["repository"] is True
+    assert record["scope"]["ticket"] is True
 
 
 def test_index_waits_for_concurrent_publisher(

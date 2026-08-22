@@ -142,7 +142,13 @@ def append_event(
 def logging_status(settings: "Settings") -> dict[str, Any]:
     log_dir = settings.resolved_log_dir
     streams = {}
-    for name in ("index", "retrieval"):
+    for name in (
+        "index",
+        "generation",
+        "artifact-intake",
+        "distillation",
+        "retrieval",
+    ):
         path = log_dir / f"{name}.jsonl"
         streams[name] = {
             "path": str(path),

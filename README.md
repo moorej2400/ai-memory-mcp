@@ -126,21 +126,30 @@ Use `memory_artifact_read` to read ordered source context around an `artifact://
 
 ## Refresh architecture
 
-`memory_sync` updates the derived indexes after a canonical change.
+`memory_sync` publishes one coordinated derived generation after a canonical change.
 
 ```mermaid
 flowchart TB
     MdChange["Markdown change"] --> Sync["memory_sync"]
     ArtChange["Artifact batch ingest"] --> Sync
     Sync --> Stage["Build staged indexes"]
-    Stage --> Validate{"Validation"}
-    Validate -->|pass| Publish["Publish the index pointer"]
-    Validate -->|fail| Keep["Keep the last satisfactory index"]
+    Stage --> Md["Stage Markdown vectors"]
+    Stage --> Art["Stage artifact vectors"]
+    Stage --> Graph["Stage Graphify"]
+    Md --> Validate{"Validate all layers"}
+    Art --> Validate
+    Graph --> Validate
+    Validate -->|pass| Publish["Publish one generation pointer"]
+    Validate -->|fail| Keep["Keep the previous generation"]
     Publish --> Health["Run health and retrieval checks"]
 ```
 
-The Graphify maintenance script rebuilds the graph on the same staged pattern.
-It validates staged data, publishes it, and keeps the last satisfactory graph after a failure.
+Each recall pins one published generation and one artifact database read snapshot.
+The recall never combines components from different generations.
+
+The system retains the active generation and one verified previous generation.
+Retention removes only derived snapshots.
+Retention never removes canonical artifacts or required object files.
 
 A failed refresh never changes either canonical store.
 
@@ -163,8 +172,8 @@ The MCP facade never exposes an artifact write operation.
 |---|---|
 | `memory_recall` | Returns cited Markdown and artifact evidence. |
 | `memory_artifact_read` | Returns ordered raw context for one artifact reference. |
-| `memory_sync` | Updates the derived indexes after a canonical change. |
-| `memory_status` | Reports source, index, artifact, Graphify, and runtime status. |
+| `memory_sync` | Publishes one coordinated generation after a canonical change. |
+| `memory_status` | Reports strict health for every required layer. |
 
 ## Reliability and performance
 
@@ -175,7 +184,11 @@ The MCP facade never exposes an artifact write operation.
 - One query loads context for all returned records.
 - Recall results omit internal provider diagnostics.
 - Incremental indexing skips unchanged Markdown files.
-- Versioned snapshots preserve the last satisfactory index.
+- Incremental artifact indexing skips unchanged bursts.
+- Large vector corpora use ANN candidates with exact reranking.
+- Versioned generations preserve the last satisfactory state.
+- Recall uses only components from one generation.
+- Health reports missing and stale layers.
 - Artifact intake validates a complete batch before it changes SQLite.
 - Artifact backups verify a restored copy against the same digest.
 - A redaction moves object bytes to quarantine, because the project never deletes a file.

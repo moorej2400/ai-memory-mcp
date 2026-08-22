@@ -100,9 +100,11 @@ def test_read_tools_do_not_build_a_missing_index(
 
     assert status.index.available is False
     assert recall.status == "no_answer"
-    assert recall.warnings == [
-        "Memory index is not available. Call memory_sync."
-    ]
+    assert "Memory index is not available. Call memory_sync." in recall.warnings
+    assert any(
+        "Artifact semantic index is not available" in warning
+        for warning in recall.warnings
+    )
     assert not list(state_dir.glob("index-*.sqlite"))
     assert not (state_dir / "current-index.json").exists()
     assert (state_dir / "logs" / "retrieval.jsonl").is_file()

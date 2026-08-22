@@ -15,7 +15,7 @@ from urllib.parse import quote
 from ai_memory_mcp import __version__
 from ai_memory_mcp.config import Settings
 
-ARTIFACT_SCHEMA_VERSION = 3
+ARTIFACT_SCHEMA_VERSION = 4
 NETWORK_FILESYSTEM_TYPES = {
     "9p",
     "afpfs",
@@ -519,6 +519,167 @@ MIGRATION_3_STATEMENTS = (
 )
 
 
+MIGRATION_4_STATEMENTS = (
+    """
+    CREATE TABLE artifact_vector_dirty (
+        parent_artifact_id TEXT PRIMARY KEY,
+        change_counter INTEGER NOT NULL CHECK(change_counter >= 0)
+    )
+    """,
+    """
+    CREATE TRIGGER artifacts_vector_dirty_insert
+    AFTER INSERT ON artifacts
+    BEGIN
+        INSERT OR REPLACE INTO artifact_vector_dirty(
+            parent_artifact_id, change_counter
+        )
+        SELECT
+            CASE
+                WHEN new.entity IN ('message', 'transcript-cue')
+                    THEN new.parent_artifact_id
+                WHEN new.entity IN ('conversation', 'transcript')
+                    THEN new.artifact_id
+                WHEN new.entity = 'attachment'
+                    THEN (
+                        SELECT parent_artifact_id FROM artifacts
+                        WHERE artifact_id = new.parent_artifact_id
+                    )
+            END,
+            CAST((
+                SELECT value FROM artifact_metadata
+                WHERE key = 'change_counter'
+            ) AS INTEGER) + 1
+        WHERE new.entity IN (
+            'message', 'transcript-cue', 'conversation',
+            'transcript', 'attachment'
+        )
+          AND CASE
+                WHEN new.entity IN ('message', 'transcript-cue')
+                    THEN new.parent_artifact_id
+                WHEN new.entity IN ('conversation', 'transcript')
+                    THEN new.artifact_id
+                WHEN new.entity = 'attachment'
+                    THEN (
+                        SELECT parent_artifact_id FROM artifacts
+                        WHERE artifact_id = new.parent_artifact_id
+                    )
+              END IS NOT NULL;
+    END
+    """,
+    """
+    CREATE TRIGGER artifacts_vector_dirty_update
+    AFTER UPDATE ON artifacts
+    BEGIN
+        INSERT OR REPLACE INTO artifact_vector_dirty(
+            parent_artifact_id, change_counter
+        )
+        SELECT parent_artifact_id, CAST((
+            SELECT value FROM artifact_metadata
+            WHERE key = 'change_counter'
+        ) AS INTEGER) + 1
+        FROM (
+            SELECT CASE
+                WHEN old.entity IN ('message', 'transcript-cue')
+                    THEN old.parent_artifact_id
+                WHEN old.entity IN ('conversation', 'transcript')
+                    THEN old.artifact_id
+                WHEN old.entity = 'attachment'
+                    THEN (
+                        SELECT parent_artifact_id FROM artifacts
+                        WHERE artifact_id = old.parent_artifact_id
+                    )
+            END AS parent_artifact_id
+            UNION
+            SELECT CASE
+                WHEN new.entity IN ('message', 'transcript-cue')
+                    THEN new.parent_artifact_id
+                WHEN new.entity IN ('conversation', 'transcript')
+                    THEN new.artifact_id
+                WHEN new.entity = 'attachment'
+                    THEN (
+                        SELECT parent_artifact_id FROM artifacts
+                        WHERE artifact_id = new.parent_artifact_id
+                    )
+            END AS parent_artifact_id
+        )
+        WHERE parent_artifact_id IS NOT NULL;
+    END
+    """,
+    """
+    CREATE TRIGGER artifacts_vector_dirty_delete
+    BEFORE DELETE ON artifacts
+    BEGIN
+        INSERT OR REPLACE INTO artifact_vector_dirty(
+            parent_artifact_id, change_counter
+        )
+        SELECT
+            CASE
+                WHEN old.entity IN ('message', 'transcript-cue')
+                    THEN old.parent_artifact_id
+                WHEN old.entity IN ('conversation', 'transcript')
+                    THEN old.artifact_id
+                WHEN old.entity = 'attachment'
+                    THEN (
+                        SELECT parent_artifact_id FROM artifacts
+                        WHERE artifact_id = old.parent_artifact_id
+                    )
+            END,
+            CAST((
+                SELECT value FROM artifact_metadata
+                WHERE key = 'change_counter'
+            ) AS INTEGER) + 1
+        WHERE old.entity IN (
+            'message', 'transcript-cue', 'conversation',
+            'transcript', 'attachment'
+        )
+          AND CASE
+                WHEN old.entity IN ('message', 'transcript-cue')
+                    THEN old.parent_artifact_id
+                WHEN old.entity IN ('conversation', 'transcript')
+                    THEN old.artifact_id
+                WHEN old.entity = 'attachment'
+                    THEN (
+                        SELECT parent_artifact_id FROM artifacts
+                        WHERE artifact_id = old.parent_artifact_id
+                    )
+              END IS NOT NULL;
+    END
+    """,
+    """
+    INSERT OR REPLACE INTO artifact_vector_dirty(
+        parent_artifact_id, change_counter
+    )
+    SELECT DISTINCT
+        CASE
+            WHEN child.entity IN ('message', 'transcript-cue')
+                THEN child.parent_artifact_id
+            WHEN child.entity IN ('conversation', 'transcript')
+                THEN child.artifact_id
+            WHEN child.entity = 'attachment'
+                THEN parent.parent_artifact_id
+        END,
+        CAST(metadata.value AS INTEGER)
+    FROM artifacts AS child
+    LEFT JOIN artifacts AS parent
+      ON parent.artifact_id = child.parent_artifact_id
+    JOIN artifact_metadata AS metadata
+      ON metadata.key = 'change_counter'
+    WHERE child.entity IN (
+        'message', 'transcript-cue', 'conversation',
+        'transcript', 'attachment'
+    )
+      AND CASE
+            WHEN child.entity IN ('message', 'transcript-cue')
+                THEN child.parent_artifact_id
+            WHEN child.entity IN ('conversation', 'transcript')
+                THEN child.artifact_id
+            WHEN child.entity = 'attachment'
+                THEN parent.parent_artifact_id
+          END IS NOT NULL
+    """,
+)
+
+
 def _backup_database(
     connection: sqlite3.Connection,
     settings: Settings,
@@ -619,6 +780,27 @@ def _apply_migration_3(connection: sqlite3.Connection) -> None:
         connection.commit()
 
 
+def _apply_migration_4(connection: sqlite3.Connection) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for statement in MIGRATION_4_STATEMENTS:
+            connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO artifact_schema_migrations(
+                version, applied_at, application_version
+            ) VALUES (?, ?, ?)
+            """,
+            (4, now, __version__),
+        )
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
 def migrate_artifact_db(settings: Settings) -> MigrationResult:
     """Move the canonical artifact database to the current schema."""
     path = settings.artifact_db.expanduser()
@@ -649,6 +831,9 @@ def migrate_artifact_db(settings: Settings) -> MigrationResult:
         if from_version < 3:
             _apply_migration_3(connection)
             applied.append(3)
+        if from_version < 4:
+            _apply_migration_4(connection)
+            applied.append(4)
 
     _private_file(path)
     return MigrationResult(

@@ -72,8 +72,10 @@ def _resolve_link(
 def build_provider_graph(
     settings: Settings,
     output_dir: Path,
+    *,
+    index_path: Path | None = None,
 ) -> dict[str, Any]:
-    index_path = current_index_path(settings)
+    index_path = index_path or current_index_path(settings)
     if index_path is None:
         raise FileNotFoundError(
             "Memory index is not available. Run memory_sync before Graphify refresh."

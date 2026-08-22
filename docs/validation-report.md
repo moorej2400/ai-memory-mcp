@@ -1,6 +1,6 @@
 # Validation Report
 
-Date: 2026-08-16
+Date: 2026-08-19
 
 Status: satisfactory
 
@@ -15,11 +15,11 @@ Status: satisfactory
 
 ## Automated tests
 
-All 374 automated tests passed.
+All 403 automated tests passed.
 The tests covered storage layout, artifact intake, retrieval, distillation, migration, recovery, MCP tools, client merging, and repository privacy.
-All eight provider TypeScript test files passed.
+All nine provider TypeScript test files passed.
 The provider shell setup test passed.
-The artifact database uses schema version 3.
+The artifact database uses schema version 4.
 
 ## Frozen benchmark
 
@@ -34,8 +34,10 @@ All 20 cases passed.
 | No-answer accuracy | 1.000 |
 | Scope leakage | 0.000 |
 | Citation failures | 0.000 |
-| Median latency | 3.21 ms |
-| 95th percentile latency | 6.98 ms |
+| Median latency | 11.70 ms |
+| 95th percentile latency | 13.61 ms |
+| Document diversity at 5 | 1.000 |
+| Stale-layer behavior | Passed |
 
 The frozen contract SHA-256 value is:
 
@@ -48,19 +50,22 @@ The fixture contained 100 conversations, 100,000 messages, 100 meetings, 100 tra
 
 | Metric | Result |
 |---|---:|
-| Batch validation | 14.736 s |
-| SQLite intake | 51.252 s |
-| Active SQLite files | 809,541,120 bytes |
-| Warm FTS median | 1.373 ms |
-| Warm FTS 95th percentile | 1.682 ms |
-| Ordered-read median | 3.681 ms |
-| Ordered-read 95th percentile | 4.031 ms |
-| Burst-index build | 25.838 s |
-| Warm fused-recall median | 216.326 ms |
-| Warm fused-recall 95th percentile | 301.651 ms |
+| Batch validation | 14.098 s |
+| SQLite intake | 46.627 s |
+| Active SQLite files | 809,652,120 bytes |
+| Warm FTS median | 1.432 ms |
+| Warm FTS 95th percentile | 1.754 ms |
+| Ordered-read median | 3.779 ms |
+| Ordered-read 95th percentile | 4.134 ms |
+| Burst-index build | 26.275 s |
+| Artifact vector recall at 5 | 1.000 |
+| Minimum ANN candidates | 1,000 |
+| Warm fused-recall median | 442.703 ms |
+| Warm fused-recall 95th percentile | 573.597 ms |
 
 The burst index contained 18,800 deterministic bursts.
 All 18,800 bursts had hashed vectors.
+The artifact benchmark used the random-projection ANN backend.
 
 The JSONL fixture SHA-256 value is:
 
