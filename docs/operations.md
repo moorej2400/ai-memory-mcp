@@ -175,6 +175,11 @@ Run a dry-run check on macOS or Linux:
 ```
 
 Check the reported counts and unresolved identities.
+Check `synthetic_note_identities` when old Markdown has no provider identity.
+Each synthetic identity uses the note name and content SHA-256.
+Treat synthetic identities as separate review records.
+Check `duplicate_note_mappings` for multiple notes linked to one provider record.
+The migration keeps each duplicate note as a separate transcript identity.
 The `database_sha256` value identifies the logical database snapshot.
 Stop the import if a required count is incorrect.
 

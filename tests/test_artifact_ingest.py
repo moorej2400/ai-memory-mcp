@@ -39,6 +39,7 @@ def _event(
     entity: str,
     external_id: str,
     text: str | None = None,
+    title: str | None = None,
     parent_entity: str | None = None,
     parent_external_id: str | None = None,
     operation: str = "upsert",
@@ -61,6 +62,7 @@ def _event(
         payload = RedactionPayload(reason="Source privacy request")
     else:
         payload = ArtifactPayload(
+            title=title,
             text=text,
             content_format="plain",
             classification=classification,
@@ -146,6 +148,21 @@ def test_replayed_events_are_idempotent(artifact_store: ArtifactStore) -> None:
     assert second.accepted == 0
     assert second.unchanged == 2
     assert artifact_store.count("message") == 1
+
+
+def test_large_batches_use_bounded_redaction_lookups(
+    artifact_store: ArtifactStore,
+) -> None:
+    events = [
+        _event(entity="conversation", external_id=f"conversation-{index}")
+        for index in range(1005)
+    ]
+
+    first = artifact_store.apply_batch(_batch(events, batch_id="large-batch-1"))
+    second = artifact_store.apply_batch(_batch(events, batch_id="large-batch-2"))
+
+    assert first.accepted == len(events)
+    assert second.unchanged == len(events)
 
 
 def test_replayed_batch_id_returns_stored_receipt(
@@ -403,6 +420,188 @@ def test_source_sequence_has_priority_over_source_time(
         )
     )
     assert receipt.stale == 1
+
+
+def test_equal_source_sequence_uses_updated_at_as_tiebreaker(
+    artifact_store: ArtifactStore,
+) -> None:
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="conversation-refresh",
+                    text="Before refresh",
+                    source_sequence=7,
+                    source_updated_at="2026-01-02T09:00:00Z",
+                )
+            ],
+            batch_id="conversation-refresh-initial",
+        )
+    )
+    receipt = artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="conversation-refresh",
+                    text="After refresh",
+                    source_sequence=7,
+                    source_updated_at="2026-01-02T10:00:00Z",
+                )
+            ],
+            batch_id="conversation-refresh-later",
+        )
+    )
+
+    assert receipt.accepted == 1
+    assert receipt.conflicts == 0
+    assert artifact_store.get_by_external_id(
+        "chat-source", "workspace", "conversation", "conversation-refresh"
+    ).text_content == "After refresh"
+
+
+def test_same_payload_ordering_metadata_enrichment_is_not_a_conflict(
+    artifact_store: ArtifactStore,
+) -> None:
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="metadata-enrichment-conversation",
+                    text="Stable conversation snapshot",
+                )
+            ],
+            batch_id="metadata-enrichment-initial",
+        )
+    )
+    receipt = artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="metadata-enrichment-conversation",
+                    text="Stable conversation snapshot",
+                    source_version="provider-revision-1",
+                )
+            ],
+            batch_id="metadata-enrichment-replay",
+        )
+    )
+
+    assert receipt.accepted == 1
+    assert receipt.conflicts == 0
+
+
+def test_unordered_recording_title_enrichment_is_not_a_conflict(
+    artifact_store: ArtifactStore,
+) -> None:
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="recording",
+                    external_id="recording-title-enrichment",
+                    source_payload={"source_url": "https://example.test/recording"},
+                )
+            ],
+            batch_id="recording-title-enrichment-initial",
+        )
+    )
+    receipt = artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="recording",
+                    external_id="recording-title-enrichment",
+                    title="Teams Meeting",
+                    source_payload={"source_url": "https://example.test/recording"},
+                )
+            ],
+            batch_id="recording-title-enrichment-replay",
+        )
+    )
+
+    assert receipt.accepted == 1
+    assert receipt.conflicts == 0
+
+
+def test_unordered_recording_metadata_superset_is_not_a_conflict(
+    artifact_store: ArtifactStore,
+) -> None:
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="meeting",
+                    external_id="meeting-1",
+                    title="Teams Meeting",
+                ),
+                _event(
+                    entity="recording",
+                    external_id="recording-metadata-superset",
+                    title="Teams Meeting",
+                    source_payload={"source_url": "https://example.test/recording"},
+                ),
+            ],
+            batch_id="recording-metadata-superset-initial",
+        )
+    )
+    receipt = artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="recording",
+                    external_id="recording-metadata-superset",
+                    title="Teams Meeting",
+                    parent_entity="meeting",
+                    parent_external_id="meeting-1",
+                    source_payload={
+                        "source_url": "https://example.test/recording",
+                        "conversation_id": "conversation-1",
+                    },
+                )
+            ],
+            batch_id="recording-metadata-superset-replay",
+        )
+    )
+
+    assert receipt.accepted == 1
+    assert receipt.conflicts == 0
+
+
+def test_ordered_provider_snapshot_replaces_unordered_legacy_payload(
+    artifact_store: ArtifactStore,
+) -> None:
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="ordered-migration-conversation",
+                    text="Legacy snapshot",
+                )
+            ],
+            batch_id="ordered-migration-initial",
+        )
+    )
+    receipt = artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="ordered-migration-conversation",
+                    text="Provider-enriched snapshot",
+                    source_version="provider-revision-1",
+                )
+            ],
+            batch_id="ordered-migration-replay",
+        )
+    )
+
+    assert receipt.accepted == 1
+    assert receipt.conflicts == 0
 
 
 def test_event_identity_ignores_lower_priority_ordering_fields(
@@ -982,6 +1181,68 @@ def test_complete_coverage_tombstones_an_omitted_child(
     )
     assert receipt.tombstones == 1
     assert artifact_store.count("message") == 0
+
+
+def test_conflicting_parent_snapshot_cannot_drive_coverage_tombstones(
+    artifact_store: ArtifactStore,
+    artifact_settings: Settings,
+) -> None:
+    artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="conversation-legacy-replay",
+                    text="Current conversation",
+                    source_updated_at="2026-01-02T11:00:00Z",
+                ),
+                _event(
+                    entity="message",
+                    external_id="message-legacy-replay",
+                    text="Current message",
+                    parent_entity="conversation",
+                    parent_external_id="conversation-legacy-replay",
+                    source_updated_at="2026-01-02T10:00:00Z",
+                ),
+            ],
+            batch_id="batch-current-parent",
+        )
+    )
+    claim = CoverageClaim(
+        parent=ArtifactReference(
+            entity="conversation",
+            external_id="conversation-legacy-replay",
+        ),
+        entity="message",
+        complete=True,
+    )
+
+    receipt = artifact_store.apply_batch(
+        _batch(
+            [
+                _event(
+                    entity="conversation",
+                    external_id="conversation-legacy-replay",
+                    text=None,
+                )
+            ],
+            batch_id="batch-conflicting-parent",
+            coverage=[claim],
+        )
+    )
+
+    with connect_artifact_db(
+        artifact_settings.artifact_db,
+        read_only=True,
+    ) as connection:
+        coverage_count = connection.execute(
+            "SELECT count(*) FROM artifact_coverage WHERE batch_id = ?",
+            ("batch-conflicting-parent",),
+        ).fetchone()[0]
+    assert receipt.conflicts == 1
+    assert receipt.tombstones == 0
+    assert artifact_store.count("message") == 1
+    assert coverage_count == 0
 
 
 def test_duplicate_complete_coverage_is_applied_once(

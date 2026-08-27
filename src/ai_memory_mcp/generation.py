@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from .artifacts.schema import ClosingSQLiteConnection
 from .audit import append_event, file_lock
 from .config import Settings
 
@@ -246,6 +247,7 @@ def _sqlite_metrics(path: Path, count_sql: str) -> dict[str, Any]:
     with sqlite3.connect(
         f"file:{path.resolve().as_posix()}?mode=ro",
         uri=True,
+        factory=ClosingSQLiteConnection,
     ) as connection:
         integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
         if integrity != "ok":
@@ -359,6 +361,7 @@ def _valid_generation_components(
         with sqlite3.connect(
             f"file:{artifact.resolve().as_posix()}?mode=ro",
             uri=True,
+            factory=ClosingSQLiteConnection,
         ) as connection:
             row = connection.execute(
                 "SELECT value FROM metadata "

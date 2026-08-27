@@ -169,6 +169,132 @@ def test_repeated_legacy_import_is_a_no_op(
     assert second.unchanged_events == 10
 
 
+def test_meeting_note_uses_exact_ical_uid_before_display_title(
+    artifact_settings: Settings,
+    legacy_fixture: LegacyFixture,
+    tmp_path: Path,
+) -> None:
+    note = tmp_path / "provider-note.md"
+    note.write_text(
+        "---\n"
+        "type: meeting\n"
+        "title: A title that does not match\n"
+        "ical_uid: provider-uid-1\n"
+        "meeting_start: '2026-01-02T09:00:00Z'\n"
+        "---\n\n"
+        "# A title that does not match\n\n"
+        "## Transcript\n\n"
+        "09:05 Actor A: Provider identity is stable.\n",
+        encoding="utf-8",
+    )
+    with sqlite3.connect(legacy_fixture.database) as connection:
+        connection.execute(
+            "UPDATE meetings SET raw_json = ?",
+            ('{"subject":"Provider subject","iCalUid":"provider-uid-1"}',),
+        )
+
+    plan = plan_legacy_migration(
+        source="chat-source",
+        source_instance="workspace",
+        sync_db=legacy_fixture.database,
+        meeting_notes=note,
+    )
+
+    assert plan.unresolved_identities == 0
+    assert plan.synthetic_note_identities == 0
+
+
+def test_unmatched_meeting_note_gets_explicit_synthetic_identity(
+    artifact_settings: Settings,
+    legacy_fixture: LegacyFixture,
+    tmp_path: Path,
+) -> None:
+    note = tmp_path / "unmatched-note.md"
+    note.write_text(
+        "---\n"
+        "type: meeting\n"
+        "title: Meeting not present in sync\n"
+        "meeting_start: '2026-01-03T09:00:00Z'\n"
+        "---\n\n"
+        "# Meeting not present in sync\n\n"
+        "## Summary\n\n"
+        "Keep this summary as a review candidate.\n\n"
+        "## Transcript\n\n"
+        "09:05 Actor A: Preserve this transcript.\n",
+        encoding="utf-8",
+    )
+
+    plan = plan_legacy_migration(
+        source="chat-source",
+        source_instance="workspace",
+        sync_db=legacy_fixture.database,
+        meeting_notes=note,
+    )
+    assert plan.unresolved_identities == 0
+    assert plan.synthetic_note_identities == 1
+
+    receipt = run_legacy_migration(
+        artifact_settings,
+        source="chat-source",
+        source_instance="workspace",
+        sync_db=legacy_fixture.database,
+        meeting_notes=note,
+    )
+    assert receipt.synthetic_note_identities == 1
+    assert receipt.verified is True
+    with connect_artifact_db(artifact_settings.artifact_db, read_only=True) as connection:
+        entities = dict(
+            connection.execute(
+                "SELECT entity, count(*) FROM artifacts GROUP BY entity"
+            )
+        )
+        assert entities["meeting"] == 2
+        assert entities["transcript"] == 1
+
+
+def test_duplicate_meeting_notes_are_all_preserved(
+    artifact_settings: Settings,
+    legacy_fixture: LegacyFixture,
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first-note.md"
+    second = tmp_path / "second-note.md"
+    first.write_text(
+        legacy_fixture.meeting_notes.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    second.write_text(
+        legacy_fixture.meeting_notes.read_text(encoding="utf-8").replace(
+            "The meeting selected the green setting and assigned a validation step.",
+            "The meeting also recorded a second review note.",
+        ),
+        encoding="utf-8",
+    )
+
+    plan = plan_legacy_migration(
+        source="chat-source",
+        source_instance="workspace",
+        sync_db=legacy_fixture.database,
+        meeting_notes=tmp_path,
+    )
+    assert plan.unresolved_identities == 0
+    assert plan.synthetic_note_identities == 0
+    assert plan.duplicate_note_mappings == 1
+    assert plan.duplicate_natural_keys == 0
+
+    run_legacy_migration(
+        artifact_settings,
+        source="chat-source",
+        source_instance="workspace",
+        sync_db=legacy_fixture.database,
+        meeting_notes=tmp_path,
+    )
+    with connect_artifact_db(artifact_settings.artifact_db, read_only=True) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM artifacts WHERE entity = 'transcript'"
+        ).fetchone()[0] == 2
+
+
 def test_legacy_retry_records_evidence_after_post_intake_failure(
     artifact_settings: Settings,
     legacy_fixture: LegacyFixture,

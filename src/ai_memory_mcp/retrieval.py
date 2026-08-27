@@ -47,6 +47,7 @@ STOPWORDS = {
 
 SEMANTIC_COVERAGE_MIN = 0.20
 SEMANTIC_MARGIN_MIN = 0.35
+SCOPED_DISTRIBUTED_COVERAGE_MIN = 0.50
 FRESHNESS_CAP = 0.03
 FRESHNESS_HALF_LIFE_DAYS = 180.0
 REVIEW_OVERDUE_PENALTY = 0.03
@@ -74,7 +75,10 @@ def _raw_exact_reason(query: str, hit: ArtifactSearchHit) -> str | None:
         hit.artifact_id.casefold(),
         hit.artifact_uri.casefold(),
     }
-    if candidate and candidate in identifiers:
+    if candidate and (
+        candidate in identifiers
+        or candidate == hit.matched_identity.casefold()
+    ):
         return "exact identifier"
     searchable = f"{hit.title}\n{hit.text}".casefold()
     if any(phrase.casefold() in searchable for phrase in _quoted_phrases(query)):
@@ -312,6 +316,22 @@ def _intent_expansions(tokens: set[str]) -> set[str]:
     }:
         expansions.update({"background", "hidden", "windowless"})
     return expansions - tokens
+
+
+def _distributed_query_coverage(
+    query: str,
+    hits: list[SearchHit],
+) -> float:
+    content_query = set(tokenize(query)) - STOPWORDS
+    if not content_query:
+        return 0.0
+    matched: set[str] = set()
+    for hit in hits:
+        searchable = (
+            f"{hit.memory_id} {hit.path} {hit.title} {hit.heading} {hit.text}"
+        )
+        matched.update(content_query & set(tokenize(searchable)))
+    return len(matched) / len(content_query)
 
 
 def _row_hit(row: sqlite3.Row, score: float, source: str, rank: int) -> SearchHit:
@@ -781,10 +801,31 @@ class RetrievalEngine:
             and semantic_margin >= SEMANTIC_MARGIN_MIN
             and top.signals.get("query_coverage", 0.0) >= SEMANTIC_COVERAGE_MIN
         )
+        corroborating_hits = [
+            hit
+            for hit in hits[:3]
+            if "lexical" in hit.ranks and "semantic" in hit.ranks
+        ]
+        narrow_scope = bool(
+            planned_scope.repository
+            or planned_scope.project
+            or planned_scope.ticket
+            or planned_scope.path_prefix
+        )
+        # A narrow query can require facts from multiple notes. Aggregate only
+        # independently corroborated hits so broad corpus noise cannot answer it.
+        distributed_evidence = bool(
+            narrow_scope
+            and len(corroborating_hits) >= 2
+            and top_score >= 0.08
+            and _distributed_query_coverage(query, corroborating_hits)
+            >= SCOPED_DISTRIBUTED_COVERAGE_MIN
+        )
         answered = bool(top) and (
             exact_evidence
             or intent_evidence
             or semantic_evidence
+            or distributed_evidence
             or (
                 corroborated_text
                 and top_score >= 0.045

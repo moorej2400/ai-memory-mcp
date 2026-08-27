@@ -10,6 +10,7 @@ import pytest
 
 import ai_memory_mcp.artifacts.schema as schema_module
 from ai_memory_mcp.ann import ANN_BANDS, available as ann_available
+import ai_memory_mcp.artifacts.vector_index as vector_index_module
 from ai_memory_mcp.artifacts.models import (
     ArtifactBatchManifest,
     ArtifactEvent,
@@ -311,6 +312,32 @@ def test_force_build_preserves_previous_snapshot(
     assert second.snapshot != first.snapshot
     assert Path(first.snapshot).is_file()
     assert Path(second.snapshot).is_file()
+
+
+def test_pointer_publication_retries_a_transient_file_lock(
+    artifact_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_settings.state_dir.mkdir(parents=True)
+    snapshot = artifact_settings.state_dir / "artifact-index-test.sqlite"
+    snapshot.touch()
+    real_replace = vector_index_module.os.replace
+    attempts = 0
+
+    def replace_after_transient_lock(source: Path, destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError("Synthetic transient pointer lock.")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(vector_index_module.os, "replace", replace_after_transient_lock)
+    monkeypatch.setattr(vector_index_module.time, "sleep", lambda _seconds: None)
+
+    vector_index_module._publish_pointer(artifact_settings, snapshot)
+
+    assert attempts == 2
+    assert artifact_settings.artifact_pointer_path.is_file()
 
 
 def test_failed_vector_build_leaves_no_final_looking_snapshot(

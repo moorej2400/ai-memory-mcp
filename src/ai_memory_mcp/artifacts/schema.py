@@ -29,6 +29,18 @@ NETWORK_FILESYSTEM_TYPES = {
 MOUNT_CACHE_SECONDS = 1.0
 
 
+class ClosingSQLiteConnection(sqlite3.Connection):
+    """Apply transaction semantics and close when a context block exits."""
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        # sqlite3.Connection.__exit__ does not close the handle. Windows then
+        # rejects publication or cleanup of the temporary database and WAL.
+        try:
+            return bool(super().__exit__(exc_type, exc, traceback))
+        finally:
+            self.close()
+
+
 @dataclass(frozen=True, slots=True)
 class MigrationResult:
     from_version: int
@@ -180,10 +192,19 @@ def connect_artifact_db(
     path = require_local_database_path(path)
     if read_only:
         uri = f"file:{quote(path.as_posix(), safe='/')}?mode=ro"
-        connection = sqlite3.connect(uri, uri=True, timeout=10.0)
+        connection = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=10.0,
+            factory=ClosingSQLiteConnection,
+        )
     else:
         _private_directory(path.parent)
-        connection = sqlite3.connect(path, timeout=10.0)
+        connection = sqlite3.connect(
+            path,
+            timeout=10.0,
+            factory=ClosingSQLiteConnection,
+        )
 
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -695,7 +716,10 @@ def _backup_database(
         f".{backup_path.name}.partial-{os.getpid()}-{time.time_ns()}"
     )
     try:
-        with sqlite3.connect(partial_path) as backup:
+        with sqlite3.connect(
+            partial_path,
+            factory=ClosingSQLiteConnection,
+        ) as backup:
             connection.backup(backup)
             integrity = str(backup.execute("PRAGMA quick_check").fetchone()[0])
             if integrity != "ok":

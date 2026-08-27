@@ -25,6 +25,8 @@ from .models import (
 )
 from .schema import connect_artifact_db, migrate_artifact_db
 
+SQLITE_VARIABLE_BATCH_SIZE = 900
+
 
 @dataclass(frozen=True, slots=True)
 class StoredArtifact:
@@ -98,6 +100,81 @@ def _parse_time(value: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _json_is_subset(current: object, incoming: object) -> bool:
+    if isinstance(current, dict):
+        return (
+            isinstance(incoming, dict)
+            and all(
+                key in incoming and _json_is_subset(value, incoming[key])
+                for key, value in current.items()
+            )
+        )
+    if isinstance(current, list):
+        return isinstance(incoming, list) and all(
+            any(
+                _json_is_subset(value, candidate)
+                and _json_is_subset(candidate, value)
+                for candidate in incoming
+            )
+            for value in current
+        )
+    return current == incoming
+
+
+def _has_recording_material_payload(payload: dict[str, Any]) -> bool:
+    return any(
+        payload.get(key) not in (None, "", [], {})
+        for key in (
+            "text",
+            "object",
+            "occurred_at",
+            "author",
+            "links",
+            "classification",
+            "participants",
+            "reactions",
+        )
+    )
+
+
+def _is_unordered_recording_metadata_enrichment(
+    current: sqlite3.Row,
+    event: ArtifactEvent,
+    parent_value: str | None,
+) -> bool:
+    """Treat a metadata-only recording superset as enrichment, not a conflict."""
+    if event.entity != "recording" or event.operation != "upsert":
+        return False
+    if any(
+        current[key] is not None
+        for key in ("source_sequence", "source_updated_at", "source_version")
+    ) or any(
+        value is not None
+        for value in (event.source_sequence, event.source_updated_at, event.source_version)
+    ):
+        return False
+    if not isinstance(event.payload, ArtifactPayload):
+        return False
+    try:
+        current_payload = json.loads(str(current["payload_json"]))
+        incoming_payload = _payload_document(event.payload)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(current_payload, dict) or not isinstance(incoming_payload, dict):
+        return False
+    if _has_recording_material_payload(current_payload) or _has_recording_material_payload(incoming_payload):
+        return False
+    current_title = current_payload.get("title") or ""
+    incoming_title = incoming_payload.get("title") or ""
+    if current_title and current_title != incoming_title:
+        return False
+    if current["parent_artifact_id"] is not None and parent_value != current["parent_artifact_id"]:
+        return False
+    current_payload.pop("title", None)
+    incoming_payload.pop("title", None)
+    return _json_is_subset(current_payload, incoming_payload)
 
 
 class ArtifactStore:
@@ -417,20 +494,27 @@ class ArtifactStore:
         }
         redacted: set[str] = set()
         if values:
-            placeholders = ",".join("?" for _ in values)
             with connect_artifact_db(
                 self.settings.artifact_db,
                 read_only=True,
             ) as connection:
-                redacted.update(
-                    str(row[0])
-                    for row in connection.execute(
-                        f"SELECT artifact_id FROM artifacts "
-                        f"WHERE redacted_at IS NOT NULL "
-                        f"AND artifact_id IN ({placeholders})",
-                        tuple(values),
+                ordered_values = sorted(values)
+                # SQLite limits bound variables per statement. Batch the
+                # redaction lookup so large legacy imports fail closed.
+                for offset in range(0, len(ordered_values), SQLITE_VARIABLE_BATCH_SIZE):
+                    chunk = ordered_values[
+                        offset : offset + SQLITE_VARIABLE_BATCH_SIZE
+                    ]
+                    placeholders = ",".join("?" for _ in chunk)
+                    redacted.update(
+                        str(row[0])
+                        for row in connection.execute(
+                            f"SELECT artifact_id FROM artifacts "
+                            f"WHERE redacted_at IS NOT NULL "
+                            f"AND artifact_id IN ({placeholders})",
+                            tuple(chunk),
+                        )
                     )
-                )
         # A redaction earlier in one batch must block later handoff reads for
         # the same artifact before the database transaction starts.
         for event in batch.events:
@@ -924,7 +1008,7 @@ class ArtifactStore:
             ):
                 ordering = "stale"
             else:
-                ordering = self._compare_ordering(current, event, payload_sha256)
+                ordering = self._compare_ordering(current, event, payload_sha256, parent_value)
             if ordering in {"stale", "conflict"}:
                 self._insert_event(
                     connection,
@@ -1233,18 +1317,53 @@ class ArtifactStore:
         current: sqlite3.Row,
         event: ArtifactEvent,
         payload_sha256: str,
+        parent_value: str | None,
     ) -> Literal["newer", "stale", "conflict"]:
+        payload_matches = payload_sha256 == current["payload_sha256"]
+        current_has_ordering = any(
+            current[key] is not None
+            for key in ("source_sequence", "source_updated_at", "source_version")
+        )
+        event_has_ordering = any(
+            value is not None
+            for value in (event.source_sequence, event.source_updated_at, event.source_version)
+        )
+        # Messages-sync discovers recording links with a sparse, unordered
+        # snapshot. A title-only enrichment must not conflict with the same
+        # recording already stored from a richer transcript artifact.
+        if _is_unordered_recording_metadata_enrichment(current, event, parent_value):
+            return "newer"
+        # A legacy artifact without ordering cannot outrank a later provider
+        # snapshot that carries Teams revision metadata, even when the payload
+        # was enriched at the same time.
+        if not current_has_ordering and event_has_ordering:
+            return "newer"
+        if current_has_ordering and not event_has_ordering:
+            return "stale" if payload_matches else "conflict"
+
         current_sequence = current["source_sequence"]
         if current_sequence is not None and event.source_sequence is not None:
             if event.source_sequence < current_sequence:
                 return "stale"
             if event.source_sequence > current_sequence:
                 return "newer"
-            return (
-                "newer"
-                if payload_sha256 == current["payload_sha256"]
-                else "conflict"
-            )
+            if payload_matches:
+                return "newer"
+            # Teams chat-list revisions can remain stable while the
+            # conversation's last-activity timestamp advances. Use that
+            # timestamp as a tie-breaker so a valid refreshed snapshot does
+            # not become a false conflict.
+            if current["source_updated_at"] is not None and event.source_updated_at is not None:
+                incoming = event.source_updated_at
+                if incoming.tzinfo is None:
+                    incoming = incoming.replace(tzinfo=timezone.utc)
+                incoming = incoming.astimezone(timezone.utc)
+                previous = _parse_time(current["source_updated_at"])
+                if incoming > previous:
+                    return "newer"
+                if incoming < previous:
+                    return "stale"
+            return "conflict"
 
         current_time = current["source_updated_at"]
         if current_time is not None and event.source_updated_at is not None:
@@ -1259,14 +1378,18 @@ class ArtifactStore:
                 return "newer"
             return (
                 "newer"
-                if payload_sha256 == current["payload_sha256"]
+                if payload_matches
                 else "conflict"
             )
 
+        # Older provider snapshots may have stored the same payload without
+        # ordering metadata. Accept later metadata enrichment instead of
+        # turning an unchanged conversation into a false conflict; never let a
+        # metadata-poor replay erase ordering already present on the artifact.
         if event.source_version == current["source_version"]:
             return (
                 "newer"
-                if payload_sha256 == current["payload_sha256"]
+                if payload_matches
                 else "conflict"
             )
         return "conflict"
@@ -1561,13 +1684,31 @@ class ArtifactStore:
                 claim.parent.external_id,
             )
             parent = connection.execute(
-                "SELECT 1 FROM artifacts WHERE artifact_id = ?",
+                "SELECT last_event_id FROM artifacts WHERE artifact_id = ?",
                 (parent_value,),
             ).fetchone()
             if parent is None:
                 raise ValueError(
                     "A complete coverage claim requires an existing parent."
                 )
+
+            parent_inputs = [
+                (event, event_value)
+                for event, artifact_value, event_value in event_artifacts
+                if (
+                    event.entity == claim.parent.entity
+                    and event.external_id == claim.parent.external_id
+                )
+            ]
+            if parent_inputs and claim.parent.entity == "conversation":
+                parent_event, parent_event_value = parent_inputs[-1]
+                # A stale conversation snapshot cannot authorize message
+                # tombstones. Keep coverage claims without a parent event valid.
+                if (
+                    parent_event.operation != "upsert"
+                    or str(parent["last_event_id"] or "") != parent_event_value
+                ):
+                    continue
 
             present: set[str] = set()
             for event, artifact_value, _ in event_artifacts:

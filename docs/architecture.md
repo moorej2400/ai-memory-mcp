@@ -82,6 +82,7 @@ It validates identity and metadata.
 It skips unchanged content.
 It publishes a versioned SQLite snapshot.
 It prefixes each indexed path with its source ID.
+It creates compact aliases for memory identities and scopes.
 It does not modify a configured vault.
 It updates vectors only for changed Markdown chunks.
 Large vector searches use an ANN candidate index before exact reranking.
@@ -91,6 +92,8 @@ Portable installations use exact search when the ANN backend is unavailable.
 
 SQLite FTS5 supplies exact and lexical results.
 Exact matches get priority for identifiers, paths, filenames, and error text.
+Repository filters accept the canonical ID, owner and repository, repository name, or encoded folder name.
+Narrow scopes can combine independently corroborated evidence from multiple notes.
 
 ### Semantic retrieval
 
@@ -142,6 +145,9 @@ The facade returns source paths and retrieval evidence.
 | `memory_sync` | Publishes one coordinated derived generation. |
 | `memory_status` | Reports strict health for each required layer. |
 
+`memory_status` marks the index as stale when canonical Markdown differs from the published snapshot.
+Graphify is also stale when its source index is stale.
+
 ## Query procedure
 
 1. Pin one current generation manifest.
@@ -190,7 +196,9 @@ Examples include unsafe updates, unstable serialization, or insufficient provena
 ## Performance rules
 
 - Apply scope filters before ranking.
+- Resolve scope aliases through indexed lookup tables.
 - Use exact matches for stable identifiers.
+- Skip exact and relationship lookups for general questions.
 - Use reciprocal rank fusion for provider results.
 - Limit reranking to a bounded candidate set.
 - Load context for all results in one database query.

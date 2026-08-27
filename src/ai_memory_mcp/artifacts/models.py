@@ -204,6 +204,7 @@ class ArtifactSearchHit(StrictModel):
     occurred_at: datetime | None = None
     score: float = 0.0
     evidence_class: ArtifactEvidenceClass = "raw"
+    matched_identity: str = ""
 
 
 class ArtifactReadRecord(StrictModel):
@@ -341,6 +342,8 @@ class LegacyMigrationPlan(StrictModel):
     chat_notes: int = Field(ge=0)
     transcript_cues: int = Field(ge=0)
     unresolved_identities: int = Field(ge=0)
+    synthetic_note_identities: int = Field(default=0, ge=0)
+    duplicate_note_mappings: int = Field(default=0, ge=0)
     duplicate_natural_keys: int = Field(ge=0)
 
 

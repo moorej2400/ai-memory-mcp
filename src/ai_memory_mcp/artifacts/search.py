@@ -186,6 +186,105 @@ class ArtifactSearch:
             ).fetchall()
         return [self._search_hit(row, query=query) for row in rows]
 
+    def find_identity(
+        self,
+        identity: str,
+        scope: ArtifactScope | None = None,
+        limit: int = 20,
+    ) -> list[ArtifactSearchHit]:
+        """Return active artifacts that match one exact provider identity."""
+        identity = identity.strip().strip('"')
+        if not identity:
+            return []
+        if limit <= 0:
+            raise ValueError("The artifact identity limit must be positive.")
+        limit = min(limit, 100)
+        selected_scope = scope or ArtifactScope()
+        conditions = [
+            "a.deleted_at IS NULL",
+            "a.redacted_at IS NULL",
+            active_ancestor_predicate("a"),
+        ]
+        parameters: list[object] = [
+            identity,
+            identity,
+            identity,
+            identity,
+            identity,
+        ]
+        if selected_scope.source is not None:
+            conditions.append("a.source = ?")
+            parameters.append(selected_scope.source)
+        if selected_scope.source_instance is not None:
+            conditions.append("a.source_instance = ?")
+            parameters.append(selected_scope.source_instance)
+        if selected_scope.entities:
+            placeholders = ", ".join("?" for _ in selected_scope.entities)
+            conditions.append(f"a.entity IN ({placeholders})")
+            parameters.extend(selected_scope.entities)
+        if selected_scope.parent is not None:
+            conditions.append("a.parent_artifact_id = ?")
+            parameters.append(_parent_id(selected_scope.parent))
+        if selected_scope.date_from is not None:
+            conditions.append("a.occurred_at >= ?")
+            parameters.append(_utc_iso(selected_scope.date_from))
+        if selected_scope.date_to is not None:
+            conditions.append("a.occurred_at <= ?")
+            parameters.append(_utc_iso(selected_scope.date_to))
+        parameters.append(limit)
+
+        # Provider aliases are normalized outside FTS. Query them before the
+        # hybrid path so a call or drive ID cannot fall through to graph search.
+        with connect_artifact_db(
+            self.settings.artifact_db,
+            read_only=True,
+        ) as connection:
+            rows = connection.execute(
+                f"""
+                WITH identity_candidates AS (
+                    SELECT artifact_id, 0 AS identity_rank
+                    FROM artifacts
+                    WHERE artifact_id = ?
+                    UNION ALL
+                    SELECT artifact_id, 1 AS identity_rank
+                    FROM artifacts
+                    WHERE external_id = ?
+                    UNION ALL
+                    SELECT artifact_id, 2 AS identity_rank
+                    FROM artifacts
+                    WHERE substr(external_id, -(length(?) + 1)) = ':' || ?
+                    UNION ALL
+                    SELECT artifact_id, 2 AS identity_rank
+                    FROM artifact_aliases
+                    WHERE alias_value = ?
+                ), ranked_candidates AS (
+                    SELECT artifact_id, MIN(identity_rank) AS identity_rank
+                    FROM identity_candidates
+                    GROUP BY artifact_id
+                )
+                SELECT a.*, ranked_candidates.identity_rank
+                FROM ranked_candidates
+                JOIN artifacts AS a
+                    ON a.artifact_id = ranked_candidates.artifact_id
+                WHERE {' AND '.join(conditions)}
+                ORDER BY
+                    ranked_candidates.identity_rank,
+                    COALESCE(a.occurred_at, '') DESC,
+                    a.artifact_id
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        return [
+            self._search_hit(
+                row,
+                score=1.0,
+                query=identity,
+                matched_identity=identity,
+            )
+            for row in rows
+        ]
+
     def get(
         self,
         reference: str,
@@ -238,6 +337,7 @@ class ArtifactSearch:
         *,
         score: float | None = None,
         query: str | None = None,
+        matched_identity: str = "",
     ) -> ArtifactSearchHit:
         if score is None:
             relevance = max(0.0, -float(row["lexical_score"]))
@@ -258,6 +358,7 @@ class ArtifactSearch:
             occurred_at=row["occurred_at"],
             score=score,
             evidence_class="raw",
+            matched_identity=matched_identity,
         )
 
     def read(

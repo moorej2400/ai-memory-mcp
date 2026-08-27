@@ -15,7 +15,11 @@ from .models import (
     ArtifactIntegrityResult,
     ArtifactRestoreResult,
 )
-from .schema import connect_artifact_db, require_local_database_path
+from .schema import (
+    ClosingSQLiteConnection,
+    connect_artifact_db,
+    require_local_database_path,
+)
 
 HASH_CHUNK_BYTES = 1024 * 1024
 
@@ -82,7 +86,12 @@ def _sha256_file(path: Path) -> str:
 def _read_only(path: Path) -> sqlite3.Connection:
     path = require_local_database_path(path)
     uri = f"file:{quote(path.as_posix(), safe='/')}?mode=ro"
-    connection = sqlite3.connect(uri, uri=True, timeout=10.0)
+    connection = sqlite3.connect(
+        uri,
+        uri=True,
+        timeout=10.0,
+        factory=ClosingSQLiteConnection,
+    )
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 10000")
@@ -147,7 +156,10 @@ def backup_artifact_db(settings: Settings) -> ArtifactBackupResult:
                 settings.artifact_db,
                 read_only=True,
             ) as source,
-            sqlite3.connect(temporary) as target,
+            sqlite3.connect(
+                temporary,
+                factory=ClosingSQLiteConnection,
+            ) as target,
         ):
             source.backup(target)
         _private_file(temporary)
@@ -195,7 +207,13 @@ def restore_artifact_db(
     )
     require_local_database_path(temporary)
     try:
-        with _read_only(source) as backup, sqlite3.connect(temporary) as restored:
+        with (
+            _read_only(source) as backup,
+            sqlite3.connect(
+                temporary,
+                factory=ClosingSQLiteConnection,
+            ) as restored,
+        ):
             backup.backup(restored)
         _private_file(temporary)
         restored_integrity = _inspect(temporary)

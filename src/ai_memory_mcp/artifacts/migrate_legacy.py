@@ -5,7 +5,7 @@ import json
 import re
 import sqlite3
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, time, timezone
 from pathlib import Path
@@ -82,8 +82,10 @@ class LegacyData:
     meetings: list[dict[str, Any]]
     chat_notes: list[LegacyNote]
     meeting_notes: list[LegacyNote]
-    chat_mapping: dict[str, LegacyNote]
-    meeting_mapping: dict[str, LegacyNote]
+    chat_mapping: dict[str, list[LegacyNote]]
+    meeting_mapping: dict[str, list[LegacyNote]]
+    synthetic_chat_notes: list[LegacyNote]
+    synthetic_meeting_notes: list[LegacyNote]
     cues: dict[str, list[LegacyCue]]
     source_database_fingerprint: tuple[tuple[str, int, int, str], ...]
 
@@ -215,6 +217,15 @@ def _note_manifest(notes: list[LegacyNote]) -> str:
     return sha256_text(canonical_json(values))
 
 
+def _note_identity(note: LegacyNote) -> str:
+    # Include the stable file name so equal note bodies remain distinct.
+    return sha256_text(canonical_json([note.name, note.sha256]))
+
+
+def _legacy_note_external_id(note: LegacyNote) -> str:
+    return f"legacy-note:{_note_identity(note)}"
+
+
 def _conversation_id(note: LegacyNote) -> str | None:
     for key in (
         "conversation_id",
@@ -240,17 +251,31 @@ def _map_notes(
     rows: list[dict[str, Any]],
     *,
     title_key: str,
-) -> tuple[dict[str, LegacyNote], int, int]:
+    identity_candidates: Callable[
+        [LegacyNote, list[dict[str, Any]]], Iterable[str]
+    ] | None = None,
+) -> tuple[dict[str, list[LegacyNote]], list[LegacyNote], int]:
     valid_ids = {
         str(row["conversation_id"] if "conversation_id" in row else row["id"])
         for row in rows
     }
-    mapping: dict[str, LegacyNote] = {}
-    unresolved = 0
-    duplicates = 0
+    mapping: dict[str, list[LegacyNote]] = {}
+    unresolved: list[LegacyNote] = []
     for note in notes:
-        candidate = _conversation_id(note)
-        if candidate not in valid_ids:
+        candidates = (
+            [
+                str(candidate)
+                for candidate in identity_candidates(note, rows)
+                if str(candidate) in valid_ids
+            ]
+            if identity_candidates is not None
+            else []
+        )
+        if not candidates:
+            candidate = _conversation_id(note)
+            if candidate in valid_ids:
+                candidates = [candidate]
+        if not candidates:
             note_title = _title(note).casefold()
             matches = [
                 str(row["conversation_id"] if "conversation_id" in row else row["id"])
@@ -258,17 +283,47 @@ def _map_notes(
                 if str(row.get(title_key) or "").casefold() == note_title
             ]
             if len(matches) == 1:
-                candidate = matches[0]
-            else:
-                candidate = None
-        if candidate is None or candidate not in valid_ids:
-            unresolved += 1
+                candidates = matches
+        if len(candidates) != 1:
+            # A content hash gives an unambiguous identity when the provider
+            # cannot prove which meeting owns an old note. Keep the note for
+            # explicit synthetic import instead of guessing or dropping it.
+            unresolved.append(note)
             continue
-        if candidate in mapping:
-            duplicates += 1
+        mapping.setdefault(candidates[0], []).append(note)
+    duplicate_notes = sum(
+        max(len(values) - 1, 0) for values in mapping.values()
+    )
+    return mapping, unresolved, duplicate_notes
+
+
+def _meeting_identity_candidates(
+    note: LegacyNote,
+    rows: list[dict[str, Any]],
+) -> Iterable[str]:
+    """Return only provider-backed identities that the legacy note proves."""
+    candidate = _conversation_id(note)
+    valid_ids = {
+        str(row["conversation_id"] if "conversation_id" in row else row["id"])
+        for row in rows
+    }
+    if candidate and candidate in valid_ids:
+        yield candidate
+        return
+
+    # The legacy note format stores the provider iCalendar UID while the
+    # sync database stores it in the raw provider envelope. This exact match
+    # is safe because the UID is an occurrence identity, not a display label.
+    note_ical_uid = str(note.metadata.get("ical_uid") or "").strip().casefold()
+    if not note_ical_uid:
+        return
+    for row in rows:
+        raw = _raw_json(row.get("raw_json"))
+        if not isinstance(raw, dict):
             continue
-        mapping[candidate] = note
-    return mapping, unresolved, duplicates
+        row_ical_uid = str(raw.get("iCalUid") or "").strip().casefold()
+        if row_ical_uid == note_ical_uid:
+            yield str(row["conversation_id"])
 
 
 def _section(body: str, heading: str) -> str:
@@ -423,21 +478,26 @@ def _load_legacy(
         connection.close()
     chat_values = [_read_note(path) for path in _note_paths(chat_notes)]
     meeting_values = [_read_note(path) for path in _note_paths(meeting_notes)]
-    chat_mapping, unresolved_chat, duplicate_chat = _map_notes(
+    chat_mapping, unresolved_chat_notes, duplicate_chat = _map_notes(
         chat_values,
         conversations,
         title_key="name",
     )
-    meeting_mapping, unresolved_meeting, duplicate_meeting = _map_notes(
+    meeting_mapping, unresolved_meeting_notes, duplicate_meeting = _map_notes(
         meeting_values,
         meetings,
         title_key="subject",
+        identity_candidates=_meeting_identity_candidates,
     )
     meeting_by_id = {str(row["conversation_id"]): row for row in meetings}
-    cues = {
-        conversation_id: _parse_cues(note, meeting_by_id[conversation_id])
-        for conversation_id, note in meeting_mapping.items()
-    }
+    cues: dict[str, list[LegacyCue]] = {}
+    for conversation_id, notes in meeting_mapping.items():
+        for note in notes:
+            cues[note.sha256] = _parse_cues(note, meeting_by_id[conversation_id])
+    for note in unresolved_meeting_notes:
+        cues[note.sha256] = _parse_cues(note, {})
+    for note in unresolved_chat_notes:
+        cues.setdefault(note.sha256, [])
     note_manifest = _note_manifest([*chat_values, *meeting_values])
     plan = LegacyMigrationPlan(
         source=source,
@@ -451,10 +511,13 @@ def _load_legacy(
         meeting_notes=len(meeting_values),
         chat_notes=len(chat_values),
         transcript_cues=sum(len(value) for value in cues.values()),
-        unresolved_identities=unresolved_chat + unresolved_meeting,
-        duplicate_natural_keys=(
-            duplicate_natural_keys + duplicate_chat + duplicate_meeting
-        ),
+        # Every note receives either a proven provider identity or an
+        # explicit content-derived synthetic identity before import.
+        unresolved_identities=0,
+        synthetic_note_identities=len(unresolved_chat_notes)
+        + len(unresolved_meeting_notes),
+        duplicate_note_mappings=duplicate_chat + duplicate_meeting,
+        duplicate_natural_keys=duplicate_natural_keys,
     )
     return LegacyData(
         plan=plan,
@@ -466,6 +529,8 @@ def _load_legacy(
         meeting_notes=meeting_values,
         chat_mapping=chat_mapping,
         meeting_mapping=meeting_mapping,
+        synthetic_chat_notes=unresolved_chat_notes,
+        synthetic_meeting_notes=unresolved_meeting_notes,
         cues=cues,
         source_database_fingerprint=source_database_fingerprint,
     )
@@ -639,6 +704,93 @@ def _participants(note: LegacyNote | None) -> list[ArtifactActor]:
     ]
 
 
+def _transcript_external_id(
+    conversation_id: str,
+    note: LegacyNote,
+    note_count: int,
+) -> str:
+    if note_count == 1:
+        return f"{conversation_id}:legacy-transcript"
+    return f"{conversation_id}:legacy-transcript:{_note_identity(note)}"
+
+
+def _append_transcript_events(
+    events: list[ArtifactEvent],
+    *,
+    meeting_external_id: str,
+    transcript_external_id: str,
+    note: LegacyNote,
+    meeting: dict[str, Any],
+    cues: list[LegacyCue],
+) -> None:
+    subject = _safe_text(meeting.get("subject") or _title(note) or "Meeting")
+    source_payload: dict[str, Any] = {
+        "legacy_note_name": _safe_text(note.name),
+        "legacy_note_sha256": note.sha256,
+        "legacy_note_identity": "name-and-content-sha256",
+    }
+    if summary := _safe_text(_summary(note)):
+        source_payload["legacy_summary_candidate"] = summary
+    transcript_text = _safe_text(_section(note.body, "Transcript"))
+    events.append(
+        ArtifactEvent.model_validate(
+            {
+                "schema": "ai-memory/artifact-event@1",
+                "record": "event",
+                "entity": "transcript",
+                "operation": "upsert",
+                "external_id": transcript_external_id,
+                "parent": {
+                    "entity": "meeting",
+                    "external_id": meeting_external_id,
+                },
+                "source_version": note.sha256,
+                "source_updated_at": meeting.get("updated_at"),
+                "payload": ArtifactPayload(
+                    title=f"{subject} transcript",
+                    occurred_at=meeting.get("start_time") or _base_date(note, meeting),
+                    text=transcript_text,
+                    content_format="plain",
+                    participants=_participants(note),
+                    source_payload=source_payload,
+                ),
+                }
+            )
+        )
+    for cue in cues:
+        events.append(
+            ArtifactEvent.model_validate(
+                {
+                    "schema": "ai-memory/artifact-event@1",
+                    "record": "event",
+                    "entity": "transcript-cue",
+                    "operation": "upsert",
+                    "external_id": f"{transcript_external_id}:cue:{cue.ordinal}",
+                    "parent": {
+                        "entity": "transcript",
+                        "external_id": transcript_external_id,
+                    },
+                    "source_version": note.sha256,
+                    "source_sequence": cue.ordinal,
+                    "source_updated_at": meeting.get("updated_at"),
+                    "payload": ArtifactPayload(
+                        occurred_at=cue.occurred_at,
+                        text=_safe_text(cue.text),
+                        content_format="plain",
+                        author=(
+                            ArtifactActor(
+                                name=_safe_text(cue.speaker),
+                                id_confidence="display-name-only",
+                            )
+                            if cue.speaker
+                            else None
+                        ),
+                    ),
+                }
+            )
+        )
+
+
 def _reactions(raw: Any) -> list[str]:
     if not isinstance(raw, dict) or not isinstance(raw.get("reactions"), list):
         return []
@@ -664,7 +816,8 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
 
     for row in data.conversations:
         conversation_id = str(row["id"])
-        note = data.chat_mapping.get(conversation_id)
+        notes = data.chat_mapping.get(conversation_id, [])
+        note = notes[0] if notes else None
         summary = _safe_text(_summary(note)) if note else ""
         source_payload = {
             "legacy": _legacy_source_payload(
@@ -674,6 +827,12 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
         }
         if summary:
             source_payload["legacy_summary_candidate"] = summary
+        if len(notes) > 1:
+            source_payload["legacy_summary_candidates"] = [
+                _safe_text(_summary(value))
+                for value in notes
+                if _summary(value).strip()
+            ]
         events.append(
             ArtifactEvent.model_validate(
                 {
@@ -693,6 +852,95 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
                 }
             )
         )
+
+    # Notes without a proven conversation identity remain first-class
+    # conversation artifacts. Their content-derived IDs preserve every note
+    # without claiming a provider relationship that the source cannot prove.
+    for note in data.synthetic_chat_notes:
+        conversation_external_id = _legacy_note_external_id(note)
+        summary = _safe_text(_summary(note))
+        source_payload = {
+            "legacy_note_name": _safe_text(note.name),
+            "legacy_note_sha256": note.sha256,
+            "legacy_note_identity": "name-and-content-sha256",
+        }
+        if summary:
+            source_payload["legacy_summary_candidate"] = summary
+        events.append(
+            ArtifactEvent.model_validate(
+                {
+                    "schema": "ai-memory/artifact-event@1",
+                    "record": "event",
+                    "entity": "conversation",
+                    "operation": "upsert",
+                    "external_id": conversation_external_id,
+                    "source_version": note.sha256,
+                    "payload": ArtifactPayload(
+                        title=_safe_text(_title(note)) or None,
+                        occurred_at=_base_date(note, {}),
+                        content_format="plain",
+                        participants=_participants(note),
+                        aliases=[
+                            ArtifactAlias(
+                                kind="legacy-note-sha256",
+                                value=note.sha256,
+                            )
+                        ],
+                        source_payload=source_payload,
+                    ),
+                }
+            )
+        )
+
+    # Preserve a second note that maps to one conversation as its own
+    # identity. A summary list on the provider record cannot preserve note
+    # bodies or replay state for duplicate source files.
+    for conversation_id, notes in data.chat_mapping.items():
+        for note in notes[1:]:
+            conversation_external_id = _legacy_note_external_id(note)
+            summary = _safe_text(_summary(note))
+            source_payload = {
+                "legacy_note_name": _safe_text(note.name),
+                "legacy_note_sha256": note.sha256,
+                "legacy_note_identity": "name-and-content-sha256",
+                "legacy_note_parent_conversation_id": conversation_id,
+            }
+            if summary:
+                source_payload["legacy_summary_candidate"] = summary
+            events.append(
+                ArtifactEvent.model_validate(
+                    {
+                        "schema": "ai-memory/artifact-event@1",
+                        "record": "event",
+                        "entity": "conversation",
+                        "operation": "upsert",
+                        "external_id": conversation_external_id,
+                        "source_version": note.sha256,
+                        "payload": ArtifactPayload(
+                            title=_safe_text(_title(note)) or None,
+                            occurred_at=_base_date(note, {}),
+                            content_format="plain",
+                            participants=_participants(note),
+                            aliases=[
+                                ArtifactAlias(
+                                    kind="legacy-note-sha256",
+                                    value=note.sha256,
+                                )
+                            ],
+                            links=[
+                                ArtifactLink(
+                                    relation="related-chat",
+                                    target=ArtifactReference(
+                                        entity="conversation",
+                                        external_id=conversation_id,
+                                    ),
+                                )
+                            ],
+                            source_payload=source_payload,
+                        ),
+                    }
+                )
+            )
 
     for row in data.messages:
         conversation_id = str(row["conversation_id"])
@@ -797,8 +1045,7 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
     for row in data.meetings:
         conversation_id = str(row["conversation_id"])
         meeting_external_id = _meeting_external_id(row)
-        note = data.meeting_mapping.get(conversation_id)
-        transcript_external_id = _transcript_external_id(conversation_id)
+        notes = data.meeting_mapping.get(conversation_id, [])
         links = [
             ArtifactLink(
                 relation="related-chat",
@@ -808,13 +1055,17 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
                 ),
             )
         ]
-        if note is not None:
+        for note in notes:
             links.append(
                 ArtifactLink(
                     relation="contains",
                     target=ArtifactReference(
                         entity="transcript",
-                        external_id=transcript_external_id,
+                        external_id=_transcript_external_id(
+                            conversation_id,
+                            note,
+                            len(notes),
+                        ),
                     ),
                 )
             )
@@ -824,8 +1075,13 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
                 ("end_time", "join_url", "meeting_type"),
             )
         }
-        if note is not None and (summary := _safe_text(_summary(note))):
-            source_payload["legacy_summary_candidate"] = summary
+        summaries = [
+            _safe_text(_summary(note)) for note in notes if _summary(note).strip()
+        ]
+        if summaries:
+            source_payload["legacy_summary_candidate"] = summaries[0]
+        if len(summaries) > 1:
+            source_payload["legacy_summary_candidates"] = summaries
         events.append(
             ArtifactEvent.model_validate(
                 {
@@ -852,7 +1108,7 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
                             if row.get("organizer_id")
                             else None
                         ),
-                        participants=_participants(note),
+                        participants=_participants(notes[0] if notes else None),
                         aliases=[
                             ArtifactAlias(
                                 kind="conversation-id",
@@ -865,71 +1121,79 @@ def _events(data: LegacyData, sync_db: Path) -> list[ArtifactEvent]:
                 }
             )
         )
-        if note is None:
-            continue
-        transcript_text = _safe_text(_section(note.body, "Transcript"))
+        for note in notes:
+            _append_transcript_events(
+                events,
+                meeting_external_id=meeting_external_id,
+                transcript_external_id=_transcript_external_id(
+                    conversation_id,
+                    note,
+                    len(notes),
+                ),
+                note=note,
+                meeting=row,
+                cues=data.cues.get(note.sha256, []),
+            )
+
+    # Keep notes without a proven provider meeting as synthetic meetings.
+    for note in data.synthetic_meeting_notes:
+        meeting_external_id = _legacy_note_external_id(note)
+        transcript_external_id = _transcript_external_id(
+            meeting_external_id,
+            note,
+            1,
+        )
+        summary = _safe_text(_summary(note))
+        source_payload: dict[str, Any] = {
+            "legacy_note_name": _safe_text(note.name),
+            "legacy_note_sha256": note.sha256,
+            "legacy_note_identity": "name-and-content-sha256",
+        }
+        if summary:
+            source_payload["legacy_summary_candidate"] = summary
         events.append(
             ArtifactEvent.model_validate(
                 {
                     "schema": "ai-memory/artifact-event@1",
                     "record": "event",
-                    "entity": "transcript",
+                    "entity": "meeting",
                     "operation": "upsert",
-                    "external_id": transcript_external_id,
-                    "parent": {
-                        "entity": "meeting",
-                        "external_id": meeting_external_id,
-                    },
+                    "external_id": meeting_external_id,
                     "source_version": note.sha256,
-                    "source_updated_at": row.get("updated_at"),
                     "payload": ArtifactPayload(
-                        title=(
-                            f"{_safe_text(row.get('subject') or 'Meeting')} transcript"
-                        ),
-                        occurred_at=row.get("start_time"),
-                        text=transcript_text,
+                        title=_safe_text(_title(note)) or "Legacy meeting note",
+                        occurred_at=_base_date(note, {}),
+                        text=_safe_text(_title(note)) or None,
                         content_format="plain",
                         participants=_participants(note),
-                        source_payload={
-                            "legacy_note_name": _safe_text(note.name),
-                            "legacy_note_sha256": note.sha256,
-                        },
+                        aliases=[
+                            ArtifactAlias(
+                                kind="legacy-note-sha256",
+                                value=note.sha256,
+                            )
+                        ],
+                        links=[
+                            ArtifactLink(
+                                relation="contains",
+                                target=ArtifactReference(
+                                    entity="transcript",
+                                    external_id=transcript_external_id,
+                                ),
+                            )
+                        ],
+                        source_payload=source_payload,
                     ),
                 }
             )
         )
-        for cue in data.cues.get(conversation_id, []):
-            events.append(
-                ArtifactEvent.model_validate(
-                    {
-                        "schema": "ai-memory/artifact-event@1",
-                        "record": "event",
-                        "entity": "transcript-cue",
-                        "operation": "upsert",
-                        "external_id": f"{transcript_external_id}:cue:{cue.ordinal}",
-                        "parent": {
-                            "entity": "transcript",
-                            "external_id": transcript_external_id,
-                        },
-                        "source_version": note.sha256,
-                        "source_sequence": cue.ordinal,
-                        "source_updated_at": row.get("updated_at"),
-                        "payload": ArtifactPayload(
-                            occurred_at=cue.occurred_at,
-                            text=_safe_text(cue.text),
-                            content_format="plain",
-                            author=(
-                                ArtifactActor(
-                                    name=_safe_text(cue.speaker),
-                                    id_confidence="display-name-only",
-                                )
-                                if cue.speaker
-                                else None
-                            ),
-                        ),
-                    }
-                )
-            )
+        _append_transcript_events(
+            events,
+            meeting_external_id=meeting_external_id,
+            transcript_external_id=transcript_external_id,
+            note=note,
+            meeting={},
+            cues=data.cues.get(note.sha256, []),
+        )
     return events
 
 
@@ -977,10 +1241,6 @@ def _meeting_external_id(row: dict[str, Any]) -> str:
         f"conversation:{quote(conversation_id, safe='')}:"
         f"{quote(occurrence, safe='')}"
     )
-
-
-def _transcript_external_id(conversation_id: str) -> str:
-    return f"{conversation_id}:legacy-transcript"
 
 
 def _observed_at(data: LegacyData) -> datetime:

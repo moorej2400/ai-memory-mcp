@@ -112,6 +112,41 @@ def test_status_marks_only_the_primary_source_writable(tmp_path: Path) -> None:
     assert status.retrieval_sources[0].writable is False
 
 
+def test_index_detects_markdown_changes_after_publication(
+    tmp_path: Path,
+) -> None:
+    core = tmp_path / "core"
+    relative = "Notes/Freshness.md"
+    _write_memory(
+        core,
+        relative,
+        memory_id="mem-freshness",
+        title="Freshness",
+        text="The index matches this source.",
+    )
+    settings = Settings(
+        memory_root=core,
+        state_dir=tmp_path / "state",
+        graph_path=tmp_path / "graph.json",
+        graphify_mcp_url="",
+        embedding_provider="hashed",
+    )
+    result = build_index(settings, force=True)
+    index = MemoryIndex(settings, path=Path(str(result["snapshot"])))
+
+    assert index.canonical_stale() is False
+
+    _write_memory(
+        core,
+        relative,
+        memory_id="mem-freshness",
+        title="Freshness",
+        text="The canonical Markdown changed after publication.",
+    )
+
+    assert index.canonical_stale() is True
+
+
 def test_settings_load_named_retrieval_sources(
     tmp_path: Path,
     monkeypatch,

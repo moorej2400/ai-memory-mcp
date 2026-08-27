@@ -628,6 +628,41 @@ class MemoryService:
                 date_to=date_to,
             )
             try:
+                if self._should_attempt_exact(query):
+                    provider_started = time.perf_counter()
+                    exact_hits = pinned.artifact_search.find_identity(
+                        self._identity_candidate(query),
+                        artifact_scope,
+                        limit=requested_limit,
+                    )
+                    artifact_latency_ms["artifact_exact"] = round(
+                        (time.perf_counter() - provider_started) * 1000,
+                        3,
+                    )
+                    if exact_hits:
+                        packet = merge_artifact_evidence(
+                            query,
+                            None,
+                            exact_hits,
+                            settings=self.settings,
+                            now=datetime.now(timezone.utc),
+                            limit=requested_limit,
+                        )
+                        response, diagnostics = self._packet_response(
+                            query,
+                            packet,
+                            scope,
+                            intent="exact",
+                            markdown_used=False,
+                        )
+                        diagnostics["route"] = "artifact-exact"
+                        diagnostics["artifact_searched"] = True
+                        diagnostics["generation_id"] = pinned.generation_id
+                        diagnostics.setdefault("provider_latency_ms", {}).update(
+                            artifact_latency_ms
+                        )
+                        response.warnings.extend(pinned.warnings)
+                        return response, diagnostics
                 provider_started = time.perf_counter()
                 artifact_hits = pinned.artifact_search.search(
                     query,
@@ -714,49 +749,47 @@ class MemoryService:
             )
 
         if use_markdown:
-            exact = self.engine.get(self._identity_candidate(query), scope)
-            if exact["found"] and not artifact_hits:
-                response = self._exact_response(query, exact["memory"], scope)
-                if artifact_warning:
-                    response.warnings.append(artifact_warning)
-                if artifact_semantic_warning:
-                    response.warnings.append(artifact_semantic_warning)
-                response.warnings.extend(pinned.warnings)
-                return (
-                    response,
-                    {
-                        "route": "exact",
-                        "graphify": self.engine.graph.health(),
-                        "generation_id": pinned.generation_id,
-                    },
-                )
+            if not artifact_hits and self._should_attempt_exact(query):
+                exact = self.engine.get(self._identity_candidate(query), scope)
+                if exact["found"]:
+                    response = self._exact_response(query, exact["memory"], scope)
+                    if artifact_warning:
+                        response.warnings.append(artifact_warning)
+                    if artifact_semantic_warning:
+                        response.warnings.append(artifact_semantic_warning)
+                    response.warnings.extend(pinned.warnings)
+                    return (
+                        response,
+                        {
+                            "route": "exact",
+                            "graphify": self.engine.graph.health(),
+                            "generation_id": pinned.generation_id,
+                        },
+                    )
 
-            mentioned = self.engine.mentioned_documents(query, scope, limit=3)
-            if (
-                not artifact_hits
-                and self._is_relationship_query(query)
-                and len(mentioned) >= 2
-            ):
-                response = self._relationship_response(
-                    query,
-                    mentioned[0],
-                    mentioned[1],
-                    scope,
-                )
-                if artifact_warning:
-                    response.warnings.append(artifact_warning)
-                if artifact_semantic_warning:
-                    response.warnings.append(artifact_semantic_warning)
-                response.warnings.extend(pinned.warnings)
-                return (
-                    response,
-                    {
-                        "route": "relationship",
-                        "mentioned_documents": len(mentioned),
-                        "graphify": self.engine.graph.health(),
-                        "generation_id": pinned.generation_id,
-                    },
-                )
+            if not artifact_hits and self._is_relationship_query(query):
+                mentioned = self.engine.mentioned_documents(query, scope, limit=3)
+                if len(mentioned) >= 2:
+                    response = self._relationship_response(
+                        query,
+                        mentioned[0],
+                        mentioned[1],
+                        scope,
+                    )
+                    if artifact_warning:
+                        response.warnings.append(artifact_warning)
+                    if artifact_semantic_warning:
+                        response.warnings.append(artifact_semantic_warning)
+                    response.warnings.extend(pinned.warnings)
+                    return (
+                        response,
+                        {
+                            "route": "relationship",
+                            "mentioned_documents": len(mentioned),
+                            "graphify": self.engine.graph.health(),
+                            "generation_id": pinned.generation_id,
+                        },
+                    )
             markdown_packet = self.engine.search(
                 query,
                 scope=scope,
@@ -1362,6 +1395,28 @@ class MemoryService:
         )
 
     @staticmethod
+    def _should_attempt_exact(query: str) -> bool:
+        words = query.split()
+        if not words:
+            return False
+        lowered = tuple(word.casefold().strip(":") for word in words)
+        explicit_prefixes = (
+            ("get",),
+            ("open",),
+            ("show",),
+            ("recall",),
+            ("find", "memory"),
+            ("get", "memory"),
+            ("open", "memory"),
+            ("show", "memory"),
+        )
+        if any(lowered[: len(prefix)] == prefix for prefix in explicit_prefixes):
+            return True
+        # Broad exact pre-scans delay normal questions. IDs and short names do not
+        # need question punctuation or more than a small phrase.
+        return len(query) <= 160 and len(words) <= 10 and not query.endswith("?")
+
+    @staticmethod
     def _identity_candidate(query: str) -> str:
         words = query.split()
         if not words:
@@ -1384,7 +1439,24 @@ class MemoryService:
 
     @staticmethod
     def _is_relationship_query(query: str) -> bool:
-        return bool(set(tokenize(query)) & RELATIONSHIP_TERMS)
+        tokens = set(tokenize(query))
+        if not tokens & RELATIONSHIP_TERMS:
+            return False
+        return bool(
+            "relationship" in tokens
+            or "between" in tokens
+            or (
+                tokens
+                & {
+                    "connect",
+                    "connected",
+                    "connection",
+                    "relate",
+                    "related",
+                }
+                and "to" in tokens
+            )
+        )
 
     def _exact_response(
         self,

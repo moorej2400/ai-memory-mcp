@@ -99,6 +99,7 @@ def test_read_tools_do_not_build_a_missing_index(
     recall = asyncio.run(call("memory_recall", {"query": "ALPHA-142"}))
 
     assert status.index.available is False
+    assert status.index.stale is False
     assert recall.status == "no_answer"
     assert "Memory index is not available. Call memory_sync." in recall.warnings
     assert any(

@@ -6,6 +6,7 @@ import os
 import sqlite3
 import struct
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -19,13 +20,16 @@ from .ann import (
     multiprobe_buckets,
     vector_buckets,
 )
+from .artifacts.schema import ClosingSQLiteConnection
 from .config import Settings
 from .embedding import fingerprint, resolve_provider
 from .models import MemoryChunk, MemoryDocument, ScopeFilter
 from .text import chunk_document, parse_document
 
-SCHEMA_VERSION = 5
+# Version 6 adds identity and scope alias tables to the upstream version 5 ANN schema.
+SCHEMA_VERSION = 6
 _VECTOR_ITEM = struct.Struct("<He")
+_REPOSITORY_SCOPE_KINDS = frozenset({"repo", "repository"})
 
 
 def _utc_now() -> str:
@@ -34,9 +38,13 @@ def _utc_now() -> str:
 
 def _connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     if read_only:
-        connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        connection = sqlite3.connect(
+            f"file:{path.as_posix()}?mode=ro",
+            uri=True,
+            factory=ClosingSQLiteConnection,
+        )
     else:
-        connection = sqlite3.connect(path)
+        connection = sqlite3.connect(path, factory=ClosingSQLiteConnection)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
@@ -92,6 +100,22 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             ON chunk_ann_buckets(band, bucket, chunk_id);
         CREATE INDEX IF NOT EXISTS idx_documents_scope
             ON documents(source_id, root_scope, status, scope_kind, scope_id);
+        CREATE TABLE IF NOT EXISTS document_identity_aliases (
+            identity TEXT COLLATE NOCASE NOT NULL,
+            memory_id TEXT NOT NULL REFERENCES documents(memory_id) ON DELETE CASCADE,
+            priority INTEGER NOT NULL,
+            PRIMARY KEY(identity, memory_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_document_identity_memory
+            ON document_identity_aliases(memory_id);
+        CREATE TABLE IF NOT EXISTS document_scope_aliases (
+            kind TEXT NOT NULL,
+            alias TEXT COLLATE NOCASE NOT NULL,
+            memory_id TEXT NOT NULL REFERENCES documents(memory_id) ON DELETE CASCADE,
+            PRIMARY KEY(kind, alias, memory_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_document_scope_alias_memory
+            ON document_scope_aliases(memory_id, kind);
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
             chunk_id UNINDEXED,
             title,
@@ -104,16 +128,115 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _normalized_alias(value: str) -> str:
+    return value.strip().replace("\\", "/").strip("/").casefold()
+
+
+def _repository_aliases(value: str) -> set[str]:
+    normalized = _normalized_alias(value)
+    if not normalized:
+        return set()
+    aliases = {normalized}
+    repository = normalized
+    if ":" in repository:
+        provider, candidate = repository.split(":", 1)
+        if "/" in candidate:
+            repository = candidate.strip("/")
+            aliases.add(repository)
+            aliases.add(f"{provider}--{repository.replace('/', '--')}")
+    if "/" in repository:
+        aliases.add(repository.rsplit("/", 1)[-1])
+    return aliases
+
+
+def _path_scope_aliases(path: str) -> dict[str, set[str]]:
+    parts = path.replace("\\", "/").split("/")
+    aliases: dict[str, set[str]] = {
+        "repository": set(),
+        "project": set(),
+        "ticket": set(),
+    }
+    markers = {
+        "repos": "repository",
+        "projects": "project",
+        "tickets": "ticket",
+    }
+    for index, part in enumerate(parts[:-1]):
+        kind = markers.get(part.casefold())
+        if kind:
+            value = _normalized_alias(parts[index + 1])
+            if value:
+                aliases[kind].add(value)
+    return aliases
+
+
+def _scope_alias_rows(document: MemoryDocument) -> list[tuple[str, str, str]]:
+    aliases = _path_scope_aliases(document.path)
+    scope_kind = document.scope_kind.casefold()
+    if scope_kind in _REPOSITORY_SCOPE_KINDS:
+        aliases["repository"].update(_repository_aliases(document.scope_id))
+    elif scope_kind in aliases and document.scope_id:
+        aliases[scope_kind].add(_normalized_alias(document.scope_id))
+    for value in document.repos:
+        aliases["repository"].update(_repository_aliases(value))
+    for kind, values in (
+        ("project", document.projects),
+        (
+            "ticket",
+            [
+                *document.identifiers,
+                *([document.scope_id] if scope_kind == "ticket" else []),
+            ],
+        ),
+    ):
+        aliases[kind].update(
+            alias for value in values if (alias := _normalized_alias(value))
+        )
+    return [
+        (kind, alias, document.memory_id)
+        for kind, values in aliases.items()
+        for alias in sorted(values)
+    ]
+
+
+def _identity_alias_rows(document: MemoryDocument) -> list[tuple[str, str, int]]:
+    relative_path = document.path.split("/", 1)[-1]
+    candidates = (
+        (document.memory_id, 0),
+        (document.path, 1),
+        (relative_path, 1),
+        (document.title, 2),
+        (Path(document.path).stem, 3),
+        *((identifier, 4) for identifier in document.identifiers),
+    )
+    priorities: dict[str, int] = {}
+    for value, priority in candidates:
+        identity = _normalized_alias(value)
+        if identity:
+            priorities[identity] = min(priority, priorities.get(identity, priority))
+    return [
+        (identity, document.memory_id, priority)
+        for identity, priority in priorities.items()
+    ]
+
+
 def _eligible_markdown(root: Path) -> list[Path]:
     paths: list[Path] = []
-    for path in root.rglob("*.md"):
-        relative = path.relative_to(root)
-        parts = {part.casefold() for part in relative.parts}
-        if any(part.startswith(".") for part in relative.parts):
-            continue
-        if "restricted" in parts or ".trash" in parts:
-            continue
-        paths.append(path)
+    # pathlib.rglob enters excluded subtrees before this filter runs. Prune
+    # them during os.walk and avoid glob-matcher overhead on every directory.
+    for directory, directories, filenames in os.walk(root):
+        directories[:] = [
+            name
+            for name in directories
+            if not name.startswith(".")
+            and name.casefold() not in {"restricted", ".trash"}
+        ]
+        parent = Path(directory)
+        paths.extend(
+            parent / name
+            for name in filenames
+            if name.casefold().endswith(".md") and not name.startswith(".")
+        )
     return sorted(paths, key=lambda item: item.as_posix().casefold())
 
 
@@ -142,6 +265,15 @@ def _insert_document(
             "repos_json": json.dumps(document.repos),
             "tools_json": json.dumps(document.tools),
         },
+    )
+    connection.executemany(
+        "INSERT INTO document_identity_aliases VALUES (?, ?, ?)",
+        _identity_alias_rows(document),
+    )
+    # Compact aliases keep scoped misses off document bodies and JSON fields.
+    connection.executemany(
+        "INSERT INTO document_scope_aliases VALUES (?, ?, ?)",
+        _scope_alias_rows(document),
     )
     identifiers = " ".join(document.identifiers)
     for chunk in chunks:
@@ -658,32 +790,14 @@ class MemoryIndex:
         with self.connection() as connection:
             row = connection.execute(
                 f"""
-                SELECT d.* FROM documents d
-                WHERE (
-                    d.memory_id = ?
-                    OR lower(d.path) = lower(?)
-                    OR lower(d.title) = lower(?)
-                )
+                SELECT d.* FROM document_identity_aliases i
+                JOIN documents d USING(memory_id)
+                WHERE i.identity = ? COLLATE NOCASE
                 {scope_clause}
-                ORDER BY
-                    CASE
-                        WHEN d.memory_id = ? THEN 0
-                        WHEN d.path = ? THEN 1
-                        WHEN lower(d.title) = lower(?) THEN 2
-                        ELSE 3
-                    END,
-                    length(d.path)
+                ORDER BY i.priority, length(d.path)
                 LIMIT 1
                 """,
-                (
-                    identity,
-                    identity,
-                    identity,
-                    *parameters,
-                    identity,
-                    identity,
-                    identity,
-                ),
+                (identity, *parameters),
             ).fetchone()
         return decode_document(row) if row else None
 
@@ -695,44 +809,48 @@ class MemoryIndex:
         limit: int = 3,
     ) -> list[dict[str, object]]:
         where, parameters = scope_sql(scope)
+        scope_clause = where.replace("WHERE", "AND", 1) if where else ""
         with self.connection() as connection:
             rows = connection.execute(
-                f"SELECT d.* FROM documents d {where}",
+                f"""
+                SELECT i.identity, i.memory_id, i.priority
+                FROM document_identity_aliases i
+                JOIN documents d USING(memory_id)
+                WHERE i.priority <= 3
+                {scope_clause}
+                """,
                 parameters,
             ).fetchall()
         query_text = query.casefold()
-        matches: list[tuple[int, int, dict[str, object]]] = []
+        matches: list[tuple[int, int, int, str]] = []
         for row in rows:
-            document = decode_document(row)
-            path = str(document["path"])
-            identities = {
-                str(document["memory_id"]),
-                path,
-                Path(path).stem,
-                str(document["title"]),
-            }
-            matched = [
-                (query_text.index(identity.casefold()), len(identity))
-                for identity in identities
-                if len(identity) >= 4 and identity.casefold() in query_text
-            ]
-            if matched:
-                position, matched_length = min(
-                    matched,
-                    key=lambda item: (item[0], -item[1]),
+            identity = str(row["identity"])
+            if len(identity) >= 4 and identity in query_text:
+                matches.append(
+                    (
+                        query_text.index(identity),
+                        -len(identity),
+                        int(row["priority"]),
+                        str(row["memory_id"]),
+                    )
                 )
-                matches.append((position, matched_length, document))
-        matches.sort(
-            key=lambda item: (
-                item[0],
-                -item[1],
-                str(item[2]["title"]).casefold(),
-            )
-        )
-        return [
-            document
-            for _, _, document in matches[: max(1, limit)]
-        ]
+        matches.sort(key=lambda item: item[:3])
+        memory_ids = list(
+            dict.fromkeys(match[3] for match in matches)
+        )[: max(1, limit)]
+        if not memory_ids:
+            return []
+        placeholders = ", ".join("?" for _ in memory_ids)
+        with self.connection() as connection:
+            documents = {
+                str(row["memory_id"]): decode_document(row)
+                for row in connection.execute(
+                    f"SELECT d.* FROM documents d "
+                    f"WHERE d.memory_id IN ({placeholders})",
+                    memory_ids,
+                )
+            }
+        return [documents[memory_id] for memory_id in memory_ids]
 
     def scoped_identities(self, scope: ScopeFilter) -> set[str]:
         """Return normalized document identities that are inside one scope."""
@@ -904,63 +1022,39 @@ def scope_sql(scope: ScopeFilter) -> tuple[str, list[str]]:
     if scope.repository:
         clauses.append(
             """
-            (
-                EXISTS (
-                    SELECT 1 FROM json_each(d.repos_json)
-                    WHERE lower(value) = lower(?)
-                )
-                OR lower(d.scope_id) = lower(?)
-                OR lower(d.path) LIKE lower(?) ESCAPE '\\'
+            EXISTS (
+                SELECT 1 FROM document_scope_aliases a
+                WHERE a.memory_id = d.memory_id
+                AND a.kind = 'repository'
+                AND a.alias = ? COLLATE NOCASE
             )
             """
         )
-        parameters.extend(
-            (
-                scope.repository,
-                scope.repository,
-                f"%/{_like_literal(scope.repository)}/%",
-            )
-        )
+        parameters.append(_normalized_alias(scope.repository))
     if scope.project:
         clauses.append(
             """
-            (
-                EXISTS (
-                    SELECT 1 FROM json_each(d.projects_json)
-                    WHERE lower(value) = lower(?)
-                )
-                OR lower(d.scope_id) = lower(?)
-                OR lower(d.path) LIKE lower(?) ESCAPE '\\'
+            EXISTS (
+                SELECT 1 FROM document_scope_aliases a
+                WHERE a.memory_id = d.memory_id
+                AND a.kind = 'project'
+                AND a.alias = ? COLLATE NOCASE
             )
             """
         )
-        parameters.extend(
-            (
-                scope.project,
-                scope.project,
-                f"%/{_like_literal(scope.project)}/%",
-            )
-        )
+        parameters.append(_normalized_alias(scope.project))
     if scope.ticket:
         clauses.append(
             """
-            (
-                EXISTS (
-                    SELECT 1 FROM json_each(d.identifiers_json)
-                    WHERE lower(value) = lower(?)
-                )
-                OR lower(d.scope_id) = lower(?)
-                OR lower(d.path) LIKE lower(?) ESCAPE '\\'
+            EXISTS (
+                SELECT 1 FROM document_scope_aliases a
+                WHERE a.memory_id = d.memory_id
+                AND a.kind = 'ticket'
+                AND a.alias = ? COLLATE NOCASE
             )
             """
         )
-        parameters.extend(
-            (
-                scope.ticket,
-                scope.ticket,
-                f"%/{_like_literal(scope.ticket)}/%",
-            )
-        )
+        parameters.append(_normalized_alias(scope.ticket))
     return (f"WHERE {' AND '.join(clauses)}" if clauses else "", parameters)
 
 

@@ -9,6 +9,7 @@ import pytest
 
 from ai_memory_mcp.artifacts.identity import artifact_id, artifact_uri
 from ai_memory_mcp.artifacts.models import (
+    ArtifactAlias,
     ArtifactBatchManifest,
     ArtifactEvent,
     ArtifactLink,
@@ -31,6 +32,7 @@ def _event(
     occurred_at: str,
     *,
     parent: tuple[str, str] | None = None,
+    aliases: list[ArtifactAlias] | None = None,
     links: list[ArtifactLink] | None = None,
 ) -> ArtifactEvent:
     parent_reference = (
@@ -51,6 +53,7 @@ def _event(
                 text=text,
                 content_format="plain",
                 occurred_at=occurred_at,
+                aliases=aliases or [],
                 links=links or [],
                 source_payload={"provider_field": f"raw-{external_id}"},
             ),
@@ -151,6 +154,100 @@ def test_raw_search_filters_before_ranking(
     ]
     assert all(hit.evidence_class == "raw" for hit in hits)
     assert all(hit.artifact_uri.startswith("artifact://message/") for hit in hits)
+
+
+def test_exact_identity_finds_provider_alias_with_scope(
+    artifact_settings: Settings,
+) -> None:
+    store = ArtifactStore(artifact_settings)
+    store.apply_batch(
+        _batch(
+            "chat-source",
+            "workspace",
+            "identity-alias-1",
+            [
+                _event(
+                    "meeting",
+                    "meeting:call:call-4",
+                    "",
+                    "2026-01-02T10:00:00Z",
+                    aliases=[ArtifactAlias(kind="call", value="call-4")],
+                )
+            ],
+        )
+    )
+
+    hits = ArtifactSearch(artifact_settings).find_identity(
+        "call-4",
+        ArtifactScope(
+            source="chat-source",
+            source_instance="workspace",
+            entities=("meeting",),
+        ),
+    )
+
+    assert [hit.external_id for hit in hits] == ["meeting:call:call-4"]
+    assert hits[0].matched_identity == "call-4"
+
+
+def test_exact_identity_applies_entity_scope(
+    artifact_settings: Settings,
+) -> None:
+    store = ArtifactStore(artifact_settings)
+    store.apply_batch(
+        _batch(
+            "chat-source",
+            "workspace",
+            "identity-alias-2",
+            [
+                _event(
+                    "recording",
+                    "recording:recording-4",
+                    "",
+                    "2026-01-02T10:00:00Z",
+                    aliases=[
+                        ArtifactAlias(kind="drive-item", value="drive-item-4")
+                    ],
+                )
+            ],
+        )
+    )
+
+    hits = ArtifactSearch(artifact_settings).find_identity(
+        "drive-item-4",
+        ArtifactScope(entities=("meeting",)),
+    )
+
+    assert hits == []
+
+
+def test_exact_identity_finds_namespaced_external_id(
+    artifact_settings: Settings,
+) -> None:
+    store = ArtifactStore(artifact_settings)
+    store.apply_batch(
+        _batch(
+            "chat-source",
+            "workspace",
+            "identity-external-id-1",
+            [
+                _event(
+                    "recording",
+                    "recording:drive-item-4",
+                    "",
+                    "2026-01-02T10:00:00Z",
+                )
+            ],
+        )
+    )
+
+    hits = ArtifactSearch(artifact_settings).find_identity(
+        "drive-item-4",
+        ArtifactScope(entities=("recording",)),
+    )
+
+    assert [hit.external_id for hit in hits] == ["recording:drive-item-4"]
+    assert hits[0].matched_identity == "drive-item-4"
 
 
 def test_raw_search_supports_parent_and_date_scope(

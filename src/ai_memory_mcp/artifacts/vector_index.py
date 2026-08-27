@@ -33,9 +33,15 @@ from .models import (
     ArtifactSearchHit,
     ArtifactVectorSearchResult,
 )
-from .schema import connect_artifact_db, require_local_database_path
+from .schema import (
+    ClosingSQLiteConnection,
+    connect_artifact_db,
+    require_local_database_path,
+)
 
 ARTIFACT_VECTOR_SCHEMA_VERSION = 2
+POINTER_REPLACE_RETRY_SECONDS = 1.0
+POINTER_REPLACE_RETRY_INTERVAL_SECONDS = 0.05
 
 
 def _utc_iso(value: datetime) -> str:
@@ -50,9 +56,10 @@ def _connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
         connection = sqlite3.connect(
             f"file:{path.resolve().as_posix()}?mode=ro",
             uri=True,
+            factory=ClosingSQLiteConnection,
         )
     else:
-        connection = sqlite3.connect(path)
+        connection = sqlite3.connect(path, factory=ClosingSQLiteConnection)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 10000")
@@ -395,7 +402,17 @@ def _publish_pointer(settings: Settings, snapshot: Path) -> None:
         stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())
-    os.replace(temporary, pointer)
+    deadline = time.monotonic() + POINTER_REPLACE_RETRY_SECONDS
+    while True:
+        try:
+            os.replace(temporary, pointer)
+            break
+        except PermissionError:
+            # Windows scanners can briefly hold the prior pointer after reads.
+            # Retry only the atomic replace; the validated snapshot is unchanged.
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(POINTER_REPLACE_RETRY_INTERVAL_SECONDS)
 
 
 def _publish_snapshot_no_overwrite(temporary: Path, snapshot: Path) -> None:
