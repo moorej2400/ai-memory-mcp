@@ -134,6 +134,7 @@ class Settings:
     audit_log_max_bytes: int = 25_000_000
     audit_lock_timeout_seconds: float = 10.0
     index_lock_timeout_seconds: float = 300.0
+    recall_timeout_seconds: float = 30.0
     embedding_provider: str = "auto"
     embedding_model: str = ""
     artifact_db: Path = Path.home() / ".ai-memory" / "artifacts.sqlite3"
@@ -171,6 +172,13 @@ class Settings:
             raise ValueError(
                 "AI_MEMORY_ARTIFACT_BATCH_MAX_BYTES must be positive."
             )
+        recall_timeout_seconds = float(
+            os.getenv("AI_MEMORY_MCP_RECALL_TIMEOUT_SECONDS", "30")
+        )
+        if recall_timeout_seconds <= 0:
+            raise ValueError(
+                "AI_MEMORY_MCP_RECALL_TIMEOUT_SECONDS must be positive."
+            )
         return cls(
             memory_root=root,
             state_dir=state,
@@ -207,6 +215,7 @@ class Settings:
             index_lock_timeout_seconds=float(
                 os.getenv("AI_MEMORY_INDEX_LOCK_TIMEOUT_SECONDS", "300")
             ),
+            recall_timeout_seconds=recall_timeout_seconds,
             embedding_provider=os.getenv(
                 "AI_MEMORY_MCP_EMBEDDING_PROVIDER", "auto"
             ),

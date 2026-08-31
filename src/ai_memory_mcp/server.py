@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import ipaddress
 from datetime import datetime
 from typing import Annotated, Literal
@@ -12,6 +13,7 @@ from pydantic import Field
 from .artifacts.models import ArtifactReadResponse
 from .config import Settings
 from .models import RecallResponse, StatusResponse, SyncResponse
+from .recall_worker import WorkerDeadlineExceeded, recall_in_worker
 from .service import MemoryService
 
 
@@ -57,7 +59,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         ),
         structured_output=True,
     )
-    def memory_recall(
+    async def memory_recall(
         query: Annotated[
             str,
             Field(
@@ -158,22 +160,41 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         ] = 8,
     ) -> RecallResponse:
         """Recall cited memory and its applicable relationships."""
-        return service.recall(
-            query,
-            source_id=source_id,
-            root_scope=root_scope,
-            repository=repository,
-            project=project,
-            ticket=ticket,
-            status=status,
-            path_prefix=path_prefix,
-            source_label=source_label,
-            source_instance=source_instance,
-            artifact_kind=artifact_kind,
-            date_from=date_from,
-            date_to=date_to,
-            limit=limit,
-        )
+        arguments = {
+            "query": query,
+            "source_id": source_id,
+            "root_scope": root_scope,
+            "repository": repository,
+            "project": project,
+            "ticket": ticket,
+            "status": status,
+            "path_prefix": path_prefix,
+            "source_label": source_label,
+            "source_instance": source_instance,
+            "artifact_kind": artifact_kind,
+            "date_from": date_from,
+            "date_to": date_to,
+            "limit": limit,
+        }
+        try:
+            # The manager thread only supervises a killable process. It cannot
+            # retain a generation lease or SQLite snapshot after the deadline.
+            return await asyncio.to_thread(
+                recall_in_worker,
+                settings,
+                arguments,
+            )
+        except WorkerDeadlineExceeded:
+            intent = "exact" if query.strip().startswith("artifact://") else "search"
+            return RecallResponse(
+                status="no_answer",
+                intent=intent,
+                query=query,
+                warnings=[
+                    "Memory recall exceeded its time limit. Retry the request. "
+                    "This no_answer result does not mean the memory is absent."
+                ],
+            )
 
     @mcp.tool(
         annotations=ToolAnnotations(

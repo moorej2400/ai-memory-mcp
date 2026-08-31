@@ -878,7 +878,7 @@ def require_current_artifact_schema(settings: Settings) -> int:
     if version != ARTIFACT_SCHEMA_VERSION:
         raise RuntimeError(
             "The artifact database schema is not current. "
-            "Run the artifact migration command."
+            "Run `ai-memory-artifact init` before memory_sync."
         )
     return version
 

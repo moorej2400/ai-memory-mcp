@@ -219,7 +219,14 @@ class MemoryService:
         artifact_only: bool = False,
     ) -> Iterator[RecallGeneration]:
         with lease_current_generation(self.settings) as generation:
-            engine = self._engine_for_generation(generation)
+            # Artifact-only recalls must not load or validate the large Markdown
+            # and graph engine. A fresh Windows worker can spend its full deadline
+            # on that unrelated initialization before an exact artifact lookup.
+            engine = (
+                None
+                if artifact_only
+                else self._engine_for_generation(generation)
+            )
             token = self._pinned_engine.set(engine)
             generation_id = (
                 str(generation["generation_id"])
@@ -260,7 +267,11 @@ class MemoryService:
                     "A coordinated retrieval generation is not available. "
                     "Run memory_sync."
                 )
-            elif generation is not None and engine is None:
+            elif (
+                generation is not None
+                and engine is None
+                and not artifact_only
+            ):
                 component_warnings.append(
                     "The Markdown component is missing from the active generation. "
                     "Run memory_sync."
@@ -280,11 +291,16 @@ class MemoryService:
                     "The artifact semantic component is missing from the active "
                     "generation. Run memory_sync."
                 )
-            if generation is not None and manifest_component_path(
-                self.settings,
-                generation,
-                "graph_snapshot",
-            ) is None:
+            if (
+                not artifact_only
+                and generation is not None
+                and manifest_component_path(
+                    self.settings,
+                    generation,
+                    "graph_snapshot",
+                )
+                is None
+            ):
                 component_warnings.append(
                     "The graph component is missing from the active generation. "
                     "Run memory_sync."
@@ -726,7 +742,8 @@ class MemoryService:
             warnings = []
             if not index_available and not artifact_filters:
                 warnings.append(
-                    "Memory index is not available. Call memory_sync."
+                    "Memory retrieval providers are unavailable. This no_answer "
+                    "result does not mean the memory is absent. Call memory_sync."
                 )
             if artifact_warning:
                 warnings.append(artifact_warning)

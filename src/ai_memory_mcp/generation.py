@@ -20,6 +20,8 @@ GENERATION_SCHEMA = "ai-memory/generation@1"
 GENERATION_POINTER_SCHEMA = "ai-memory/generation-pointer@1"
 _PROCESS_LEASE_LOCK = threading.RLock()
 _PROCESS_LEASES: dict[str, tuple[Path, int]] = {}
+POINTER_REPLACE_RETRY_SECONDS = 2.0
+POINTER_REPLACE_RETRY_INTERVAL_SECONDS = 0.05
 
 
 def _utc_now() -> str:
@@ -94,13 +96,30 @@ def _publish_json(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_name(
         f".{path.name}.partial-{os.getpid()}-{time.time_ns()}"
     )
-    temporary.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    if os.name != "nt":
-        temporary.chmod(0o600)
-    os.replace(temporary, path)
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        if os.name != "nt":
+            temporary.chmod(0o600)
+        deadline = time.monotonic() + POINTER_REPLACE_RETRY_SECONDS
+        while True:
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                # OneDrive and Windows scanners can briefly lock a JSON pointer.
+                # Retrying the atomic replace preserves the validated generation.
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(POINTER_REPLACE_RETRY_INTERVAL_SECONDS)
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
 
 def _publish_json_no_overwrite(path: Path, payload: dict[str, Any]) -> None:
@@ -439,6 +458,7 @@ def _retire_old_generations(
 
     removed = 0
     removed_bytes = 0
+    removal_errors = 0
     candidates: list[Path] = []
     for _, manifest_path, manifest in manifests:
         candidates.append(manifest_path)
@@ -450,14 +470,22 @@ def _retire_old_generations(
     for path in sorted(set(candidates), key=lambda item: item.name):
         if not path.is_file() or path.resolve() in keep:
             continue
-        removed_bytes += path.stat().st_size
-        # These files contain derived data only. Canonical Markdown, artifacts,
-        # event revisions, and object bytes use different paths and are never pruned.
-        path.unlink()
+        try:
+            byte_count = path.stat().st_size
+            # Cleanup is best-effort after generation validation. A transient lock
+            # must not roll back to a generation whose files may already be pruned.
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            removal_errors += 1
+            continue
+        removed_bytes += byte_count
         removed += 1
     return {
         "removed_files": removed,
         "removed_bytes": removed_bytes,
+        "removal_errors": removal_errors,
         "verified_generations": len(retained),
         "last_good_available": last_good_available,
     }
@@ -485,6 +513,7 @@ def refresh_generation(settings: Settings) -> dict[str, Any]:
         acknowledge_artifact_vector_changes,
         build_artifact_vector_index,
     )
+    from .artifacts.schema import require_current_artifact_schema
     from .index import build_index, current_index_path
     from .provider_graph import build_provider_graph
 
@@ -492,7 +521,7 @@ def refresh_generation(settings: Settings) -> dict[str, Any]:
     started_at = _utc_now()
     started = time.perf_counter()
     health = generation_health(settings)
-    layer = "markdown"
+    layer = "artifact-schema"
     published = False
     owned_paths: set[Path] = set()
     with file_lock(
@@ -524,6 +553,10 @@ def refresh_generation(settings: Settings) -> dict[str, Any]:
             if path is not None
         }
         try:
+            # Fail before the expensive Markdown build when an application upgrade
+            # requires an explicit canonical artifact-database migration.
+            require_current_artifact_schema(settings)
+            layer = "markdown"
             markdown_started = time.perf_counter()
             markdown = build_index(
                 settings,

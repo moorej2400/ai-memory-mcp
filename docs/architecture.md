@@ -137,6 +137,9 @@ Weighted traversal permits controlled multi-hop evidence inside that scope.
 The MCP facade gives agents four public tools.
 The facade applies scope rules before retrieval.
 The facade returns source paths and retrieval evidence.
+The facade runs each recall in a supervised worker process.
+The facade stops and reaps the worker when the recall deadline expires.
+Process termination closes the worker generation lease and SQLite snapshot.
 
 | Tool | Function |
 |---|---|
@@ -224,6 +227,7 @@ Examples include unsafe updates, unstable serialization, or insufficient provena
 - Record privacy-safe latency, corpus, storage, growth, and failure metrics.
 - Return source paths for evidence.
 - Remove only derived snapshots through the approved retention process.
+- Stop and reap a recall worker when its deadline expires.
 
 ## Public tools
 

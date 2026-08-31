@@ -11,11 +11,12 @@ from ai_memory_mcp.artifacts.models import (
     ArtifactPayload,
     ParsedArtifactBatch,
 )
-from ai_memory_mcp.artifacts.schema import migrate_artifact_db
+from ai_memory_mcp.artifacts.schema import connect_artifact_db, migrate_artifact_db
 from ai_memory_mcp.artifacts.store import ArtifactStore
 from ai_memory_mcp.config import Settings
 from ai_memory_mcp.generation import (
     _cleanup_failed_generation,
+    _publish_json,
     _retire_old_generations,
     lease_current_generation,
     load_current_generation,
@@ -117,6 +118,63 @@ def test_sync_publishes_one_consistent_generation(tmp_path: Path) -> None:
     assert status.index.generation_id == generation["generation_id"]
     assert status.artifact_vector.stale is False
     assert status.graphify.stale is False
+
+
+def test_sync_rejects_an_outdated_artifact_schema_before_indexing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = _settings(tmp_path)
+    with connect_artifact_db(settings.artifact_db) as connection:
+        connection.execute(
+            "DELETE FROM artifact_schema_migrations WHERE version = 4"
+        )
+        connection.commit()
+
+    index_called = False
+
+    def fail_if_indexed(*args, **kwargs):
+        nonlocal index_called
+        index_called = True
+        raise AssertionError("Markdown indexing must follow schema validation.")
+
+    monkeypatch.setattr("ai_memory_mcp.index.build_index", fail_if_indexed)
+    result = MemoryService(settings).sync()
+
+    assert result.ok is False
+    assert index_called is False
+    assert "ai-memory-artifact init" in result.errors[0]
+    health = json.loads(settings.generation_health_path.read_text(encoding="utf-8"))
+    assert health["last_failure"]["layer"] == "artifact-schema"
+
+
+def test_json_publication_retries_a_transient_windows_lock(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    target = tmp_path / "current-generation.json"
+    original_replace = __import__("os").replace
+    attempts = 0
+
+    def flaky_replace(source: Path, destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError("synthetic OneDrive lock")
+        original_replace(source, destination)
+
+    monkeypatch.setattr("ai_memory_mcp.generation.os.replace", flaky_replace)
+    monkeypatch.setattr(
+        "ai_memory_mcp.generation.POINTER_REPLACE_RETRY_INTERVAL_SECONDS",
+        0.0,
+    )
+
+    _publish_json(target, {"generation_id": "retry-safe"})
+
+    assert attempts == 2
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "generation_id": "retry-safe"
+    }
 
 
 def test_failed_layer_keeps_the_previous_generation(
@@ -494,3 +552,43 @@ def test_retention_keeps_an_older_verified_generation_when_newer_is_invalid(
         settings.state_dir / str(generations[2]["graph_snapshot"])
     ).is_file()
     assert middle_graph.exists() is False
+
+
+def test_retention_skips_a_locked_obsolete_file_without_rolling_back(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = replace(_settings(tmp_path), generation_retention_count=3)
+    service = MemoryService(settings)
+    generations: list[dict[str, object]] = []
+    for index in range(3):
+        note = settings.memory_root / "Record.md"
+        note.write_text(
+            note.read_text(encoding="utf-8") + f"\nLocked cleanup {index}.\n",
+            encoding="utf-8",
+        )
+        assert service.sync().ok is True
+        generation = load_current_generation(settings)
+        assert generation is not None
+        generations.append(generation)
+
+    locked = settings.state_dir / str(generations[0]["graph_snapshot"])
+    current_id = str(generations[-1]["generation_id"])
+    original_unlink = Path.unlink
+
+    def selectively_locked(path: Path, *args, **kwargs) -> None:
+        if path == locked:
+            raise PermissionError("synthetic OneDrive lock")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", selectively_locked)
+    result = _retire_old_generations(
+        replace(settings, generation_retention_count=2),
+        legacy_keep=set(),
+    )
+
+    current = load_current_generation(settings)
+    assert current is not None
+    assert current["generation_id"] == current_id
+    assert locked.is_file()
+    assert result["removal_errors"] == 1

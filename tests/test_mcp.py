@@ -1,13 +1,40 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sqlite3
+import subprocess
+import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from ai_memory_mcp.config import Settings
+from ai_memory_mcp.recall_worker import (
+    WorkerDeadlineExceeded,
+    _archive_worker_generation_leases,
+    _run_worker_command,
+)
 from ai_memory_mcp.server import create_server
+from ai_memory_mcp.service import MemoryService
+
+
+def _process_exists(process_id: int) -> bool:
+    if os.name == "nt":
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {process_id}", "/FO", "CSV", "/NH"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return f'"{process_id}"' in result.stdout
+    try:
+        os.kill(process_id, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def test_public_tool_surface_is_small_and_stable(
@@ -69,6 +96,128 @@ def test_tool_call_runs_full_retrieval_internally(
     assert result.intent == "search"
 
 
+def test_memory_recall_returns_a_bounded_result_when_retrieval_stalls(
+    benchmark_settings: Settings,
+) -> None:
+    server = create_server(
+        replace(benchmark_settings, recall_timeout_seconds=0.01)
+    )
+
+    async def call() -> tuple[object, float]:
+        started = time.perf_counter()
+        result = await server._tool_manager.call_tool(
+            "memory_recall",
+            {"query": "bounded recall"},
+        )
+        elapsed = time.perf_counter() - started
+        return result, elapsed
+
+    result, elapsed = asyncio.run(call())
+
+    assert elapsed < 2.0
+    assert result.status == "no_answer"
+    assert any("time limit" in warning for warning in result.warnings)
+    assert any(
+        "does not mean the memory is absent" in warning
+        for warning in result.warnings
+    )
+
+
+def test_artifact_only_recall_does_not_load_the_markdown_engine(
+    benchmark_settings: Settings,
+    monkeypatch,
+) -> None:
+    service = MemoryService(benchmark_settings)
+
+    def fail_if_loaded(*args, **kwargs):
+        raise AssertionError("Artifact-only recall must skip the Markdown engine.")
+
+    monkeypatch.setattr(service, "_engine_for_generation", fail_if_loaded)
+
+    with service._pin_recall_generation(artifact_only=True) as pinned:
+        assert pinned.engine is None
+
+
+def test_worker_deadline_terminates_and_reaps_the_process() -> None:
+    started = time.perf_counter()
+
+    with pytest.raises(WorkerDeadlineExceeded) as raised:
+        _run_worker_command(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            b"",
+            0.05,
+        )
+
+    elapsed = time.perf_counter() - started
+    assert elapsed < 2.0
+    assert raised.value.worker_pid is not None
+    assert not _process_exists(raised.value.worker_pid)
+
+
+def test_worker_returns_its_result_through_a_dedicated_pipe() -> None:
+    assert _run_worker_command(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'worker-result')",
+        ],
+        b"",
+        10.0,
+    ) == b"worker-result"
+
+
+def test_timeout_archives_the_dead_worker_generation_lease(tmp_path: Path) -> None:
+    settings = Settings(
+        memory_root=tmp_path / "vault",
+        state_dir=tmp_path / "state",
+        graph_path=tmp_path / "graph.json",
+        graphify_mcp_url="",
+    )
+    settings.state_dir.mkdir(parents=True)
+    lease = settings.state_dir / ".generation-lease-example-321-deadbeef.json"
+    lease.write_text("{}\n", encoding="utf-8")
+
+    moved = _archive_worker_generation_leases(settings, 321)
+
+    assert moved == 1
+    assert not lease.exists()
+    assert (
+        settings.state_dir / "retired-generation-leases" / lease.name
+    ).is_file()
+
+
+def test_worker_timeout_closes_its_sqlite_snapshot(tmp_path: Path) -> None:
+    database = tmp_path / "snapshot.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE records (value INTEGER NOT NULL)")
+        connection.execute("INSERT INTO records VALUES (1)")
+
+    child_code = (
+        "import sqlite3,sys,time; "
+        "from pathlib import Path; "
+        "database=sys.argv[1]; "
+        "connection=sqlite3.connect(database); "
+        "connection.execute('BEGIN'); "
+        "connection.execute('SELECT value FROM records').fetchone(); "
+        "Path(database+'.ready').write_text('ready\\n', encoding='utf-8'); "
+        "time.sleep(60)"
+    )
+    with pytest.raises(WorkerDeadlineExceeded):
+        _run_worker_command(
+            [sys.executable, "-c", child_code, str(database)],
+            b"",
+            5.0,
+        )
+
+    assert Path(f"{database}.ready").is_file()
+    with sqlite3.connect(database, timeout=0.1) as connection:
+        connection.execute("BEGIN EXCLUSIVE")
+        connection.execute("UPDATE records SET value = 2")
+        connection.commit()
+        value = connection.execute("SELECT value FROM records").fetchone()[0]
+    assert value == 2
+
+
 def test_sync_updates_only_the_derived_index(
     benchmark_settings: Settings,
 ) -> None:
@@ -101,7 +250,10 @@ def test_read_tools_do_not_build_a_missing_index(
     assert status.index.available is False
     assert status.index.stale is False
     assert recall.status == "no_answer"
-    assert "Memory index is not available. Call memory_sync." in recall.warnings
+    assert any(
+        "no_answer result does not mean the memory is absent" in warning
+        for warning in recall.warnings
+    )
     assert any(
         "Artifact semantic index is not available" in warning
         for warning in recall.warnings
