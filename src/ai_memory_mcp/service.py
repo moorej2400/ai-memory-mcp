@@ -4,6 +4,7 @@ import importlib.metadata
 import hashlib
 import json
 import platform
+import re
 import sqlite3
 import threading
 import time
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .artifacts.identity import parse_artifact_uri
+from .artifacts.context import active_ancestor_predicate
 from .artifacts.models import ArtifactReadResponse, ArtifactScope
 from .artifacts.schema import (
     artifact_database_status,
@@ -33,6 +35,7 @@ from .generation import (
     manifest_component_path,
 )
 from .index import MemoryIndex, current_index_path
+from .freshness import markdown_freshness, publish_markdown_freshness, reconcile_markdown
 from .models import (
     ArtifactIndexResult,
     CanonicalMemoryStatus,
@@ -47,6 +50,7 @@ from .models import (
     RecallEvidence,
     RecallRelationship,
     RecallResponse,
+    RecallExecutionState,
     RuntimeStatus,
     ScopeFilter,
     SearchHit,
@@ -93,6 +97,8 @@ class RecallGeneration:
     artifact_vector_path: Path | None
     artifact_change_counter: int | None
     warnings: tuple[str, ...] = ()
+    reason_codes: tuple[str, ...] = ()
+    raw_change_counter: int | None = None
 
 
 class MemoryService:
@@ -174,6 +180,15 @@ class MemoryService:
             # A missing generation component must not fall back to a graph from
             # another generation. The adapter reports this sentinel as absent.
             graph_path = self.settings.state_dir / ".missing-generation-graph"
+        if (
+            self._engine is not None
+            and self._engine.generation_id == generation_id
+            and self._engine.index.path == markdown_path
+            and self._engine.graph.graph_path == graph_path
+        ):
+            # Published generation files are immutable. A warm worker can reuse
+            # their validated engine without hashing the graph on every request.
+            return self._engine
         if graph_path is not None:
             try:
                 graph_health = GraphifyAdapter(
@@ -219,7 +234,14 @@ class MemoryService:
         artifact_only: bool = False,
     ) -> Iterator[RecallGeneration]:
         with lease_current_generation(self.settings) as generation:
-            engine = self._engine_for_generation(generation)
+            # Artifact-only recalls must not load or validate the large Markdown
+            # and graph engine. A fresh Windows worker can spend its full deadline
+            # on that unrelated initialization before an exact artifact lookup.
+            engine = (
+                None
+                if artifact_only
+                else self._engine_for_generation(generation)
+            )
             token = self._pinned_engine.set(engine)
             generation_id = (
                 str(generation["generation_id"])
@@ -247,44 +269,62 @@ class MemoryService:
                 else None
             )
             component_warnings: list[str] = []
+            component_reasons: list[str] = []
             health = generation_health(self.settings)
             failure_at = str(health.get("last_failure", {}).get("at") or "")
             success_at = str(health.get("last_success", {}).get("at") or "")
             if failure_at and failure_at > success_at:
+                component_reasons.append("refresh_failed")
                 component_warnings.append(
                     "The latest coordinated refresh failed. Recall uses the "
                     "previous verified generation."
                 )
             if generation is None and engine is not None and not artifact_only:
+                component_reasons.append("generation_unavailable")
                 component_warnings.append(
                     "A coordinated retrieval generation is not available. "
                     "Run memory_sync."
                 )
-            elif generation is not None and engine is None:
+            elif (
+                generation is not None
+                and engine is None
+                and not artifact_only
+            ):
+                component_reasons.append("markdown_unavailable")
                 component_warnings.append(
                     "The Markdown component is missing from the active generation. "
                     "Run memory_sync."
                 )
-            elif engine is not None:
-                try:
-                    markdown_stale = engine.index.canonical_stale()
-                except (OSError, TypeError, ValueError, sqlite3.DatabaseError):
-                    markdown_stale = True
-                if markdown_stale:
-                    component_warnings.append(
-                        "Canonical Markdown is newer than the active retrieval "
-                        "generation. Run memory_sync."
-                    )
             if generation is not None and artifact_vector_path is None:
+                component_reasons.append("semantic_unavailable")
                 component_warnings.append(
                     "The artifact semantic component is missing from the active "
                     "generation. Run memory_sync."
                 )
-            if generation is not None and manifest_component_path(
-                self.settings,
-                generation,
-                "graph_snapshot",
-            ) is None:
+            if engine is not None and not artifact_only:
+                freshness = markdown_freshness(self.settings, engine.index.path)
+                if freshness is None:
+                    component_reasons.append("markdown_freshness_unknown")
+                    component_warnings.append(
+                        "Markdown freshness has not been reconciled. Call memory_status."
+                    )
+                elif freshness["stale"]:
+                    component_reasons.append("markdown_stale")
+                    component_warnings.append(
+                        "Canonical Markdown is newer than the active retrieval "
+                        "generation. Run memory_sync."
+                    )
+            if (
+                not artifact_only
+                and generation is not None
+                and manifest_component_path(
+                    self.settings,
+                    generation,
+                    "graph_snapshot",
+                )
+                is None
+            ):
+                component_reasons.append("graph_unavailable")
                 component_warnings.append(
                     "The graph component is missing from the active generation. "
                     "Run memory_sync."
@@ -293,6 +333,7 @@ class MemoryService:
                 engine is not None
                 and engine.graph.graph_path.name == ".missing-generation-graph"
             ):
+                component_reasons.append("graph_unavailable")
                 component_warnings.append(
                     "The graph component is unavailable. Scoped lexical and "
                     "semantic recall remain available."
@@ -306,6 +347,7 @@ class MemoryService:
                         artifact_vector_path=None,
                         artifact_change_counter=None,
                         warnings=tuple(component_warnings),
+                        reason_codes=tuple(component_reasons),
                     )
                     return
                 if not self._artifact_schema_available():
@@ -316,6 +358,7 @@ class MemoryService:
                         artifact_vector_path=artifact_vector_path,
                         artifact_change_counter=expected_counter,
                         warnings=tuple(component_warnings),
+                        reason_codes=tuple(component_reasons),
                     )
                     return
                 with connect_artifact_db(
@@ -331,17 +374,26 @@ class MemoryService:
                     ).fetchone()
                     current_counter = int(row[0]) if row is not None else -1
                     if expected_counter is not None and current_counter != expected_counter:
+                        # Canonical FTS is transactionally current and remains safe
+                        # during derived-index lag. Only semantic candidates stay pinned
+                        # to the older generation watermark.
                         yield RecallGeneration(
                             generation_id=generation_id,
                             engine=engine,
-                            artifact_search=None,
+                            artifact_search=ArtifactSearch(
+                                self.settings,
+                                connection=connection,
+                            ),
                             artifact_vector_path=artifact_vector_path,
                             artifact_change_counter=expected_counter,
+                            raw_change_counter=current_counter,
                             warnings=(
                                 *component_warnings,
-                                "Artifact data is newer than the active retrieval "
-                                "generation. Run memory_sync.",
+                                "Artifact semantic data is older than canonical raw "
+                                "data. Raw artifact search remains available. Run "
+                                "memory_sync.",
                             ),
+                            reason_codes=(*component_reasons, "semantic_lag"),
                         )
                         return
                     yield RecallGeneration(
@@ -353,7 +405,9 @@ class MemoryService:
                         ),
                         artifact_vector_path=artifact_vector_path,
                         artifact_change_counter=current_counter,
+                        raw_change_counter=current_counter,
                         warnings=tuple(component_warnings),
+                        reason_codes=tuple(component_reasons),
                     )
             finally:
                 self._pinned_engine.reset(token)
@@ -425,6 +479,31 @@ class MemoryService:
                     or query.strip().startswith("artifact://")
                 ),
             ) as pinned:
+                execution_state = RecallExecutionState(reason_codes=[
+                    reason for reason in pinned.reason_codes
+                    if not markdown_scope_requested or reason not in {"semantic_lag", "semantic_unavailable"}
+                ])
+                coverage = execution_state.coverage
+                coverage.markdown_available = pinned.engine is not None
+                coverage.artifact_lexical_available = pinned.artifact_search is not None
+                if pinned.artifact_vector_path is not None:
+                    try:
+                        from .artifacts.schema import ClosingSQLiteConnection
+                        with sqlite3.connect(pinned.artifact_vector_path.as_uri() + "?mode=ro", uri=True,
+                                             factory=ClosingSQLiteConnection) as connection:
+                            metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+                        coverage.artifact_semantic_available = True
+                        coverage.artifact_semantic_lag = max(
+                            0, (pinned.raw_change_counter or 0) - int(metadata.get("artifact_change_counter", "0"))
+                        )
+                        coverage.observed_from = metadata.get("observed_from") or None
+                        coverage.observed_to = metadata.get("observed_to") or None
+                        for name in ("eligible_artifacts", "indexed_artifacts", "excluded_artifacts",
+                                     "empty_artifacts", "failed_artifacts", "missing_absolute_time"):
+                            setattr(coverage, name, int(metadata.get(name, "0")))
+                    except (OSError, sqlite3.Error, TypeError, ValueError):
+                        if not markdown_scope_requested:
+                            execution_state.reason_codes.append("semantic_unavailable")
                 response, diagnostics = self._recall(
                     query,
                     source_id=source_id,
@@ -441,7 +520,23 @@ class MemoryService:
                     date_to=date_to,
                     limit=limit,
                     pinned=pinned,
+                    execution_state=execution_state,
                 )
+                if pinned.engine is not None and "markdown" in execution_state.completed_providers:
+                    if pinned.engine.provider_warning:
+                        execution_state.reason_codes.append("semantic_unavailable")
+                    if diagnostics.get("semantic_search", {}).get("budget_exhausted"):
+                        execution_state.reason_codes.append("search_budget_exhausted")
+                if execution_state.completed_providers == ["artifact_exact"]:
+                    # Canonical identity lookup does not use derived indexes.
+                    # Their lag or absence must not reject valid V1 citations.
+                    execution_state.reason_codes.clear()
+                execution_state.reason_codes = list(dict.fromkeys(execution_state.reason_codes))
+                execution_state.execution = (
+                    "failed" if not execution_state.completed_providers
+                    else "partial" if execution_state.reason_codes else "complete"
+                )
+                response._execution_state = execution_state
         except Exception as exc:
             append_event(
                 self.settings,
@@ -501,6 +596,7 @@ class MemoryService:
         date_to: str | datetime | None = None,
         limit: int | None = None,
         pinned: RecallGeneration,
+        execution_state: RecallExecutionState,
     ) -> tuple[RecallResponse, dict[str, Any]]:
         query = query.strip()
         if not query:
@@ -540,6 +636,8 @@ class MemoryService:
         ) or status != "active"
         artifact_available = pinned.artifact_search is not None
         index_available = pinned.engine is not None
+        if not artifact_filters and not query.startswith("artifact://") and not index_available:
+            execution_state.reason_codes.append("markdown_unavailable")
 
         if artifact_filters and markdown_filters:
             raise ValueError(
@@ -553,6 +651,7 @@ class MemoryService:
                     "Markdown filters cannot be used with an artifact reference."
                 )
             if not artifact_available:
+                execution_state.reason_codes.append("artifact_unavailable")
                 warnings = list(pinned.warnings)
                 if not warnings:
                     warnings.append("Artifact database is not available.")
@@ -578,7 +677,12 @@ class MemoryService:
             try:
                 provider_started = time.perf_counter()
                 exact_hit = pinned.artifact_search.get(query, artifact_scope)
+            except KeyError:
+                # A valid reference outside this visible snapshot is a completed
+                # absence lookup, not a provider failure or a permission disclosure.
+                exact_hit = None
             except ARTIFACT_PROVIDER_ERRORS:
+                execution_state.reason_codes.append("artifact_unavailable")
                 return (
                     RecallResponse(
                         status="no_answer",
@@ -592,10 +696,11 @@ class MemoryService:
                 (time.perf_counter() - provider_started) * 1000,
                 3,
             )
+            execution_state.completed_providers.append("artifact_exact")
             packet = merge_artifact_evidence(
                 query,
                 None,
-                [exact_hit],
+                [exact_hit] if exact_hit is not None else [],
                 settings=self.settings,
                 now=datetime.now(timezone.utc),
                 limit=1,
@@ -628,6 +733,42 @@ class MemoryService:
                 date_to=date_to,
             )
             try:
+                if self._should_attempt_exact(query):
+                    provider_started = time.perf_counter()
+                    exact_hits = pinned.artifact_search.find_identity(
+                        self._identity_candidate(query),
+                        artifact_scope,
+                        limit=requested_limit,
+                    )
+                    artifact_latency_ms["artifact_exact"] = round(
+                        (time.perf_counter() - provider_started) * 1000,
+                        3,
+                    )
+                    if exact_hits:
+                        execution_state.completed_providers.append("artifact_exact")
+                        packet = merge_artifact_evidence(
+                            self._identity_candidate(query),
+                            None,
+                            exact_hits,
+                            settings=self.settings,
+                            now=datetime.now(timezone.utc),
+                            limit=requested_limit,
+                        )
+                        response, diagnostics = self._packet_response(
+                            query,
+                            packet,
+                            scope,
+                            intent="exact",
+                            markdown_used=False,
+                        )
+                        diagnostics["route"] = "artifact-exact"
+                        diagnostics["artifact_searched"] = True
+                        diagnostics["generation_id"] = pinned.generation_id
+                        diagnostics.setdefault("provider_latency_ms", {}).update(
+                            artifact_latency_ms
+                        )
+                        response.warnings.extend(pinned.warnings)
+                        return response, diagnostics
                 provider_started = time.perf_counter()
                 artifact_hits = pinned.artifact_search.search(
                     query,
@@ -635,12 +776,14 @@ class MemoryService:
                     limit=max(40, requested_limit * 8),
                 )
             except ARTIFACT_PROVIDER_ERRORS:
+                execution_state.reason_codes.append("artifact_unavailable")
                 artifact_warning = (
                     "Artifact database is not available for this filter."
                     if artifact_filters
                     else "Artifact database is not available."
                 )
             else:
+                execution_state.completed_providers.append("artifact_fts")
                 artifact_latency_ms["artifact_fts"] = round(
                     (time.perf_counter() - provider_started) * 1000,
                     3,
@@ -648,6 +791,7 @@ class MemoryService:
                 from .artifacts.vector_index import search_artifact_vectors
 
                 if pinned.artifact_vector_path is None:
+                    execution_state.reason_codes.append("semantic_unavailable")
                     artifact_semantic_warning = (
                         "Artifact semantic index is not available. "
                         "Raw artifact search remains available."
@@ -664,6 +808,7 @@ class MemoryService:
                             expected_change_counter=pinned.artifact_change_counter,
                         )
                     except ARTIFACT_PROVIDER_ERRORS:
+                        execution_state.reason_codes.append("semantic_unavailable")
                         artifact_semantic_warning = (
                             "Artifact semantic index is not available. "
                             "Raw artifact search remains available."
@@ -677,13 +822,24 @@ class MemoryService:
                         artifact_semantic_details = {
                             "backend": semantic.backend,
                             "candidates": semantic.candidate_count,
+                            "vectors_scored": semantic.vectors_scored,
+                            "blocks_read": semantic.blocks_read,
+                            "budget_exhausted": semantic.budget_exhausted,
                         }
                         if semantic.stale:
+                            execution_state.reason_codes.append("semantic_lag")
                             artifact_semantic_warning = (
                                 "Artifact semantic index is stale. Raw artifact search "
                                 "remains available."
                             )
-        elif artifact_filters and not artifact_available:
+                        elif semantic.budget_exhausted:
+                            execution_state.reason_codes.append("search_budget_exhausted")
+                            artifact_semantic_warning = (
+                                "Artifact semantic search reached its work budget. "
+                                "Raw artifact search remains available."
+                            )
+        elif use_artifacts and not artifact_available:
+            execution_state.reason_codes.append("artifact_unavailable")
             artifact_warning = "Artifact database is not available for this filter."
 
         use_markdown = index_available and not artifact_filters
@@ -691,7 +847,8 @@ class MemoryService:
             warnings = []
             if not index_available and not artifact_filters:
                 warnings.append(
-                    "Memory index is not available. Call memory_sync."
+                    "Memory retrieval providers are unavailable. This no_answer "
+                    "result does not mean the memory is absent. Call memory_sync."
                 )
             if artifact_warning:
                 warnings.append(artifact_warning)
@@ -714,54 +871,55 @@ class MemoryService:
             )
 
         if use_markdown:
-            exact = self.engine.get(self._identity_candidate(query), scope)
-            if exact["found"] and not artifact_hits:
-                response = self._exact_response(query, exact["memory"], scope)
-                if artifact_warning:
-                    response.warnings.append(artifact_warning)
-                if artifact_semantic_warning:
-                    response.warnings.append(artifact_semantic_warning)
-                response.warnings.extend(pinned.warnings)
-                return (
-                    response,
-                    {
-                        "route": "exact",
-                        "graphify": self.engine.graph.health(),
-                        "generation_id": pinned.generation_id,
-                    },
-                )
+            if not artifact_hits and self._should_attempt_exact(query):
+                exact = self.engine.get(self._identity_candidate(query), scope)
+                if exact["found"]:
+                    execution_state.completed_providers.append("markdown")
+                    response = self._exact_response(query, exact["memory"], scope)
+                    if artifact_warning:
+                        response.warnings.append(artifact_warning)
+                    if artifact_semantic_warning:
+                        response.warnings.append(artifact_semantic_warning)
+                    response.warnings.extend(pinned.warnings)
+                    return (
+                        response,
+                        {
+                            "route": "exact",
+                            "graphify": self.engine.graph.health(),
+                            "generation_id": pinned.generation_id,
+                        },
+                    )
 
-            mentioned = self.engine.mentioned_documents(query, scope, limit=3)
-            if (
-                not artifact_hits
-                and self._is_relationship_query(query)
-                and len(mentioned) >= 2
-            ):
-                response = self._relationship_response(
-                    query,
-                    mentioned[0],
-                    mentioned[1],
-                    scope,
-                )
-                if artifact_warning:
-                    response.warnings.append(artifact_warning)
-                if artifact_semantic_warning:
-                    response.warnings.append(artifact_semantic_warning)
-                response.warnings.extend(pinned.warnings)
-                return (
-                    response,
-                    {
-                        "route": "relationship",
-                        "mentioned_documents": len(mentioned),
-                        "graphify": self.engine.graph.health(),
-                        "generation_id": pinned.generation_id,
-                    },
-                )
+            if not artifact_hits and self._is_relationship_query(query):
+                mentioned = self.engine.mentioned_documents(query, scope, limit=3)
+                if len(mentioned) >= 2:
+                    execution_state.completed_providers.append("markdown")
+                    response = self._relationship_response(
+                        query,
+                        mentioned[0],
+                        mentioned[1],
+                        scope,
+                    )
+                    if artifact_warning:
+                        response.warnings.append(artifact_warning)
+                    if artifact_semantic_warning:
+                        response.warnings.append(artifact_semantic_warning)
+                    response.warnings.extend(pinned.warnings)
+                    return (
+                        response,
+                        {
+                            "route": "relationship",
+                            "mentioned_documents": len(mentioned),
+                            "graphify": self.engine.graph.health(),
+                            "generation_id": pinned.generation_id,
+                        },
+                    )
             markdown_packet = self.engine.search(
                 query,
                 scope=scope,
                 limit=requested_limit,
             )
+            execution_state.completed_providers.append("markdown")
         else:
             markdown_packet = None
         packet = merge_artifact_evidence(
@@ -806,6 +964,9 @@ class MemoryService:
         intent: str,
         markdown_used: bool,
     ) -> tuple[RecallResponse, dict[str, Any]]:
+        supporting, source_warnings = self._supporting_artifact_references(
+            packet.results
+        )
         evidence = [
             RecallEvidence(
                 memory_id=hit.memory_id,
@@ -819,6 +980,12 @@ class MemoryService:
                 source_label=hit.source_label,
                 source_instance=hit.source_instance,
                 occurred_at=hit.occurred_at,
+                segment_id=hit.segment_id,
+                segment_start=hit.segment_start,
+                segment_end=hit.segment_end,
+                meeting_artifact_uri=hit.meeting_artifact_uri,
+                continuation=hit.continuation,
+                supporting_artifact_uris=supporting.get(hit.memory_id, []),
             )
             for hit in packet.results
         ]
@@ -833,6 +1000,12 @@ class MemoryService:
                 source_label=hit.source_label,
                 source_instance=hit.source_instance,
                 occurred_at=hit.occurred_at,
+                segment_id=hit.segment_id,
+                segment_start=hit.segment_start,
+                segment_end=hit.segment_end,
+                meeting_artifact_uri=hit.meeting_artifact_uri,
+                continuation=hit.continuation,
+                supporting_artifact_uris=supporting.get(hit.memory_id, []),
             )
             for hit in packet.results
         ]
@@ -845,11 +1018,18 @@ class MemoryService:
             else []
         )
         warnings = self._graph_warnings() if markdown_used else []
+        warnings.extend(source_warnings)
         if markdown_used and self.engine.provider_warning:
             warnings.append(self.engine.provider_warning)
+        semantic_details = packet.diagnostics.get("semantic_search", {})
+        if markdown_used and semantic_details.get("budget_exhausted"):
+            warnings.append(
+                "Markdown semantic search reached its work budget. "
+                "Lexical search results remain available."
+            )
         if evidence and evidence[0].evidence_class in {"raw", "burst"}:
             warnings.append(RAW_ARTIFACT_WARNING)
-        elif packet.answer_status == "no_answer" and evidence:
+        if packet.answer_status == "no_answer" and evidence:
             warnings.append(
                 "No result met the answer threshold. Evidence contains "
                 "best-effort leads only. Verify a lead in its canonical "
@@ -870,6 +1050,79 @@ class MemoryService:
                 **packet.diagnostics,
             },
         )
+
+    def _supporting_artifact_references(
+        self,
+        hits: list[SearchHit],
+    ) -> tuple[dict[str, list[str]], list[str]]:
+        discovered: dict[str, list[str]] = {}
+        engine = self._pinned_engine.get()
+        if engine is None:
+            return discovered, []
+        for hit in hits:
+            if hit.evidence_class != "distilled":
+                continue
+            # Provenance belongs to the same immutable document as the claim.
+            # A newer canonical note may describe different evidence entirely.
+            with engine.index.connection() as connection:
+                row = connection.execute(
+                    "SELECT artifact_references_json FROM documents WHERE memory_id = ?", (hit.memory_id,)
+                ).fetchone()
+            references = json.loads(row[0]) if row is not None else []
+            if references:
+                discovered[hit.memory_id] = references
+        if not discovered or not self._artifact_schema_available():
+            return discovered, []
+        all_references = list(
+            dict.fromkeys(
+                reference
+                for references in discovered.values()
+                for reference in references
+            )
+        )
+        identities = [parse_artifact_uri(reference)[1] for reference in all_references]
+        placeholders = ", ".join("?" for _ in identities)
+        with connect_artifact_db(self.settings.artifact_db, read_only=True) as connection:
+            valid_ids = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT artifact_id FROM artifacts WHERE artifact_id IN ("
+                    + placeholders
+                    + ") AND deleted_at IS NULL AND redacted_at IS NULL AND "
+                    + active_ancestor_predicate("artifacts"),
+                    identities,
+                )
+            }
+            stale_ids = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT artifact_id FROM distillation_state "
+                    "WHERE artifact_id IN ("
+                    + placeholders
+                    + ") AND status = 'pending'",
+                    identities,
+                )
+            }
+        valid = {
+            memory_id: [
+                reference
+                for reference in references
+                if parse_artifact_uri(reference)[1] in valid_ids
+            ]
+            for memory_id, references in discovered.items()
+        }
+        warnings: list[str] = []
+        if len(valid_ids) != len(identities):
+            warnings.append(
+                "A distilled memory has an unavailable source reference. "
+                "Use only the available supporting artifact references."
+            )
+        if stale_ids:
+            warnings.append(
+                "A distilled memory has newer source evidence. "
+                "Review its supporting artifact references before use."
+            )
+        return valid, warnings
 
     def artifact_read(
         self,
@@ -970,6 +1223,9 @@ class MemoryService:
             generation.pop("_artifact_result")
         )
         self._engine = RetrievalEngine(self.settings)
+        reconcile_markdown(self.settings)
+        from .artifacts.vector_index import schedule_artifact_compaction
+        schedule_artifact_compaction(self.settings)
         retention = generation["retention"]
         return SyncResponse(
             ok=True,
@@ -1025,9 +1281,12 @@ class MemoryService:
             try:
                 index = MemoryIndex(self.settings, path=index_path)
                 metadata = index.metadata()
+                markdown_stale = generation is None or index.canonical_stale()
+                freshness = publish_markdown_freshness(self.settings, index_path, markdown_stale)
                 index_status = IndexStatus(
                     available=True,
-                    stale=generation is None or index.canonical_stale(),
+                    stale=markdown_stale,
+                    reconciled_at=str(freshness["reconciled_at"]),
                     generation_id=generation_id,
                     path=str(index.path),
                     schema_version=metadata.get("schema_version"),
@@ -1177,6 +1436,22 @@ class MemoryService:
                     embedded_bursts=int(
                         metadata.get("embedded_bursts", "0")
                     ),
+                    eligible_artifacts=int(
+                        metadata.get("eligible_artifacts", "0")
+                    ),
+                    indexed_artifacts=int(
+                        metadata.get("indexed_artifacts", "0")
+                    ),
+                    excluded_artifacts=int(
+                        metadata.get("excluded_artifacts", "0")
+                    ),
+                    empty_artifacts=int(metadata.get("empty_artifacts", "0")),
+                    failed_artifacts=int(metadata.get("failed_artifacts", "0")),
+                    missing_absolute_time=int(
+                        metadata.get("missing_absolute_time", "0")
+                    ),
+                    observed_from=metadata.get("observed_from") or None,
+                    observed_to=metadata.get("observed_to") or None,
                     ann_backend=metadata.get("ann_backend"),
                     byte_count=artifact_vector_path.stat().st_size,
                     age_seconds=max(
@@ -1362,6 +1637,28 @@ class MemoryService:
         )
 
     @staticmethod
+    def _should_attempt_exact(query: str) -> bool:
+        words = query.split()
+        if not words:
+            return False
+        lowered = tuple(word.casefold().strip(":") for word in words)
+        explicit_prefixes = (
+            ("get",),
+            ("open",),
+            ("show",),
+            ("recall",),
+            ("find", "memory"),
+            ("get", "memory"),
+            ("open", "memory"),
+            ("show", "memory"),
+        )
+        if any(lowered[: len(prefix)] == prefix for prefix in explicit_prefixes):
+            return True
+        # Broad exact pre-scans delay normal questions. IDs and short names do not
+        # need question punctuation or more than a small phrase.
+        return len(query) <= 160 and len(words) <= 10 and not query.endswith("?")
+
+    @staticmethod
     def _identity_candidate(query: str) -> str:
         words = query.split()
         if not words:
@@ -1384,7 +1681,24 @@ class MemoryService:
 
     @staticmethod
     def _is_relationship_query(query: str) -> bool:
-        return bool(set(tokenize(query)) & RELATIONSHIP_TERMS)
+        tokens = set(tokenize(query))
+        if not tokens & RELATIONSHIP_TERMS:
+            return False
+        return bool(
+            "relationship" in tokens
+            or "between" in tokens
+            or (
+                tokens
+                & {
+                    "connect",
+                    "connected",
+                    "connection",
+                    "relate",
+                    "related",
+                }
+                and "to" in tokens
+            )
+        )
 
     def _exact_response(
         self,

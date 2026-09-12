@@ -103,6 +103,15 @@ repository-owned scripts.
 | `AI_MEMORY_MCP_HOST` | `127.0.0.1` | Sets the HTTP host. |
 | `AI_MEMORY_MCP_PORT` | `4334` | Sets the HTTP port. |
 | `AI_MEMORY_MCP_RESULT_LIMIT` | `8` | Sets the default result limit. |
+| `AI_MEMORY_MCP_RECALL_TIMEOUT_SECONDS` | `30` | Sets the recall worker deadline. |
+| `AI_MEMORY_RECALL_WORKERS` | `2` | Sets the supervised worker count. |
+| `AI_MEMORY_RECALL_QUEUE_CAPACITY` | `8` | Sets the bounded waiting request count. |
+| `AI_MEMORY_RECALL_WORKER_MAX_REQUESTS` | `500` | Sets the worker recycle interval. |
+| `AI_MEMORY_VECTOR_BLOCK_SIZE` | `1024` | Sets the exact-search vector block size. |
+| `AI_MEMORY_VECTOR_MAX_VECTORS` | `200000` | Sets the exact-search vector work limit. |
+| `AI_MEMORY_VECTOR_MAX_SECONDS` | `8` | Sets the exact-search elapsed work limit. |
+| `AI_MEMORY_ANN_CANDIDATE_LIMIT` | `10000` | Sets the maximum ANN candidate count. |
+| `AI_MEMORY_CONTEXT_MAX_CHARACTERS` | `5000` | Sets the expanded context limit. |
 | `AI_MEMORY_MCP_SEMANTIC_DIMENSIONS` | `1024` | Sets the hashed semantic vector size. |
 | `AI_MEMORY_MCP_EMBEDDING_PROVIDER` | `auto` | Selects `model2vec`, `hashed`, or `auto`. |
 | `AI_MEMORY_MCP_EMBEDDING_MODEL` | `minishlab/potion-base-8M` | Sets the Model2Vec model name. |
@@ -115,6 +124,10 @@ repository-owned scripts.
 
 The server accepts only a loopback host.
 The HTTP transport does not provide authentication.
+
+The recall deadline contains failed work.
+It does not define acceptable retrieval performance.
+Response version 2 reports a deadline as failed execution, not an empty search.
 
 The retrieval log contains Markdown queries and returned evidence.
 Artifact routes store query hashes, evidence digests, and metadata.

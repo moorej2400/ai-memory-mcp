@@ -52,7 +52,8 @@ AI Memory owns validation, canonical storage, revisions, receipts, search, and c
 
 `memory_recall` searches distilled Markdown and raw artifact text.
 Distilled evidence can answer a general question.
-Raw evidence is a lead unless the query has an exact match.
+Response version 2 returns ranked raw evidence without an exact-match requirement.
+Read the cited raw record before you use its content as a fact.
 
 Use `memory_artifact_read` to read ordered source context around an artifact citation.
 
@@ -75,3 +76,10 @@ Later events for a redacted artifact do not read or copy provider handoff files.
 
 Create a consistent SQLite backup before each schema migration.
 Keep the migration source unchanged until count and digest checks pass.
+
+Schema version 6 adds a derived source-order table.
+Intake updates its ordered keys in the same transaction as the raw records.
+Context reads and incremental index updates use these keys for untimed messages and transcript cues.
+Covering indexes reduce the data that unscoped identity lookup must read.
+Migration builds the table from existing source records.
+The migration backup preserves the previous database.

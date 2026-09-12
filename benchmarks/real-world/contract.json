@@ -1,0 +1,213 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "smoke": {
+      "filler_notes": 24,
+      "conversations": 4,
+      "messages_per_conversation": 20,
+      "meetings": 3,
+      "cues_per_meeting": 16
+    },
+    "standard": {
+      "filler_notes": 300,
+      "conversations": 30,
+      "messages_per_conversation": 120,
+      "meetings": 16,
+      "cues_per_meeting": 80
+    },
+    "scale": {
+      "filler_notes": 1500,
+      "conversations": 100,
+      "messages_per_conversation": 1000,
+      "meetings": 100,
+      "cues_per_meeting": 500
+    },
+    "regression": {
+      "filler_notes": 100,
+      "conversations": 20,
+      "messages_per_conversation": 50,
+      "meetings": 20,
+      "cues_per_meeting": 100
+    },
+    "workload": {
+      "filler_notes": 2500,
+      "conversations": 50,
+      "messages_per_conversation": 1000,
+      "meetings": 1000,
+      "cues_per_meeting": 100
+    },
+    "growth": {
+      "filler_notes": 25000,
+      "conversations": 500,
+      "messages_per_conversation": 1000,
+      "meetings": 5000,
+      "cues_per_meeting": 200
+    }
+  },
+  "quality": {
+    "minimum_pass_rate": 1.0,
+    "minimum_recall_at_5": 1.0,
+    "minimum_no_answer_accuracy": 1.0,
+    "minimum_ann_candidate_recall_at_10": 0.95,
+    "maximum_scope_leakage_rate": 0.0,
+    "maximum_citation_failure_rate": 0.0
+  },
+  "performance": {
+    "smoke": {
+      "maximum_recall_p95_ms": 1000,
+      "minimum_refresh_events_per_second": 100,
+      "maximum_peak_resident_bytes": 1073741824
+    },
+    "regression": {
+      "maximum_recall_p95_ms": 2000,
+      "minimum_refresh_events_per_second": 500,
+      "maximum_peak_resident_bytes": 2147483648
+    },
+    "workload": {
+      "maximum_recall_p95_ms": 5000,
+      "minimum_refresh_events_per_second": 500,
+      "maximum_peak_resident_bytes": 4294967296
+    },
+    "growth": {
+      "maximum_recall_p95_ms": 10000,
+      "minimum_refresh_events_per_second": 500,
+      "maximum_peak_resident_bytes": 8589934592
+    }
+  },
+  "cases": [
+    {
+      "id": "incident-identifier",
+      "query": "LANTERN-248",
+      "expected_any": ["rw-lantern-incident"],
+      "tags": ["identifier", "incident"]
+    },
+    {
+      "id": "incident-error-remedy",
+      "query": "What is the recovery action after error FL-208?",
+      "expected_any": ["rw-lantern-incident"],
+      "tags": ["error", "procedure"]
+    },
+    {
+      "id": "conceptual-produce",
+      "query": "Which vegetable should I use to make a rich pasta sauce?",
+      "expected_any": ["rw-kitchen-tomato"],
+      "requires_semantic": true,
+      "tags": ["semantic", "conceptual"]
+    },
+    {
+      "id": "cedar-scope",
+      "query": "When is the deployment window?",
+      "scope": {"repository": "cedar"},
+      "expected_any": ["rw-cedar-window"],
+      "forbidden": ["rw-harbor-window"],
+      "tags": ["scope", "repository"]
+    },
+    {
+      "id": "harbor-scope",
+      "query": "When is the deployment window?",
+      "scope": {"repository": "harbor"},
+      "expected_any": ["rw-harbor-window"],
+      "forbidden": ["rw-cedar-window"],
+      "tags": ["scope", "repository"]
+    },
+    {
+      "id": "literal-wildcard-scope",
+      "query": "When is the deployment window?",
+      "scope": {"repository": "%"},
+      "no_answer": true,
+      "forbidden": ["rw-cedar-window", "rw-harbor-window"],
+      "tags": ["scope", "wildcard", "no-answer"]
+    },
+    {
+      "id": "current-retention",
+      "query": "What is the current archive retention period?",
+      "expected_any": ["rw-current-retention"],
+      "forbidden": ["rw-old-retention"],
+      "tags": ["supersession", "freshness"]
+    },
+    {
+      "id": "old-retention",
+      "query": "What was the retired archive retention period?",
+      "scope": {"status": "superseded"},
+      "expected_any": ["rw-old-retention"],
+      "tags": ["supersession", "scope"]
+    },
+    {
+      "id": "graph-relationship",
+      "query": "How is the Lantern recovery runbook related to the cache incident?",
+      "expected_any": ["rw-lantern-runbook", "rw-lantern-incident"],
+      "tags": ["graph", "relationship"]
+    },
+    {
+      "id": "meeting-decision",
+      "query": "What temperature starts the studio cooling fans?",
+      "expected_any": ["rw-studio-cooling"],
+      "tags": ["meeting", "distilled", "noise"]
+    },
+    {
+      "id": "raw-chat-marker",
+      "query": "\"The approved opal checkpoint is CP-731.\"",
+      "expected_artifacts": ["message:target-chat-message"],
+      "expected_status": "answered",
+      "expected_warning": "Raw artifact",
+      "scope": {
+        "source_label": "synthetic-chat",
+        "source_instance": "real-world"
+      },
+      "tags": ["artifact", "chat", "citation"]
+    },
+    {
+      "id": "raw-meeting-marker",
+      "query": "\"The accepted silver signal is SG-419.\"",
+      "expected_artifacts": ["transcript-cue:target-meeting-cue"],
+      "expected_status": "answered",
+      "expected_warning": "Raw artifact",
+      "scope": {
+        "source_label": "synthetic-chat",
+        "source_instance": "real-world"
+      },
+      "tags": ["artifact", "meeting", "citation"]
+    },
+    {
+      "id": "historical-fruit-link",
+      "query": "Someone sent me a link to buy apples. Find the message.",
+      "expected_artifacts": ["message:target-fruit-link"],
+      "scope": {
+        "source_label": "synthetic-chat",
+        "source_instance": "real-world"
+      },
+      "tags": ["artifact", "historical", "context", "short-message"]
+    },
+    {
+      "id": "meeting-descendant",
+      "query": "silver signal SG-419",
+      "expected_artifacts": ["transcript-cue:target-meeting-cue"],
+      "scope": {
+        "source_label": "synthetic-chat",
+        "source_instance": "real-world",
+        "artifact_kind": "meeting"
+      },
+      "tags": ["artifact", "meeting", "descendant"]
+    },
+    {
+      "id": "historical-fruit-link-unscoped",
+      "query": "Someone sent me a link to buy apples. Find the message.",
+      "expected_artifacts": ["message:target-fruit-link"],
+      "requires_semantic": true,
+      "tags": ["artifact", "historical", "paraphrase", "unscoped"]
+    },
+    {
+      "id": "missing-answer",
+      "query": "What is the launch date for the quartz submarine?",
+      "no_answer": true,
+      "tags": ["no-answer"]
+    },
+    {
+      "id": "durable-citation",
+      "query": "Where is the studio cooling threshold recorded?",
+      "expected_any": ["rw-studio-cooling"],
+      "expected_path": "Decisions/Studio Cooling.md",
+      "tags": ["citation", "durable"]
+    }
+  ]
+}

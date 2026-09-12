@@ -175,6 +175,11 @@ Run a dry-run check on macOS or Linux:
 ```
 
 Check the reported counts and unresolved identities.
+Check `synthetic_note_identities` when old Markdown has no provider identity.
+Each synthetic identity uses the note name and content SHA-256.
+Treat synthetic identities as separate review records.
+Check `duplicate_note_mappings` for multiple notes linked to one provider record.
+The migration keeps each duplicate note as a separate transcript identity.
 The `database_sha256` value identifies the logical database snapshot.
 Stop the import if a required count is incorrect.
 
@@ -253,10 +258,20 @@ Run the frozen retrieval benchmark:
 ```
 
 The benchmark calls the complete `memory_recall` pipeline.
-It reports recall, MRR, no-answer accuracy, scope leakage, citations, diversity, freshness, and layer latency.
+It reports recall, MRR, ANN candidate recall, source safety, resource use, and layer latency.
 The benchmark writes generated data under the ignored `benchmarks/runs/` directory.
 The benchmark does not use live messages, meetings, or memory notes.
 Do not use one benchmark run as a strict performance limit.
+
+Run the regression profile before release:
+
+```bash
+./.venv/bin/ai-memory-real-world-benchmark --profile regression --repeats 3
+```
+
+Use `workload` and `growth` only for separate capacity tests.
+An interrupted run writes an incomplete report.
+An incomplete report cannot pass a release gate.
 
 ## Run the MCP server
 
@@ -282,6 +297,23 @@ Use the HTTP transport when a local client needs an endpoint:
 
 The default HTTP endpoint is `http://127.0.0.1:4334/mcp`.
 The server rejects non-loopback hosts because this transport has no authentication.
+
+## Interpret recall results
+
+Use response version 2 for new clients.
+This version separates execution state from result kind.
+
+`execution` is `complete`, `partial`, or `failed`.
+`result_kind` is `exact`, `ranked`, or `empty`.
+Do not interpret failed execution as an absent memory.
+
+Read `reason_codes` when execution is partial or failed.
+Read `coverage` for semantic lag, source availability, and representation counts.
+Use `memory_artifact_read` to inspect a raw citation.
+Use `supporting_artifact_uris` to inspect evidence for a distilled memory.
+
+Response version 1 remains available during client migration.
+Version 1 returns a tool error when it cannot represent an incomplete result safely.
 
 ## Update client registrations
 

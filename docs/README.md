@@ -16,6 +16,7 @@ Return to the [project overview](../README.md) for the quick-start procedure.
 - [Artifact storage](artifact-storage.md) defines raw and distilled authority.
 - [Development](development.md) gives the development and test procedures.
 - [Validation](validation-report.md) gives the current validation evidence.
+- [Retrieval reliability validation](retrieval-reliability-validation.md) gives the scale and quality evidence.
 - [Writing standard](writing-standard.md) gives the documentation rules.
 
 ## Agent integration

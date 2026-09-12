@@ -42,6 +42,26 @@ Do not change the frozen cases during retrieval performance work.
 Do not change the frozen fixtures during retrieval performance work.
 The benchmark lock detects a contract change.
 
+## Run the mixed real-world benchmark
+
+Run the standard synthetic workload:
+
+```bash
+./.venv/bin/ai-memory-real-world-benchmark --profile standard
+```
+
+On Windows, run this command:
+
+```powershell
+.\.venv\Scripts\ai-memory-real-world-benchmark.exe --profile standard
+```
+
+The benchmark uses the complete `memory_recall` pipeline.
+The report includes quality, latency, throughput, corpus, and storage measurements.
+
+Use a prior report from the same machine for a performance regression gate.
+See the [mixed real-world benchmark guide](../benchmarks/real-world/README.md).
+
 ## Project directories
 
 | Directory | Content |

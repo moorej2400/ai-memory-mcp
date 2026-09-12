@@ -18,7 +18,13 @@ from .graphify import GraphifyAdapter
 from .generation import current_graph_path
 from .index import MemoryIndex, scope_sql
 from .models import EvidencePacket, ScopeFilter, SearchHit
-from .text import cosine_sparse, fts_expression, query_identifiers, tokenize
+from .text import (
+    cosine_sparse,
+    fts_expressions,
+    query_identifiers,
+    query_windows,
+    tokenize,
+)
 
 TICKET_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,12}-\d+\b", re.IGNORECASE)
 STOPWORDS = {
@@ -47,6 +53,7 @@ STOPWORDS = {
 
 SEMANTIC_COVERAGE_MIN = 0.20
 SEMANTIC_MARGIN_MIN = 0.35
+SCOPED_DISTRIBUTED_COVERAGE_MIN = 0.50
 FRESHNESS_CAP = 0.03
 FRESHNESS_HALF_LIFE_DAYS = 180.0
 REVIEW_OVERDUE_PENALTY = 0.03
@@ -74,7 +81,10 @@ def _raw_exact_reason(query: str, hit: ArtifactSearchHit) -> str | None:
         hit.artifact_id.casefold(),
         hit.artifact_uri.casefold(),
     }
-    if candidate and candidate in identifiers:
+    if candidate and (
+        candidate in identifiers
+        or candidate == hit.matched_identity.casefold()
+    ):
         return "exact identifier"
     searchable = f"{hit.title}\n{hit.text}".casefold()
     if any(phrase.casefold() in searchable for phrase in _quoted_phrases(query)):
@@ -101,8 +111,10 @@ def merge_artifact_evidence(
     if markdown_packet is not None:
         for rank, original in enumerate(markdown_packet.results, start=1):
             hit = copy.deepcopy(original)
-            hit.score += 1.0 / (settings.rrf_k + rank)
-            hit.ranks.setdefault("distilled", rank)
+            # Markdown has already been reranked and answer-checked. Preserve
+            # its final scores and ordering. Replacing scores with a single RRF
+            # vote lets two weak raw producers bury an answer-checked passage.
+            hit.ranks = {"distilled": rank}
             combined[hit.memory_id] = hit
 
     producer_ranks = {"artifact-fts": 0, "artifact-vector": 0}
@@ -117,7 +129,6 @@ def merge_artifact_evidence(
         producer_ranks[ranking] += 1
         rank = producer_ranks[ranking]
         score = 1.0 / (settings.rrf_k + rank)
-        score += min(0.04, raw.score * 0.04)
         hit = SearchHit(
             memory_id=raw.artifact_id,
             source_id=f"artifact-{raw.source}",
@@ -138,10 +149,15 @@ def merge_artifact_evidence(
             ),
             artifact_kind=raw.entity,
             external_id=raw.external_id,
+            segment_id=raw.segment_id,
+            segment_start=raw.segment_start,
+            segment_end=raw.segment_end,
+            meeting_artifact_uri=raw.meeting_artifact_uri,
+            continuation=raw.continuation,
         )
         existing = combined.get(raw.artifact_uri)
         prior_raw = raw_by_uri.get(raw.artifact_uri)
-        if prior_raw is None or (
+        if prior_raw is None or raw.score > prior_raw.score or (
             prior_raw.evidence_class != "raw" and raw.evidence_class == "raw"
         ):
             raw_by_uri[raw.artifact_uri] = raw
@@ -155,11 +171,23 @@ def merge_artifact_evidence(
             if existing.evidence_class == "raw" or hit.evidence_class != "raw"
             else (hit, existing)
         )
-        winner.ranks.update(secondary.ranks)
-        winner.signals.update(secondary.signals)
-        # Each producer contributes one independent RRF vote when both
-        # producers point to the same canonical artifact.
-        winner.score += secondary.score
+        producer = next(iter(secondary.ranks))
+        if producer not in winner.ranks:
+            winner.ranks.update(secondary.ranks)
+            winner.signals.update(secondary.signals)
+            # One source gets at most one vote from each producer.
+            winner.score += secondary.score
+        elif secondary.signals.get(producer, 0.0) > winner.signals.get(
+            producer, 0.0
+        ):
+            winner.signals[producer] = secondary.signals[producer]
+        if raw.score >= (prior_raw.score if prior_raw is not None else -1.0):
+            winner.text = hit.text
+            winner.segment_id = hit.segment_id
+            winner.segment_start = hit.segment_start
+            winner.segment_end = hit.segment_end
+            winner.meeting_artifact_uri = hit.meeting_artifact_uri
+            winner.continuation = hit.continuation
         combined[raw.artifact_uri] = winner
 
     artifact_fusion_ms = round(
@@ -167,34 +195,25 @@ def merge_artifact_evidence(
         3,
     )
     rerank_started = time.perf_counter()
+    raw_candidates = list(combined[uri] for uri in raw_by_uri)
+    for hit in raw_candidates:
+        # Feed raw text the same bounded relevance signals as Markdown. Keep
+        # producer ranks for diagnostics; aliases are only reranker inputs.
+        if "artifact-fts" in hit.ranks:
+            hit.ranks["lexical"] = hit.ranks["artifact-fts"]
+        if "artifact-vector" in hit.ranks:
+            hit.ranks["semantic"] = hit.ranks["artifact-vector"]
+            hit.signals["semantic"] = hit.signals.get("artifact-vector", 0.0)
+    RetrievalEngine._rerank_hits(query, raw_candidates, len(raw_candidates), now)
+    for hit in raw_candidates:
+        hit.ranks.pop("lexical", None)
+        hit.ranks.pop("semantic", None)
     for uri, raw in raw_by_uri.items():
         hit = combined[uri]
         reason = _raw_exact_reason(query, raw)
         if reason is not None:
             hit.score += 0.20
             hit.reasons.append(reason)
-        occurred = raw.occurred_at
-        if occurred is None:
-            continue
-        if occurred.tzinfo is None:
-            occurred = occurred.replace(tzinfo=timezone.utc)
-        age_days = max(
-            0.0,
-            (now - occurred.astimezone(timezone.utc)).total_seconds()
-            / 86400.0,
-        )
-        half_life = (
-            RAW_MEETING_HALF_LIFE_DAYS
-            if raw.entity
-            in {"meeting", "recording", "transcript", "transcript-cue"}
-            else RAW_CHAT_HALF_LIFE_DAYS
-        )
-        freshness = (
-            RAW_FRESHNESS_CAP
-            if reason is not None
-            else RAW_FRESHNESS_CAP * 0.5 ** (age_days / half_life)
-        )
-        hit.score += freshness
     ranked = sorted(
         combined.values(),
         key=lambda hit: (
@@ -314,6 +333,22 @@ def _intent_expansions(tokens: set[str]) -> set[str]:
     return expansions - tokens
 
 
+def _distributed_query_coverage(
+    query: str,
+    hits: list[SearchHit],
+) -> float:
+    content_query = set(tokenize(query)) - STOPWORDS
+    if not content_query:
+        return 0.0
+    matched: set[str] = set()
+    for hit in hits:
+        searchable = (
+            f"{hit.memory_id} {hit.path} {hit.title} {hit.heading} {hit.text}"
+        )
+        matched.update(content_query & set(tokenize(searchable)))
+    return len(matched) / len(content_query)
+
+
 def _row_hit(row: sqlite3.Row, score: float, source: str, rank: int) -> SearchHit:
     return SearchHit(
         memory_id=row["memory_id"],
@@ -327,6 +362,9 @@ def _row_hit(row: sqlite3.Row, score: float, source: str, rank: int) -> SearchHi
         review_after=row["review_after"],
         ranks={source: rank},
         signals={source: score},
+        segment_id=str(row["chunk_id"]),
+        segment_start=0,
+        segment_end=len(str(row["text"])),
     )
 
 
@@ -374,20 +412,20 @@ class RetrievalEngine:
         )
 
     def _plan(self, query: str, supplied: ScopeFilter | None) -> ScopeFilter:
-        scope = supplied or ScopeFilter()
-        ticket = TICKET_RE.search(query)
-        if ticket and not scope.ticket:
-            scope.ticket = ticket.group(0).upper()
-        return scope
+        # Prose identifiers remain retrieval signals. Only explicit arguments
+        # can narrow scope because many older notes have incomplete metadata.
+        return copy.deepcopy(supplied) if supplied is not None else ScopeFilter()
 
     def _lexical(
         self, query: str, scope: ScopeFilter, limit: int
     ) -> list[SearchHit]:
         where, parameters = scope_sql(scope)
         scope_clause = where.replace("WHERE", "AND", 1) if where else ""
+        by_chunk: dict[str, sqlite3.Row] = {}
         with self.index.connection() as connection:
-            rows = connection.execute(
-                f"""
+            for expression in fts_expressions(query):
+                rows = connection.execute(
+                    f"""
                 WITH candidates AS (
                     SELECT c.*, d.identifiers_json, d.updated, d.review_after,
                            bm25(
@@ -410,8 +448,19 @@ class RetrievalEngine:
                 ORDER BY lexical_score
                 LIMIT ?
                 """,
-                [fts_expression(query), *parameters, limit],
-            ).fetchall()
+                    [expression, *parameters, limit],
+                ).fetchall()
+                for row in rows:
+                    key = str(row["chunk_id"])
+                    prior = by_chunk.get(key)
+                    if prior is None or float(row["lexical_score"]) < float(
+                        prior["lexical_score"]
+                    ):
+                        by_chunk[key] = row
+        rows = sorted(
+            by_chunk.values(),
+            key=lambda row: (float(row["lexical_score"]), str(row["chunk_id"])),
+        )[:limit]
         return [
             _row_hit(row, _lexical_score(row["lexical_score"]), "lexical", rank)
             for rank, row in enumerate(rows, 1)
@@ -427,18 +476,28 @@ class RetrievalEngine:
     ) -> list[SearchHit]:
         if self.provider is None:
             return []
-        vector = self.provider.embed(query)
-        candidates, backend = self.index.vector_candidates(
-            scope,
-            vector,
-            limit,
-        )
+        windows = query_windows(query)
+        all_candidates: dict[str, tuple[Any, dict[int, float], float]] = {}
+        backends: list[str] = []
+        for window in windows:
+            vector = self.provider.embed(window)
+            candidates, backend = self.index.vector_candidates(scope, vector, limit)
+            backends.append(backend)
+            for row, candidate in candidates:
+                score = cosine_sparse(vector, candidate)
+                key = str(row["chunk_id"])
+                prior = all_candidates.get(key)
+                if prior is None or score > prior[2]:
+                    all_candidates[key] = (row, candidate, score)
         if details is not None:
-            details["backend"] = backend
-            details["candidates"] = len(candidates)
+            details["backend"] = "+".join(dict.fromkeys(backends))
+            details["candidates"] = len(all_candidates)
+            details["query_windows"] = len(windows)
+            details["budget_exhausted"] = any(
+                "budget-exhausted" in backend for backend in backends
+            )
         by_memory: dict[str, tuple[float, Any]] = {}
-        for row, candidate in candidates:
-            score = cosine_sparse(vector, candidate)
+        for row, _candidate, score in all_candidates.values():
             memory_id = str(row["memory_id"])
             current = by_memory.get(memory_id)
             if current is None or score > current[0]:
@@ -540,8 +599,20 @@ class RetrievalEngine:
         rankings: dict[str, list[SearchHit]],
     ) -> list[SearchHit]:
         by_memory: dict[str, SearchHit] = {}
+        passages: dict[str, dict[str, tuple[float, SearchHit, set[str]]]] = {}
         for source, hits in rankings.items():
             for rank, hit in enumerate(hits, 1):
+                if source != "graph":
+                    key = hit.segment_id or f"{hit.heading}\n{hit.text}"
+                    choices = passages.setdefault(hit.memory_id, {})
+                    score, passage, producers = choices.get(key, (0.0, hit, set()))
+                    if source not in producers:
+                        producers.add(source)
+                        choices[key] = (
+                            score + 1.0 / (self.settings.rrf_k + rank),
+                            passage,
+                            producers,
+                        )
                 fused = by_memory.get(hit.memory_id)
                 if fused is None:
                     fused = SearchHit(
@@ -554,6 +625,9 @@ class RetrievalEngine:
                         score=0.0,
                         updated=hit.updated,
                         review_after=hit.review_after,
+                        segment_id=hit.segment_id,
+                        segment_start=hit.segment_start,
+                        segment_end=hit.segment_end,
                     )
                     by_memory[hit.memory_id] = fused
                 # A long note can yield many matching sections. Each retriever
@@ -567,6 +641,16 @@ class RetrievalEngine:
                 fused.score += 1.0 / (self.settings.rrf_k + rank)
                 fused.ranks[source] = rank
                 fused.signals[source] = hit.score
+        for memory_id, choices in passages.items():
+            # Passage votes use ranks, like document fusion. Graph-only prefix
+            # scores must never compete with textual similarity scores.
+            _score, passage, _producers = max(choices.values(), key=lambda item: item[0])
+            fused = by_memory[memory_id]
+            fused.heading = passage.heading
+            fused.text = passage.text
+            fused.segment_id = passage.segment_id
+            fused.segment_start = passage.segment_start
+            fused.segment_end = passage.segment_end
         return list(by_memory.values())
 
     def _rerank(
@@ -575,11 +659,14 @@ class RetrievalEngine:
         hits: list[SearchHit],
         limit: int,
     ) -> list[SearchHit]:
+        return self._rerank_hits(query, hits, limit, self.now())
+
+    @staticmethod
+    def _rerank_hits(query: str, hits: list[SearchHit], limit: int, now: datetime) -> list[SearchHit]:
         query_casefold = query.casefold()
         query_tokens = set(tokenize(query))
         intent_expansions = _intent_expansions(query_tokens)
         identifiers = [value.casefold() for value in query_identifiers(query)]
-        now = self.now()
         for hit in hits:
             searchable = f"{hit.memory_id} {hit.path} {hit.title} {hit.heading} {hit.text}".casefold()
             title = hit.title.casefold()
@@ -655,7 +742,11 @@ class RetrievalEngine:
         for hit in hits:
             chunks = chunks_by_memory.get(hit.memory_id, [])
             selected = next(
-                (chunk for chunk in chunks if chunk["heading"] == hit.heading),
+                (
+                    chunk
+                    for chunk in chunks
+                    if str(chunk["chunk_id"]) == hit.segment_id
+                ),
                 chunks[0] if chunks else None,
             )
             if not selected:
@@ -665,10 +756,23 @@ class RetrievalEngine:
                 for chunk in chunks
                 if abs(int(chunk["ordinal"]) - int(selected["ordinal"])) <= 1
             ]
-            hit.text = "\n\n".join(
+            winning = f"## {selected['heading']}\n{selected['text']}".strip()
+            neighbors = [
                 f"## {chunk['heading']}\n{chunk['text']}".strip()
                 for chunk in relevant
-            )[:5000]
+                if str(chunk["chunk_id"]) != str(selected["chunk_id"])
+            ]
+            expanded = winning
+            for neighbor in neighbors:
+                remaining = self.settings.context_max_characters - len(expanded) - 2
+                if remaining <= 0:
+                    break
+                expanded += "\n\n" + neighbor[:remaining]
+            hit.text = expanded[: self.settings.context_max_characters]
+            hit.continuation = any(
+                len(neighbor) > max(0, self.settings.context_max_characters - len(winning))
+                for neighbor in neighbors
+            )
             hit.graph_neighbors = [
                 str(item.get("path") or item.get("label"))
                 for item in self.graph.neighbors(
@@ -731,7 +835,8 @@ class RetrievalEngine:
             3,
         )
         provider_started = time.perf_counter()
-        hits = self._rerank(query, fused, requested_limit)
+        ranked_pool = self._rerank(query, fused, max(requested_limit, 8))
+        hits = ranked_pool[:requested_limit]
         provider_latency_ms["rerank"] = round(
             (time.perf_counter() - provider_started) * 1000,
             3,
@@ -768,7 +873,7 @@ class RetrievalEngine:
         # paraphrase match from a confident-looking miss.
         top_semantic = top.signals.get("semantic", 0.0) if top else 0.0
         runner_up_semantic = max(
-            (hit.signals.get("semantic", 0.0) for hit in hits[1:]),
+            (hit.signals.get("semantic", 0.0) for hit in ranked_pool[1:]),
             default=0.0,
         )
         semantic_margin = (
@@ -781,10 +886,31 @@ class RetrievalEngine:
             and semantic_margin >= SEMANTIC_MARGIN_MIN
             and top.signals.get("query_coverage", 0.0) >= SEMANTIC_COVERAGE_MIN
         )
+        corroborating_hits = [
+            hit
+            for hit in hits[:3]
+            if "lexical" in hit.ranks and "semantic" in hit.ranks
+        ]
+        narrow_scope = bool(
+            planned_scope.repository
+            or planned_scope.project
+            or planned_scope.ticket
+            or planned_scope.path_prefix
+        )
+        # A narrow query can require facts from multiple notes. Aggregate only
+        # independently corroborated hits so broad corpus noise cannot answer it.
+        distributed_evidence = bool(
+            narrow_scope
+            and len(corroborating_hits) >= 2
+            and top_score >= 0.08
+            and _distributed_query_coverage(query, corroborating_hits)
+            >= SCOPED_DISTRIBUTED_COVERAGE_MIN
+        )
         answered = bool(top) and (
             exact_evidence
             or intent_evidence
             or semantic_evidence
+            or distributed_evidence
             or (
                 corroborated_text
                 and top_score >= 0.045

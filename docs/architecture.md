@@ -1,5 +1,9 @@
 # Architecture
 
+The [retrieval reliability design](retrieval-reliability-design.md) defines complex-query, historical-message, meeting, and large-collection behavior.
+The [implementation plan](retrieval-reliability-implementation-plan.md) records the reliability work and remaining evaluation.
+This work excludes sentence-derived criterion filtering.
+
 ## Decision
 
 AI Memory MCP uses Graphify as an internal graph provider.
@@ -16,7 +20,7 @@ Additional vaults are retrieval-only sources.
 The canonical artifact database is the write authority for raw external artifacts.
 
 The system derives memory indexes from Markdown.
-The system derives artifact search and burst indexes from the canonical artifact database.
+The system derives artifact search and semantic representation indexes from the canonical artifact database.
 
 Raw artifacts never make a Markdown file authoritative for a transcript or chat log.
 Distilled Markdown never makes the artifact database authoritative for an agent summary.
@@ -53,13 +57,13 @@ flowchart TB
     P["Primary writable vault"] --> I["Memory indexer"]
     A["Retrieval-only vaults"] --> I
     I --> MdSignals["Markdown signals<br/>exact, lexical, semantic, graph"]
-    D --> ArtSignals["Artifact signals<br/>raw FTS and bursts"]
+    D --> ArtSignals["Artifact signals<br/>raw FTS and source representations"]
     Q["Agent query"] --> S["AI Memory MCP"]
     S --> MdSignals
     S --> ArtSignals
     MdSignals --> F["RRF fusion"]
     ArtSignals --> F
-    F --> R["Rerank, decay, and context"]
+    F --> R["Rerank and context"]
     R --> E["Evidence with citations"]
     E -. agent distillation .-> P
 ```
@@ -82,6 +86,7 @@ It validates identity and metadata.
 It skips unchanged content.
 It publishes a versioned SQLite snapshot.
 It prefixes each indexed path with its source ID.
+It creates compact aliases for memory identities and scopes.
 It does not modify a configured vault.
 It updates vectors only for changed Markdown chunks.
 Large vector searches use an ANN candidate index before exact reranking.
@@ -91,6 +96,8 @@ Portable installations use exact search when the ANN backend is unavailable.
 
 SQLite FTS5 supplies exact and lexical results.
 Exact matches get priority for identifiers, paths, filenames, and error text.
+Repository filters accept the canonical ID, owner and repository, repository name, or encoded folder name.
+Narrow scopes can combine independently corroborated evidence from multiple notes.
 
 ### Semantic retrieval
 
@@ -103,6 +110,12 @@ The index records the embedding provider that built it.
 A query always uses the recorded provider.
 A provider change makes the indexer build all vectors again.
 If the recorded provider is not available, recall disables the semantic signal and gives a warning.
+
+Each nonempty message and transcript passage gets a base representation.
+Long source text uses overlapping segments that cover the complete text.
+Timestamp-free transcript passages use provider order or stable source order.
+Reply-aware representations include the explicit reply target before nearby messages.
+Each result still cites its canonical anchor record.
 
 ### Graphify provider
 
@@ -134,6 +147,13 @@ Weighted traversal permits controlled multi-hop evidence inside that scope.
 The MCP facade gives agents four public tools.
 The facade applies scope rules before retrieval.
 The facade returns source paths and retrieval evidence.
+The facade runs recall in a bounded pool of supervised worker processes.
+Each worker keeps immutable generation data and local models warm.
+Queue time is part of the recall deadline.
+The facade rejects work when the bounded queue is full.
+The facade stops and reaps the worker when the recall deadline expires.
+The facade also stops the assigned worker after client cancellation.
+Process termination closes the worker generation lease and SQLite snapshot.
 
 | Tool | Function |
 |---|---|
@@ -142,36 +162,41 @@ The facade returns source paths and retrieval evidence.
 | `memory_sync` | Publishes one coordinated derived generation. |
 | `memory_status` | Reports strict health for each required layer. |
 
+`memory_status` marks the index as stale when canonical Markdown differs from the published snapshot.
+Graphify is also stale when its source index is stale.
+
 ## Query procedure
 
 1. Pin one current generation manifest.
 2. Open one artifact database read snapshot.
-3. Resolve the optional source and domain scope.
-4. Apply repository, project, ticket, status, and path filters.
-5. Select the required retrieval providers.
-6. Run each provider from the pinned generation.
-7. Fuse ranked results with reciprocal rank fusion.
-8. Remove duplicate memory results.
-9. Rerank a bounded result set.
-10. Add the necessary context.
-11. Return evidence with source paths.
+3. Resolve each explicit source and domain scope.
+4. Apply each explicit scope filter.
+5. Send the complete query to each applicable provider.
+6. Fuse provider ranks with reciprocal rank fusion.
+7. Remove duplicate source identities.
+8. Preserve the winning passage and offsets.
+9. Add bounded context after ranking.
+10. Return evidence, citations, coverage, and execution state.
 
 Graph traversal is one retrieval signal.
 Graph traversal is not the only retrieval method.
 
 Fusion adds a bounded freshness bonus from the `updated` date.
 An expired `review_after` date applies a bounded penalty and adds a `review overdue` reason.
+Raw artifacts do not receive an age penalty.
+The service does not infer ticket, person, date, decision, or exclusion filters from a sentence.
 
 ## Refresh procedure
 
 1. Validate all configured memory sources.
 2. Stage the Markdown vector snapshot.
-3. Stage the artifact vector snapshot.
-4. Stage the Graphify snapshot from the Markdown snapshot.
-5. Validate all staged components.
-6. Publish one generation manifest atomically.
-7. Run a retrieval health check.
-8. Retain the active and verified previous generations.
+3. Read artifact changes from the committed journal.
+4. Rebuild changed source segments and bounded dependent context.
+5. Stage the Graphify snapshot from the Markdown snapshot.
+6. Validate all staged components.
+7. Publish one generation manifest atomically.
+8. Run a retrieval health check.
+9. Retain the active and verified previous generations.
 
 The update keeps the previous generation after any component failure.
 An ordinary Markdown change uses `memory_sync`.
@@ -190,14 +215,16 @@ Examples include unsafe updates, unstable serialization, or insufficient provena
 ## Performance rules
 
 - Apply scope filters before ranking.
+- Resolve scope aliases through indexed lookup tables.
 - Use exact matches for stable identifiers.
+- Use indexed identity lookups before hybrid retrieval.
 - Use reciprocal rank fusion for provider results.
 - Limit reranking to a bounded candidate set.
 - Load context for all results in one database query.
 - Keep normal recall responses compact.
 - Process only changed Markdown files during normal refreshes.
 - Keep full graph clustering as a maintenance task.
-- Update only changed Markdown chunks and artifact bursts.
+- Update only changed Markdown chunks and affected artifact representations.
 - Use ANN candidates before exact vector reranking for large corpora.
 - Use exact vector search when ANN support is unavailable.
 - Store semantic vectors in a compact binary form.
@@ -216,6 +243,7 @@ Examples include unsafe updates, unstable serialization, or insufficient provena
 - Record privacy-safe latency, corpus, storage, growth, and failure metrics.
 - Return source paths for evidence.
 - Remove only derived snapshots through the approved retention process.
+- Stop and reap a recall worker when its deadline expires.
 
 ## Public tools
 
@@ -226,13 +254,16 @@ Examples include unsafe updates, unstable serialization, or insufficient provena
 | `memory_sync` | Publishes one coordinated generation after canonical data changes. |
 | `memory_status` | Reports strict health for each required layer and generation. |
 
-`memory_recall` selects its internal behavior from the query.
+`memory_recall` selects retrieval providers from the query and explicit scope arguments.
 An exact identity returns the complete record.
 A relationship question returns a graph path when a path exists.
 A general question runs lexical, semantic, and graph retrieval.
 
-Recall reports `answered` for an exact match, sufficient lexical coverage, or a clear semantic lead.
-A paraphrase answer needs a lexical anchor and a semantic margin above the other results.
+Response version 2 reports execution and result kind separately.
+The result kind is `exact`, `ranked`, or `empty`.
+Execution is `complete`, `partial`, or `failed`.
+Coverage reports source availability, semantic lag, processing counts, and observed date bounds.
+In response version 1, a paraphrase answer needs a lexical anchor and a semantic margin above the other results.
 The two conditions together keep an absent answer at `no_answer`.
 
 A `no_answer` status still returns ranked best-effort evidence.

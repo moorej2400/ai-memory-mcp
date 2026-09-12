@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .artifacts.schema import ClosingSQLiteConnection
 from .config import Settings
 from .index import current_index_path
 from .text import wikilink_targets
@@ -83,6 +84,7 @@ def build_provider_graph(
     with sqlite3.connect(
         f"file:{index_path.as_posix()}?mode=ro",
         uri=True,
+        factory=ClosingSQLiteConnection,
     ) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(

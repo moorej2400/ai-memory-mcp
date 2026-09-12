@@ -19,6 +19,14 @@ ArtifactEntity = Literal[
 ]
 ArtifactOperation = Literal["upsert", "delete", "redact"]
 ArtifactEvidenceClass = Literal["distilled", "raw", "burst"]
+RepresentationKind = Literal["base", "context"]
+RepresentationState = Literal[
+    "indexed",
+    "pending",
+    "failed",
+    "excluded",
+    "empty_content",
+]
 ArtifactDisposition = Literal[
     "accepted",
     "unchanged",
@@ -204,6 +212,14 @@ class ArtifactSearchHit(StrictModel):
     occurred_at: datetime | None = None
     score: float = 0.0
     evidence_class: ArtifactEvidenceClass = "raw"
+    matched_identity: str = ""
+    segment_id: str | None = None
+    segment_start: int | None = Field(default=None, ge=0)
+    segment_end: int | None = Field(default=None, ge=0)
+    anchor_artifact_uri: str | None = None
+    parent_artifact_uri: str | None = None
+    meeting_artifact_uri: str | None = None
+    continuation: bool = False
 
 
 class ArtifactReadRecord(StrictModel):
@@ -260,7 +276,14 @@ class ArtifactBurstRecord(StrictModel):
     author_id: str = ""
     author_name: str = ""
     participant_names: tuple[str, ...] = ()
-    occurred_at: datetime
+    occurred_at: datetime | None = None
+    source_position: int | None = Field(default=None, ge=0)
+    relative_start_ms: int | None = Field(default=None, ge=0)
+    relative_end_ms: int | None = Field(default=None, ge=0)
+    reply_target_artifact_id: str | None = None
+    source_revision: str = ""
+    meeting_artifact_id: str | None = None
+    meeting_occurred_at: datetime | None = None
     text: str
     classification: str = ""
     reactions: tuple[str, ...] = ()
@@ -280,11 +303,24 @@ class ArtifactBurst(StrictModel):
     author_name: str = ""
     first_artifact_uri: str
     last_artifact_uri: str
-    started_at: datetime
-    ended_at: datetime
-    record_count: int = Field(ge=1, le=8)
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    record_count: int = Field(ge=1)
     text: str
     embed: bool
+    representation_kind: RepresentationKind = "base"
+    representation_version: int = Field(default=2, ge=1)
+    anchor_artifact_uri: str | None = None
+    dependency_artifact_uris: tuple[str, ...] = ()
+    dependency_digest: str = ""
+    segment_start: int = Field(default=0, ge=0)
+    segment_end: int = Field(default=0, ge=0)
+    source_position: int | None = Field(default=None, ge=0)
+    relative_start_ms: int | None = Field(default=None, ge=0)
+    relative_end_ms: int | None = Field(default=None, ge=0)
+    exclusion_reason: str = ""
+    meeting_artifact_uri: str | None = None
+    meeting_occurred_at: datetime | None = None
 
 
 class ArtifactVectorSearchResult(StrictModel):
@@ -293,6 +329,9 @@ class ArtifactVectorSearchResult(StrictModel):
     stale: bool = False
     backend: str = "exact"
     candidate_count: int = Field(default=0, ge=0)
+    vectors_scored: int = Field(default=0, ge=0)
+    blocks_read: int = Field(default=0, ge=0)
+    budget_exhausted: bool = False
 
 
 class ArtifactIntegrityResult(StrictModel):
@@ -341,6 +380,8 @@ class LegacyMigrationPlan(StrictModel):
     chat_notes: int = Field(ge=0)
     transcript_cues: int = Field(ge=0)
     unresolved_identities: int = Field(ge=0)
+    synthetic_note_identities: int = Field(default=0, ge=0)
+    duplicate_note_mappings: int = Field(default=0, ge=0)
     duplicate_natural_keys: int = Field(ge=0)
 
 

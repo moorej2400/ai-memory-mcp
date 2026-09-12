@@ -134,6 +134,15 @@ class Settings:
     audit_log_max_bytes: int = 25_000_000
     audit_lock_timeout_seconds: float = 10.0
     index_lock_timeout_seconds: float = 300.0
+    recall_timeout_seconds: float = 30.0
+    recall_worker_count: int = 2
+    recall_queue_capacity: int = 8
+    recall_worker_max_requests: int = 500
+    vector_block_size: int = 1024
+    vector_max_vectors: int = 200_000
+    vector_max_seconds: float = 8.0
+    ann_candidate_limit: int = 10_000
+    context_max_characters: int = 5000
     embedding_provider: str = "auto"
     embedding_model: str = ""
     artifact_db: Path = Path.home() / ".ai-memory" / "artifacts.sqlite3"
@@ -171,6 +180,51 @@ class Settings:
             raise ValueError(
                 "AI_MEMORY_ARTIFACT_BATCH_MAX_BYTES must be positive."
             )
+        recall_timeout_seconds = float(
+            os.getenv("AI_MEMORY_MCP_RECALL_TIMEOUT_SECONDS", "30")
+        )
+        if recall_timeout_seconds <= 0:
+            raise ValueError(
+                "AI_MEMORY_MCP_RECALL_TIMEOUT_SECONDS must be positive."
+            )
+        recall_worker_count = int(os.getenv("AI_MEMORY_RECALL_WORKERS", "2"))
+        recall_queue_capacity = int(os.getenv("AI_MEMORY_RECALL_QUEUE_CAPACITY", "8"))
+        recall_worker_max_requests = int(
+            os.getenv("AI_MEMORY_RECALL_WORKER_MAX_REQUESTS", "500")
+        )
+        vector_block_size = int(os.getenv("AI_MEMORY_VECTOR_BLOCK_SIZE", "1024"))
+        vector_max_vectors = int(os.getenv("AI_MEMORY_VECTOR_MAX_VECTORS", "200000"))
+        vector_max_seconds = float(os.getenv("AI_MEMORY_VECTOR_MAX_SECONDS", "8"))
+        ann_candidate_limit = int(os.getenv("AI_MEMORY_ANN_CANDIDATE_LIMIT", "10000"))
+        context_max_characters = int(
+            os.getenv("AI_MEMORY_CONTEXT_MAX_CHARACTERS", "5000")
+        )
+        if not 1 <= recall_worker_count <= 16:
+            raise ValueError("AI_MEMORY_RECALL_WORKERS must be from 1 through 16.")
+        if not 0 <= recall_queue_capacity <= 1000:
+            raise ValueError(
+                "AI_MEMORY_RECALL_QUEUE_CAPACITY must be from 0 through 1000."
+            )
+        if not 1 <= recall_worker_max_requests <= 100000:
+            raise ValueError(
+                "AI_MEMORY_RECALL_WORKER_MAX_REQUESTS must be from 1 through 100000."
+            )
+        if not 64 <= vector_block_size <= 16384:
+            raise ValueError("AI_MEMORY_VECTOR_BLOCK_SIZE must be from 64 through 16384.")
+        if not 1000 <= vector_max_vectors <= 5_000_000:
+            raise ValueError(
+                "AI_MEMORY_VECTOR_MAX_VECTORS must be from 1000 through 5000000."
+            )
+        if not 0.1 <= vector_max_seconds <= 120.0:
+            raise ValueError("AI_MEMORY_VECTOR_MAX_SECONDS must be from 0.1 through 120.")
+        if not 1000 <= ann_candidate_limit <= 100000:
+            raise ValueError(
+                "AI_MEMORY_ANN_CANDIDATE_LIMIT must be from 1000 through 100000."
+            )
+        if not 1000 <= context_max_characters <= 50000:
+            raise ValueError(
+                "AI_MEMORY_CONTEXT_MAX_CHARACTERS must be from 1000 through 50000."
+            )
         return cls(
             memory_root=root,
             state_dir=state,
@@ -207,6 +261,15 @@ class Settings:
             index_lock_timeout_seconds=float(
                 os.getenv("AI_MEMORY_INDEX_LOCK_TIMEOUT_SECONDS", "300")
             ),
+            recall_timeout_seconds=recall_timeout_seconds,
+            recall_worker_count=recall_worker_count,
+            recall_queue_capacity=recall_queue_capacity,
+            recall_worker_max_requests=recall_worker_max_requests,
+            vector_block_size=vector_block_size,
+            vector_max_vectors=vector_max_vectors,
+            vector_max_seconds=vector_max_seconds,
+            ann_candidate_limit=ann_candidate_limit,
+            context_max_characters=context_max_characters,
             embedding_provider=os.getenv(
                 "AI_MEMORY_MCP_EMBEDDING_PROVIDER", "auto"
             ),

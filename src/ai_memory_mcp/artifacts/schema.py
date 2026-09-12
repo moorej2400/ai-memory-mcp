@@ -15,7 +15,7 @@ from urllib.parse import quote
 from ai_memory_mcp import __version__
 from ai_memory_mcp.config import Settings
 
-ARTIFACT_SCHEMA_VERSION = 4
+ARTIFACT_SCHEMA_VERSION = 6
 NETWORK_FILESYSTEM_TYPES = {
     "9p",
     "afpfs",
@@ -27,6 +27,18 @@ NETWORK_FILESYSTEM_TYPES = {
     "webdav",
 }
 MOUNT_CACHE_SECONDS = 1.0
+
+
+class ClosingSQLiteConnection(sqlite3.Connection):
+    """Apply transaction semantics and close when a context block exits."""
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        # sqlite3.Connection.__exit__ does not close the handle. Windows then
+        # rejects publication or cleanup of the temporary database and WAL.
+        try:
+            return bool(super().__exit__(exc_type, exc, traceback))
+        finally:
+            self.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,10 +192,19 @@ def connect_artifact_db(
     path = require_local_database_path(path)
     if read_only:
         uri = f"file:{quote(path.as_posix(), safe='/')}?mode=ro"
-        connection = sqlite3.connect(uri, uri=True, timeout=10.0)
+        connection = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=10.0,
+            factory=ClosingSQLiteConnection,
+        )
     else:
         _private_directory(path.parent)
-        connection = sqlite3.connect(path, timeout=10.0)
+        connection = sqlite3.connect(
+            path,
+            timeout=10.0,
+            factory=ClosingSQLiteConnection,
+        )
 
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -680,6 +701,88 @@ MIGRATION_4_STATEMENTS = (
 )
 
 
+MIGRATION_5_STATEMENTS = (
+    """
+    CREATE TABLE artifact_change_journal (
+        revision INTEGER NOT NULL CHECK(revision >= 0),
+        ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+        artifact_id TEXT NOT NULL,
+        latest_event_id TEXT NOT NULL,
+        operation TEXT NOT NULL CHECK(operation IN ('upsert', 'delete', 'redact')),
+        affected_parent_id TEXT NOT NULL,
+        PRIMARY KEY(revision, ordinal),
+        UNIQUE(revision, artifact_id, affected_parent_id)
+    )
+    """,
+    """
+    CREATE INDEX artifact_change_journal_artifact_idx
+        ON artifact_change_journal(artifact_id, revision)
+    """,
+    """
+    CREATE INDEX artifact_change_journal_parent_idx
+        ON artifact_change_journal(affected_parent_id, revision)
+    """,
+    """
+    CREATE TRIGGER artifact_change_journal_insert
+    AFTER INSERT ON artifacts
+    BEGIN
+        INSERT OR IGNORE INTO artifact_change_journal(
+            revision, ordinal, artifact_id, latest_event_id,
+            operation, affected_parent_id
+        ) VALUES (
+            CAST((SELECT value FROM artifact_metadata
+                  WHERE key = 'change_counter') AS INTEGER) + 1,
+            COALESCE((SELECT max(ordinal) + 1 FROM artifact_change_journal
+                      WHERE revision = CAST((SELECT value FROM artifact_metadata
+                                             WHERE key = 'change_counter') AS INTEGER) + 1), 0),
+            new.artifact_id,
+            new.last_event_id,
+            CASE WHEN new.redacted_at IS NOT NULL THEN 'redact'
+                 WHEN new.deleted_at IS NOT NULL THEN 'delete' ELSE 'upsert' END,
+            COALESCE(new.parent_artifact_id, new.artifact_id)
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER artifact_change_journal_update
+    AFTER UPDATE ON artifacts
+    BEGIN
+        INSERT OR IGNORE INTO artifact_change_journal(
+            revision, ordinal, artifact_id, latest_event_id,
+            operation, affected_parent_id
+        ) VALUES (
+            CAST((SELECT value FROM artifact_metadata
+                  WHERE key = 'change_counter') AS INTEGER) + 1,
+            COALESCE((SELECT max(ordinal) + 1 FROM artifact_change_journal
+                      WHERE revision = CAST((SELECT value FROM artifact_metadata
+                                             WHERE key = 'change_counter') AS INTEGER) + 1), 0),
+            new.artifact_id,
+            new.last_event_id,
+            CASE WHEN new.redacted_at IS NOT NULL THEN 'redact'
+                 WHEN new.deleted_at IS NOT NULL THEN 'delete' ELSE 'upsert' END,
+            COALESCE(new.parent_artifact_id, old.parent_artifact_id, new.artifact_id)
+        );
+    END
+    """,
+    """
+    INSERT INTO artifact_change_journal(
+        revision, ordinal, artifact_id, latest_event_id,
+        operation, affected_parent_id
+    )
+    SELECT
+        CAST(metadata.value AS INTEGER),
+        row_number() OVER (ORDER BY artifact.artifact_id) - 1,
+        artifact.artifact_id,
+        artifact.last_event_id,
+        CASE WHEN artifact.redacted_at IS NOT NULL THEN 'redact'
+             WHEN artifact.deleted_at IS NOT NULL THEN 'delete' ELSE 'upsert' END,
+        COALESCE(artifact.parent_artifact_id, artifact.artifact_id)
+    FROM artifacts AS artifact
+    JOIN artifact_metadata AS metadata ON metadata.key = 'change_counter'
+    """,
+)
+
+
 def _backup_database(
     connection: sqlite3.Connection,
     settings: Settings,
@@ -695,7 +798,10 @@ def _backup_database(
         f".{backup_path.name}.partial-{os.getpid()}-{time.time_ns()}"
     )
     try:
-        with sqlite3.connect(partial_path) as backup:
+        with sqlite3.connect(
+            partial_path,
+            factory=ClosingSQLiteConnection,
+        ) as backup:
             connection.backup(backup)
             integrity = str(backup.execute("PRAGMA quick_check").fetchone()[0])
             if integrity != "ok":
@@ -801,6 +907,27 @@ def _apply_migration_4(connection: sqlite3.Connection) -> None:
         connection.commit()
 
 
+def _apply_migration_5(connection: sqlite3.Connection) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for statement in MIGRATION_5_STATEMENTS:
+            connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO artifact_schema_migrations(
+                version, applied_at, application_version
+            ) VALUES (?, ?, ?)
+            """,
+            (5, now, __version__),
+        )
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
 def migrate_artifact_db(settings: Settings) -> MigrationResult:
     """Move the canonical artifact database to the current schema."""
     path = settings.artifact_db.expanduser()
@@ -834,6 +961,31 @@ def migrate_artifact_db(settings: Settings) -> MigrationResult:
         if from_version < 4:
             _apply_migration_4(connection)
             applied.append(4)
+        if from_version < 5:
+            _apply_migration_5(connection)
+            applied.append(5)
+        if from_version < 6:
+            from .ordering import create_source_order
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                create_source_order(connection)
+                # Unscoped identity lookup must not read complete artifact rows.
+                # The suffix fallback scans this compact covering index only.
+                connection.execute(
+                    "CREATE INDEX artifacts_external_identity_idx "
+                    "ON artifacts(external_id, artifact_id)"
+                )
+                connection.execute(
+                    "CREATE INDEX artifact_alias_value_idx "
+                    "ON artifact_aliases(alias_value, artifact_id)"
+                )
+                connection.execute("INSERT INTO artifact_schema_migrations VALUES (?, ?, ?)",
+                                   (6, datetime.now(timezone.utc).isoformat(), __version__))
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            applied.append(6)
 
     _private_file(path)
     return MigrationResult(
@@ -854,7 +1006,7 @@ def require_current_artifact_schema(settings: Settings) -> int:
     if version != ARTIFACT_SCHEMA_VERSION:
         raise RuntimeError(
             "The artifact database schema is not current. "
-            "Run the artifact migration command."
+            "Run `ai-memory-artifact init` before memory_sync."
         )
     return version
 

@@ -149,7 +149,7 @@ def test_single_record_burst_is_capped_at_the_character_limit() -> None:
     assert len(oversized.text) == MAX_BURST_CHARACTERS
 
 
-def test_system_and_low_signal_bursts_are_not_embedded() -> None:
+def test_system_noise_is_excluded_but_short_user_text_is_embedded() -> None:
     bursts = group_bursts(
         [
             message(
@@ -161,7 +161,7 @@ def test_system_and_low_signal_bursts_are_not_embedded() -> None:
             message("10:01", "actor-a", "Thanks."),
         ]
     )
-    assert all(burst.embed is False for burst in bursts)
+    assert [burst.embed for burst in bursts] == [False, True]
 
 
 def test_identifier_reaction_and_attachment_are_embedding_signals() -> None:

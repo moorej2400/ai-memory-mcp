@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -11,7 +12,7 @@ from ai_memory_mcp.benchmark import (
     verify_contract,
 )
 from ai_memory_mcp.config import Settings
-from ai_memory_mcp.index import build_index
+from ai_memory_mcp.index import build_index, current_index_path
 from ai_memory_mcp.models import ScopeFilter
 from ai_memory_mcp.retrieval import RetrievalEngine
 from ai_memory_mcp.service import MemoryService
@@ -105,6 +106,161 @@ def test_scope_is_applied_before_ranking(benchmark_settings: Settings) -> None:
     )
     assert partial.status == "no_answer"
     assert partial.evidence == []
+
+
+def test_repository_scope_accepts_canonical_and_common_aliases(
+    tmp_path: Path,
+) -> None:
+    vault = tmp_path / "vault"
+    note = (
+        vault
+        / "Repos"
+        / "github--example-org--sample-gateway"
+        / "Telemetry.md"
+    )
+    note.parent.mkdir(parents=True)
+    note.write_text(
+        """---
+memory_id: mem-sample-telemetry
+title: Gateway telemetry
+root_scope: work
+primary_scope:
+  kind: repo
+  id: github:Example-Org/sample-gateway
+status: active
+updated: 2026-08-25
+---
+
+# Gateway telemetry
+
+The log collector receives the sample API standard output stream.
+""",
+        encoding="utf-8",
+    )
+    settings = Settings(
+        memory_root=vault,
+        state_dir=tmp_path / "state",
+        graph_path=tmp_path / "graph.json",
+        graphify_mcp_url="",
+        embedding_provider="hashed",
+    )
+    build_index(settings, force=True)
+    service = MemoryService(settings)
+
+    for repository in (
+        "sample-gateway",
+        "Example-Org/sample-gateway",
+        "github:Example-Org/sample-gateway",
+        "github--example-org--sample-gateway",
+    ):
+        response = service.recall(
+            "log collector sample API standard output",
+            repository=repository,
+            root_scope="work",
+        )
+        assert {item.memory_id for item in response.evidence} == {
+            "mem-sample-telemetry"
+        }
+
+    index_path = current_index_path(settings)
+    assert index_path is not None
+    with sqlite3.connect(index_path) as connection:
+        aliases = {
+            row[0]
+            for row in connection.execute(
+                "SELECT alias FROM document_scope_aliases "
+                "WHERE kind = 'repository'"
+            )
+        }
+    assert "sample-gateway" in aliases
+    assert "example-org/sample-gateway" in aliases
+
+
+def test_narrow_scope_combines_corroborated_evidence_across_notes(
+    tmp_path: Path,
+) -> None:
+    repository = (
+        tmp_path
+        / "vault"
+        / "Repos"
+        / "github--example-org--sample-gateway"
+    )
+    repository.mkdir(parents=True)
+    frontmatter = """---
+memory_id: {memory_id}
+title: {title}
+root_scope: work
+primary_scope:
+  kind: repo
+  id: github:Example-Org/sample-gateway
+status: active
+updated: 2026-08-25
+---
+
+# {title}
+
+{text}
+"""
+    (repository / "Runtime.md").write_text(
+        frontmatter.format(
+            memory_id="mem-sample-runtime",
+            title="Sample runtime",
+            text="DEV deployment uses zone-one and team-space for the sample API.",
+        ),
+        encoding="utf-8",
+    )
+    (repository / "Telemetry.md").write_text(
+        frontmatter.format(
+            memory_id="mem-sample-telemetry",
+            title="Sample telemetry",
+            text="The collector reads stdout and uses packet forwarding to telemetry.",
+        ),
+        encoding="utf-8",
+    )
+    settings = Settings(
+        memory_root=tmp_path / "vault",
+        state_dir=tmp_path / "state",
+        graph_path=tmp_path / "graph.json",
+        graphify_mcp_url="",
+        embedding_provider="hashed",
+    )
+    build_index(settings, force=True)
+
+    response = MemoryService(settings).recall(
+        "sample-gateway DEV collector missing zone-one team-space API logs "
+        "stdout packet forwarding telemetry dashboard archive shipping alerts "
+        "stream agent",
+        repository="sample-gateway",
+        root_scope="work",
+        limit=10,
+    )
+
+    assert response.status == "answered"
+    assert {item.memory_id for item in response.evidence[:2]} == {
+        "mem-sample-runtime",
+        "mem-sample-telemetry",
+    }
+
+
+def test_general_recall_skips_exact_and_relationship_prescans(
+    benchmark_settings: Settings,
+    monkeypatch,
+) -> None:
+    service = MemoryService(benchmark_settings)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("general recall must not run a pre-search scan")
+
+    monkeypatch.setattr(service.engine, "get", unexpected)
+    monkeypatch.setattr(service.engine, "mentioned_documents", unexpected)
+
+    response = service.recall(
+        "Explain the current authentication retry behavior and all related "
+        "deployment safeguards for a transient upstream failure",
+        limit=3,
+    )
+
+    assert response.evidence
 
 
 def test_recall_routes_exact_neighbors_and_relationship_path(

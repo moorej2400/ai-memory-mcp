@@ -150,7 +150,9 @@ def _jsonl_batch() -> str:
     ) + "\n"
 
 
-def _meeting_note(candidate, first_cue: str, second_cue: str) -> str:
+def _meeting_note(
+    candidate, first_cue: str, second_cue: str, missing_source: str
+) -> str:
     return f"""---
 type: memory
 memory_id: mem-release-control-review
@@ -198,6 +200,7 @@ The meeting selected one production release control and assigned two checks.
 ## Manual notes
 
 Keep this section outside the managed region.
+Missing source validation reference: {missing_source}
 """
 
 
@@ -251,11 +254,15 @@ def test_batch_to_distilled_markdown_recall_is_idempotent(
         "transcript-cue",
         artifact_id("teams", "workspace", "transcript-cue", "cue-5"),
     )
+    missing_source = artifact_uri(
+        "message",
+        artifact_id("teams", "workspace", "message", "missing-source"),
+    )
     relative = Path("References/Meetings/2026/release-control-review.md")
     meeting_note = artifact_settings.memory_root / relative
     meeting_note.parent.mkdir(parents=True)
     meeting_note.write_text(
-        _meeting_note(candidate, first_cue, second_cue),
+        _meeting_note(candidate, first_cue, second_cue, missing_source),
         encoding="utf-8",
     )
 
@@ -276,6 +283,10 @@ def test_batch_to_distilled_markdown_recall_is_idempotent(
     assert recalled.status == "answered"
     assert recalled.evidence[0].evidence_class == "distilled"
     assert recalled.evidence[0].memory_id == "mem-release-control-review"
+    assert first_cue in recalled.evidence[0].supporting_artifact_uris
+    assert second_cue in recalled.citations[0].supporting_artifact_uris
+    assert missing_source not in recalled.evidence[0].supporting_artifact_uris
+    assert any("unavailable source reference" in warning for warning in recalled.warnings)
 
     before_count = store.count()
     before_events = sum(

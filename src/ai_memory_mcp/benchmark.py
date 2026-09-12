@@ -211,7 +211,10 @@ def run_benchmark(
     )
     stale_layer_behavior = bool(
         stale_probe.status == "answered"
-        and any("newer than the active" in item for item in stale_probe.warnings)
+        and any(
+            "semantic data is older" in item or "semantic index is stale" in item
+            for item in stale_probe.warnings
+        )
         and service.status().ok is False
     )
     metrics = {

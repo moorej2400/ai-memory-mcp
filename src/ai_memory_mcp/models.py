@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, RootModel
 
 
 @dataclass(slots=True)
@@ -26,6 +26,7 @@ class MemoryDocument:
     tools: list[str] = field(default_factory=list)
     content_hash: str = ""
     mtime_ns: int = 0
+    artifact_references: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -74,6 +75,11 @@ class SearchHit:
     occurred_at: str | None = None
     artifact_kind: str | None = None
     external_id: str | None = None
+    segment_id: str | None = None
+    segment_start: int | None = None
+    segment_end: int | None = None
+    meeting_artifact_uri: str | None = None
+    continuation: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -113,6 +119,12 @@ class RecallEvidence(StrictOutput):
     source_label: str | None = None
     source_instance: str | None = None
     occurred_at: str | None = None
+    segment_id: str | None = None
+    segment_start: int | None = Field(default=None, ge=0)
+    segment_end: int | None = Field(default=None, ge=0)
+    meeting_artifact_uri: str | None = None
+    continuation: bool = False
+    supporting_artifact_uris: list[str] = Field(default_factory=list)
 
 
 class RecallCitation(StrictOutput):
@@ -125,6 +137,12 @@ class RecallCitation(StrictOutput):
     source_label: str | None = None
     source_instance: str | None = None
     occurred_at: str | None = None
+    segment_id: str | None = None
+    segment_start: int | None = Field(default=None, ge=0)
+    segment_end: int | None = Field(default=None, ge=0)
+    meeting_artifact_uri: str | None = None
+    continuation: bool = False
+    supporting_artifact_uris: list[str] = Field(default_factory=list)
 
 
 class RecallRelationship(StrictOutput):
@@ -139,7 +157,32 @@ class RecallRelationship(StrictOutput):
     distance: int | None = Field(default=None, ge=1, le=6)
 
 
+class RecallCoverage(StrictOutput):
+    markdown_available: bool = False
+    artifact_lexical_available: bool = False
+    artifact_semantic_available: bool = False
+    artifact_semantic_lag: int = Field(default=0, ge=0)
+    observed_from: str | None = None
+    observed_to: str | None = None
+    history_complete: bool | None = None
+    eligible_artifacts: int = Field(default=0, ge=0)
+    indexed_artifacts: int = Field(default=0, ge=0)
+    excluded_artifacts: int = Field(default=0, ge=0)
+    empty_artifacts: int = Field(default=0, ge=0)
+    failed_artifacts: int = Field(default=0, ge=0)
+    missing_absolute_time: int = Field(default=0, ge=0)
+
+
+class RecallExecutionState(StrictOutput):
+    execution: Literal["complete", "partial", "failed"] = "complete"
+    completed_providers: list[str] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=list)
+    coverage: RecallCoverage = Field(default_factory=RecallCoverage)
+
+
 class RecallResponse(StrictOutput):
+    # This state travels in the private worker envelope, not the V1 wire schema.
+    _execution_state: RecallExecutionState = PrivateAttr(default_factory=RecallExecutionState)
     status: Literal["answered", "no_answer"]
     intent: Literal["exact", "relationship", "search"]
     query: str
@@ -147,6 +190,25 @@ class RecallResponse(StrictOutput):
     citations: list[RecallCitation] = Field(default_factory=list)
     relationships: list[RecallRelationship] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+
+class RecallResponseV2(StrictOutput):
+    response_version: Literal["2"] = "2"
+    execution: Literal["complete", "partial", "failed"]
+    result_kind: Literal["exact", "ranked", "empty"]
+    intent: Literal["exact", "relationship", "search"]
+    query: str
+    evidence: list[RecallEvidence] = Field(default_factory=list)
+    citations: list[RecallCitation] = Field(default_factory=list)
+    relationships: list[RecallRelationship] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=list)
+    coverage: RecallCoverage = Field(default_factory=RecallCoverage)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class RecallToolResponse(RootModel[RecallResponse | RecallResponseV2]):
+    """Validate either flat wire contract without a framework result wrapper."""
+    model_config = ConfigDict(json_schema_extra={"type": "object"})
 
 
 class IndexParseError(StrictOutput):
@@ -179,6 +241,12 @@ class ArtifactIndexResult(StrictOutput):
     embedded_updates: int = Field(default=0, ge=0)
     reused_bursts: int = Field(default=0, ge=0)
     removed_bursts: int = Field(default=0, ge=0)
+    eligible_artifacts: int = Field(default=0, ge=0)
+    indexed_artifacts: int = Field(default=0, ge=0)
+    excluded_artifacts: int = Field(default=0, ge=0)
+    empty_artifacts: int = Field(default=0, ge=0)
+    failed_artifacts: int = Field(default=0, ge=0)
+    missing_absolute_time: int = Field(default=0, ge=0)
     ann_backend: str = "exact"
     elapsed_ms: float = Field(ge=0.0)
 
@@ -205,6 +273,7 @@ class CanonicalMemoryStatus(StrictOutput):
 class IndexStatus(StrictOutput):
     available: bool
     stale: bool = False
+    reconciled_at: str | None = None
     generation_id: str | None = None
     path: str | None = None
     schema_version: int | None = None
@@ -247,6 +316,14 @@ class ArtifactVectorStatus(StrictOutput):
     change_counter: int | None = Field(default=None, ge=0)
     bursts: int = Field(default=0, ge=0)
     embedded_bursts: int = Field(default=0, ge=0)
+    eligible_artifacts: int = Field(default=0, ge=0)
+    indexed_artifacts: int = Field(default=0, ge=0)
+    excluded_artifacts: int = Field(default=0, ge=0)
+    empty_artifacts: int = Field(default=0, ge=0)
+    failed_artifacts: int = Field(default=0, ge=0)
+    missing_absolute_time: int = Field(default=0, ge=0)
+    observed_from: str | None = None
+    observed_to: str | None = None
     ann_backend: str | None = None
     byte_count: int = Field(default=0, ge=0)
     age_seconds: float | None = Field(default=None, ge=0.0)

@@ -9,6 +9,7 @@ import pytest
 
 from ai_memory_mcp.artifacts.identity import artifact_id, artifact_uri
 from ai_memory_mcp.artifacts.models import (
+    ArtifactAlias,
     ArtifactBatchManifest,
     ArtifactEvent,
     ArtifactLink,
@@ -24,6 +25,40 @@ from ai_memory_mcp.config import Settings
 from ai_memory_mcp.text import fts_expression
 
 
+def test_untimed_context_pages_follow_source_order(artifact_settings):
+    parent = _event("conversation", "ordered-parent", "Ordered conversation", "2026-01-01T00:00:00Z")
+    messages = []
+    for index in range(10):
+        message = _event("message", f"ordered-{index}", f"Ordered text {index}", "2026-01-01T00:00:00Z",
+                         parent=("conversation", "ordered-parent"))
+        messages.append(message.model_copy(update={"payload": message.payload.model_copy(update={
+            "occurred_at": None, "source_payload": {"ordinal": index},
+        })}))
+    ArtifactStore(artifact_settings).apply_batch(_batch("chat-source", "workspace", "ordered-pages", [parent, *messages]))
+    search = ArtifactSearch(artifact_settings)
+    parent_ref = artifact_uri("conversation", artifact_id("chat-source", "workspace", "conversation", "ordered-parent"))
+    first = search.read(parent_ref, direction="after", limit=4)
+    assert [row.text for row in first.records] == [f"Ordered text {i}" for i in range(4)]
+    second = search.read(parent_ref, direction="after", cursor=first.next_cursor, limit=4)
+    assert [row.text for row in second.records] == [f"Ordered text {i}" for i in range(4, 8)]
+    middle = artifact_uri("message", artifact_id("chat-source", "workspace", "message", "ordered-5"))
+    around = search.read(middle, direction="around", limit=5)
+    assert [row.text for row in around.records] == [f"Ordered text {i}" for i in range(3, 8)]
+
+
+def test_identity_lookup_uses_the_same_raw_snapshot_as_search(artifact_settings):
+    original = _event("message", "call-721", "Earlier source text", "2026-01-01T00:00:00Z")
+    store = ArtifactStore(artifact_settings)
+    store.apply_batch(_batch("chat-source", "workspace", "snapshot-first", [original]))
+    with connect_artifact_db(artifact_settings.artifact_db, read_only=True) as connection:
+        connection.execute("BEGIN")
+        connection.execute("SELECT count(*) FROM artifacts").fetchone()
+        pinned = ArtifactSearch(artifact_settings, connection=connection)
+        updated = _event("message", "call-721", "Later source text", "2026-01-02T00:00:00Z")
+        store.apply_batch(_batch("chat-source", "workspace", "snapshot-second", [updated]))
+        assert pinned.find_identity("call-721")[0].text == "Earlier source text"
+
+
 def _event(
     entity: str,
     external_id: str,
@@ -31,6 +66,7 @@ def _event(
     occurred_at: str,
     *,
     parent: tuple[str, str] | None = None,
+    aliases: list[ArtifactAlias] | None = None,
     links: list[ArtifactLink] | None = None,
 ) -> ArtifactEvent:
     parent_reference = (
@@ -51,6 +87,7 @@ def _event(
                 text=text,
                 content_format="plain",
                 occurred_at=occurred_at,
+                aliases=aliases or [],
                 links=links or [],
                 source_payload={"provider_field": f"raw-{external_id}"},
             ),
@@ -151,6 +188,100 @@ def test_raw_search_filters_before_ranking(
     ]
     assert all(hit.evidence_class == "raw" for hit in hits)
     assert all(hit.artifact_uri.startswith("artifact://message/") for hit in hits)
+
+
+def test_exact_identity_finds_provider_alias_with_scope(
+    artifact_settings: Settings,
+) -> None:
+    store = ArtifactStore(artifact_settings)
+    store.apply_batch(
+        _batch(
+            "chat-source",
+            "workspace",
+            "identity-alias-1",
+            [
+                _event(
+                    "meeting",
+                    "meeting:call:call-4",
+                    "",
+                    "2026-01-02T10:00:00Z",
+                    aliases=[ArtifactAlias(kind="call", value="call-4")],
+                )
+            ],
+        )
+    )
+
+    hits = ArtifactSearch(artifact_settings).find_identity(
+        "call-4",
+        ArtifactScope(
+            source="chat-source",
+            source_instance="workspace",
+            entities=("meeting",),
+        ),
+    )
+
+    assert [hit.external_id for hit in hits] == ["meeting:call:call-4"]
+    assert hits[0].matched_identity == "call-4"
+
+
+def test_exact_identity_applies_entity_scope(
+    artifact_settings: Settings,
+) -> None:
+    store = ArtifactStore(artifact_settings)
+    store.apply_batch(
+        _batch(
+            "chat-source",
+            "workspace",
+            "identity-alias-2",
+            [
+                _event(
+                    "recording",
+                    "recording:recording-4",
+                    "",
+                    "2026-01-02T10:00:00Z",
+                    aliases=[
+                        ArtifactAlias(kind="drive-item", value="drive-item-4")
+                    ],
+                )
+            ],
+        )
+    )
+
+    hits = ArtifactSearch(artifact_settings).find_identity(
+        "drive-item-4",
+        ArtifactScope(entities=("meeting",)),
+    )
+
+    assert hits == []
+
+
+def test_exact_identity_finds_namespaced_external_id(
+    artifact_settings: Settings,
+) -> None:
+    store = ArtifactStore(artifact_settings)
+    store.apply_batch(
+        _batch(
+            "chat-source",
+            "workspace",
+            "identity-external-id-1",
+            [
+                _event(
+                    "recording",
+                    "recording:drive-item-4",
+                    "",
+                    "2026-01-02T10:00:00Z",
+                )
+            ],
+        )
+    )
+
+    hits = ArtifactSearch(artifact_settings).find_identity(
+        "drive-item-4",
+        ArtifactScope(entities=("recording",)),
+    )
+
+    assert [hit.external_id for hit in hits] == ["recording:drive-item-4"]
+    assert hits[0].matched_identity == "drive-item-4"
 
 
 def test_raw_search_supports_parent_and_date_scope(

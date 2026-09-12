@@ -147,6 +147,20 @@ def _write_json(value: Any, stream: TextIO | None = None) -> None:
     )
 
 
+def _configure_console_streams() -> None:
+    """Keep JSON CLI output safe for Unicode artifact metadata on Windows."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, OSError):
+            # Some embedded callers expose a stream without reconfiguration
+            # support; their existing encoding remains the best available one.
+            continue
+
+
 def _ingest(settings: Settings, args: argparse.Namespace) -> Any:
     try:
         if args.input == "-":
@@ -364,6 +378,7 @@ HANDLERS = {
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    _configure_console_streams()
     parser = _parser()
     args = parser.parse_args(argv)
     try:

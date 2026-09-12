@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from .artifacts.schema import ClosingSQLiteConnection
 from .audit import append_event, file_lock
 from .config import Settings
 
@@ -19,6 +20,8 @@ GENERATION_SCHEMA = "ai-memory/generation@1"
 GENERATION_POINTER_SCHEMA = "ai-memory/generation-pointer@1"
 _PROCESS_LEASE_LOCK = threading.RLock()
 _PROCESS_LEASES: dict[str, tuple[Path, int]] = {}
+POINTER_REPLACE_RETRY_SECONDS = 2.0
+POINTER_REPLACE_RETRY_INTERVAL_SECONDS = 0.05
 
 
 def _utc_now() -> str:
@@ -93,13 +96,30 @@ def _publish_json(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_name(
         f".{path.name}.partial-{os.getpid()}-{time.time_ns()}"
     )
-    temporary.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    if os.name != "nt":
-        temporary.chmod(0o600)
-    os.replace(temporary, path)
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        if os.name != "nt":
+            temporary.chmod(0o600)
+        deadline = time.monotonic() + POINTER_REPLACE_RETRY_SECONDS
+        while True:
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                # OneDrive and Windows scanners can briefly lock a JSON pointer.
+                # Retrying the atomic replace preserves the validated generation.
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(POINTER_REPLACE_RETRY_INTERVAL_SECONDS)
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
 
 def _publish_json_no_overwrite(path: Path, payload: dict[str, Any]) -> None:
@@ -246,6 +266,7 @@ def _sqlite_metrics(path: Path, count_sql: str) -> dict[str, Any]:
     with sqlite3.connect(
         f"file:{path.resolve().as_posix()}?mode=ro",
         uri=True,
+        factory=ClosingSQLiteConnection,
     ) as connection:
         integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
         if integrity != "ok":
@@ -256,6 +277,20 @@ def _sqlite_metrics(path: Path, count_sql: str) -> dict[str, Any]:
         "bytes": path.stat().st_size,
         "corpus_size": corpus_size,
     }
+
+
+def _artifact_metrics(path: Path) -> dict[str, Any]:
+    from .artifacts.vector_index import artifact_segment_paths
+
+    segments = artifact_segment_paths(path)
+    if not segments:
+        return _sqlite_metrics(path, "SELECT count(*) FROM bursts")
+    # Segment contents were checked when built. Rechecking the entire immutable
+    # corpus here would make every delta publication proportional to corpus size.
+    metrics = _sqlite_metrics(path, "SELECT value FROM metadata WHERE key = 'bursts'")
+    metrics["bytes"] += sum(segment.stat().st_size for segment in segments)
+    metrics["segment_fanout"] = len(segments)
+    return metrics
 
 
 def _graph_metrics(path: Path, markdown_snapshot: str) -> dict[str, Any]:
@@ -348,7 +383,7 @@ def _valid_generation_components(
         return False
     try:
         _sqlite_metrics(markdown, "SELECT count(*) FROM chunks")
-        _sqlite_metrics(artifact, "SELECT count(*) FROM bursts")
+        _artifact_metrics(artifact)
         graph_metrics = _graph_metrics(graph, markdown.name)
         layers = manifest.get("layers")
         expected_graph = (
@@ -359,6 +394,7 @@ def _valid_generation_components(
         with sqlite3.connect(
             f"file:{artifact.resolve().as_posix()}?mode=ro",
             uri=True,
+            factory=ClosingSQLiteConnection,
         ) as connection:
             row = connection.execute(
                 "SELECT value FROM metadata "
@@ -434,8 +470,19 @@ def _retire_old_generations(
             if component is not None and component.is_file():
                 keep.add(component.resolve())
 
+    from .artifacts.vector_index import artifact_segment_paths
+    for component in list(keep):
+        if component.name.startswith("artifact-index-"):
+            keep.update(path.resolve() for path in artifact_segment_paths(component))
+    compacted = _read_json(settings.state_dir / "artifact-compaction.json")
+    if compacted:
+        path = _state_child(settings, compacted.get("compacted_segment"))
+        if path is not None:
+            keep.add(path.resolve())
+
     removed = 0
     removed_bytes = 0
+    removal_errors = 0
     candidates: list[Path] = []
     for _, manifest_path, manifest in manifests:
         candidates.append(manifest_path)
@@ -447,14 +494,24 @@ def _retire_old_generations(
     for path in sorted(set(candidates), key=lambda item: item.name):
         if not path.is_file() or path.resolve() in keep:
             continue
-        removed_bytes += path.stat().st_size
-        # These files contain derived data only. Canonical Markdown, artifacts,
-        # event revisions, and object bytes use different paths and are never pruned.
-        path.unlink()
+        try:
+            byte_count = path.stat().st_size
+            # Cleanup is best-effort after generation validation. A transient lock
+            # must not roll back to a generation whose files may already be pruned.
+            archive = settings.state_dir / "retired-generations"
+            archive.mkdir(exist_ok=True)
+            path.replace(archive / path.name)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            removal_errors += 1
+            continue
+        removed_bytes += byte_count
         removed += 1
     return {
         "removed_files": removed,
         "removed_bytes": removed_bytes,
+        "removal_errors": removal_errors,
         "verified_generations": len(retained),
         "last_good_available": last_good_available,
     }
@@ -482,6 +539,7 @@ def refresh_generation(settings: Settings) -> dict[str, Any]:
         acknowledge_artifact_vector_changes,
         build_artifact_vector_index,
     )
+    from .artifacts.schema import require_current_artifact_schema
     from .index import build_index, current_index_path
     from .provider_graph import build_provider_graph
 
@@ -489,7 +547,7 @@ def refresh_generation(settings: Settings) -> dict[str, Any]:
     started_at = _utc_now()
     started = time.perf_counter()
     health = generation_health(settings)
-    layer = "markdown"
+    layer = "artifact-schema"
     published = False
     owned_paths: set[Path] = set()
     with file_lock(
@@ -507,6 +565,7 @@ def refresh_generation(settings: Settings) -> dict[str, Any]:
             for pattern in (
                 "index-*.sqlite",
                 "artifact-index-*.sqlite",
+                "artifact-segment-*.sqlite",
                 "graph-*.json",
             )
             for path in settings.state_dir.glob(pattern)
@@ -521,6 +580,10 @@ def refresh_generation(settings: Settings) -> dict[str, Any]:
             if path is not None
         }
         try:
+            # Fail before the expensive Markdown build when an application upgrade
+            # requires an explicit canonical artifact-database migration.
+            require_current_artifact_schema(settings)
+            layer = "markdown"
             markdown_started = time.perf_counter()
             markdown = build_index(
                 settings,
@@ -553,10 +616,7 @@ def refresh_generation(settings: Settings) -> dict[str, Any]:
             artifact_path = Path(artifact.snapshot)
             if artifact_path != current_artifact_index_path(settings):
                 owned_paths.add(artifact_path)
-            artifact_metrics = _sqlite_metrics(
-                artifact_path,
-                "SELECT count(*) FROM bursts",
-            )
+            artifact_metrics = _artifact_metrics(artifact_path)
             artifact_metrics.update(
                 {
                     "latency_ms": round(

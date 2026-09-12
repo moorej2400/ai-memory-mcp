@@ -27,6 +27,7 @@ AI Memory keeps internal data under `AI_MEMORY_WORK_DIR/.ai-memory/`.
 The hidden directory keeps raw data, backups, indexes, state, and logs separate from Markdown notes.
 
 Read the [architecture guide](docs/architecture.md) for the complete design rules.
+Read the [retrieval reliability validation](docs/retrieval-reliability-validation.md) for quality and capacity evidence.
 
 ## System architecture
 
@@ -40,7 +41,7 @@ flowchart TB
     subgraph Derived["Derived indexes"]
         direction LR
         MdIndex["Markdown index<br/>FTS5 and vectors"]
-        ArtIndex["Artifact index<br/>raw FTS and bursts"]
+        ArtIndex["Artifact index<br/>raw FTS and source representations"]
         Graph["Graphify graph<br/>nodes and paths"]
     end
 
@@ -78,7 +79,7 @@ AI Memory owns validation, storage, search, and citations.
 | Object storage | Holds attachment bytes by content hash, outside SQLite. |
 | Memory indexer | Validates records and publishes versioned SQLite snapshots. |
 | Artifact search | Supplies raw candidates from a full-text index. |
-| Burst index | Supplies paraphrase candidates from same-author message runs. |
+| Artifact semantic index | Supplies complete source segments and bounded reply context. |
 | Local semantic index | Supplies paraphrase candidates with Model2Vec embeddings or a hashed fallback. |
 | Graphify adapter | Supplies relationships, neighbors, and paths behind a replaceable boundary. |
 | Retrieval engine | Applies scope, RRF fusion, reranking, and context expansion. |
@@ -96,12 +97,10 @@ flowchart TB
     Query["memory_recall<br/>query and scope"]
     Scope["Apply scope filters"]
     Md["Markdown retrieval<br/>lexical, semantic, graph"]
-    Art["Artifact retrieval<br/>raw text and bursts"]
+    Art["Artifact retrieval<br/>raw text and source representations"]
     Fuse["Fuse with RRF<br/>one rank sequence for each producer"]
-    Rank["Rerank, apply decay, and expand context"]
-    Gate{"Distilled evidence<br/>ranks first?"}
-    Answer["Answered<br/>with citations"]
-    Lead["Raw evidence returns as a lead"]
+    Rank["Rerank and expand context"]
+    Result["Versioned result<br/>with citations and coverage"]
 
     Query --> Scope
     Scope --> Md
@@ -109,18 +108,17 @@ flowchart TB
     Md --> Fuse
     Art --> Fuse
     Fuse --> Rank
-    Rank --> Gate
-    Gate -->|yes| Answer
-    Gate -->|no| Lead
+    Rank --> Result
 ```
 
 The engine applies scope before it ranks each provider result.
 Each producer owns its own rank sequence, so no producer loses weight through list order.
 Exact identifiers receive bounded bonuses during reranking.
 
-Raw artifact evidence answers a question only on an exact identifier or an exact quoted phrase.
-Every other raw result returns as a lead with a caution to verify or distill it first.
-Raw evidence also decays with age, and chat decays faster than a meeting.
+Response version 2 separates execution state from result kind.
+It returns useful ranked raw candidates without an exact-phrase requirement.
+Raw historical evidence receives no automatic age penalty.
+Clients must read citations before they make factual claims.
 
 Use `memory_artifact_read` to read ordered source context around an `artifact://` citation.
 
@@ -161,6 +159,7 @@ A failed refresh never changes either canonical store.
 | `ai-memory-index` | Builds the derived Markdown index. |
 | `ai-memory-artifact` | Manages the canonical artifact database. |
 | `ai-memory-benchmark` | Runs the frozen retrieval benchmark. |
+| `ai-memory-real-world-benchmark` | Runs the mixed synthetic workload benchmark. |
 
 `ai-memory-artifact` is the only write path for raw artifacts.
 It supplies `ingest`, `search`, `read`, `pending`, `backup`, `check`, and `restore`.
@@ -184,7 +183,7 @@ The MCP facade never exposes an artifact write operation.
 - One query loads context for all returned records.
 - Recall results omit internal provider diagnostics.
 - Incremental indexing skips unchanged Markdown files.
-- Incremental artifact indexing skips unchanged bursts.
+- Incremental artifact indexing uses the committed change journal and bounded context dependencies.
 - Large vector corpora use ANN candidates with exact reranking.
 - Versioned generations preserve the last satisfactory state.
 - Recall uses only components from one generation.

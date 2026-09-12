@@ -19,8 +19,8 @@ from ai_memory_mcp.config import Settings
 def test_migration_creates_schema_and_fts(artifact_settings: Settings) -> None:
     result = migrate_artifact_db(artifact_settings)
     assert result.from_version == 0
-    assert result.to_version == ARTIFACT_SCHEMA_VERSION == 4
-    assert result.applied == [1, 2, 3, 4]
+    assert result.to_version == ARTIFACT_SCHEMA_VERSION == 6
+    assert result.applied == [1, 2, 3, 4, 5, 6]
 
     with connect_artifact_db(artifact_settings.artifact_db) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
@@ -46,6 +46,7 @@ def test_migration_creates_schema_and_fts(artifact_settings: Settings) -> None:
         "artifact_objects",
         "artifact_object_links",
         "artifact_coverage",
+        "artifact_change_journal",
         "distillation_state",
         "artifacts_fts",
     } <= names
@@ -55,10 +56,22 @@ def test_migration_creates_schema_and_fts(artifact_settings: Settings) -> None:
 def test_repeated_migration_is_a_no_op(artifact_settings: Settings) -> None:
     migrate_artifact_db(artifact_settings)
     result = migrate_artifact_db(artifact_settings)
-    assert result.from_version == 4
-    assert result.to_version == 4
+    assert result.from_version == 6
+    assert result.to_version == 6
     assert result.applied == []
     assert result.backup_path is None
+
+
+def test_unscoped_identity_lookups_use_covering_indexes(artifact_settings: Settings) -> None:
+    migrate_artifact_db(artifact_settings)
+    with connect_artifact_db(artifact_settings.artifact_db) as connection:
+        for sql, parameters, index in (
+            ("SELECT artifact_id FROM artifacts WHERE external_id = ?", ("call-721",), "artifacts_external_identity_idx"),
+            ("SELECT artifact_id FROM artifacts WHERE substr(external_id, -(length(?) + 1)) = ':' || ?", ("call-721", "call-721"), "artifacts_external_identity_idx"),
+            ("SELECT artifact_id FROM artifact_aliases WHERE alias_value = ?", ("call-721",), "artifact_alias_value_idx"),
+        ):
+            plan = " ".join(str(row[3]) for row in connection.execute("EXPLAIN QUERY PLAN " + sql, parameters))
+            assert f"COVERING INDEX {index}" in plan
 
 
 def test_status_reports_database_health(artifact_settings: Settings) -> None:
@@ -69,7 +82,7 @@ def test_status_reports_database_health(artifact_settings: Settings) -> None:
     migrate_artifact_db(artifact_settings)
     status = artifact_database_status(artifact_settings)
     assert status.exists is True
-    assert status.schema_version == 4
+    assert status.schema_version == 6
     assert status.integrity == "ok"
     assert status.change_counter == 0
 
@@ -258,7 +271,7 @@ def test_migration_3_preserves_aliases_and_allows_shared_alias_values(
     result = migrate_artifact_db(artifact_settings)
 
     assert result.from_version == 2
-    assert result.applied == [3, 4]
+    assert result.applied == [3, 4, 5, 6]
     with connect_artifact_db(artifact_settings.artifact_db) as connection:
         connection.execute(
             """

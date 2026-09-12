@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Iterator, Literal
 
 from ai_memory_mcp.config import Settings
-from ai_memory_mcp.text import fts_expression, tokenize
+from ai_memory_mcp.text import fts_expressions, tokenize
 
 from .identity import (
     ARTIFACT_ID_PATTERN,
@@ -43,9 +43,9 @@ def _parent_id(reference: str) -> str:
     return reference
 
 
-def _bounded_search_text(text: str, query: str | None) -> str:
+def _bounded_search_span(text: str, query: str | None) -> tuple[str, int, int]:
     if len(text) <= MAX_SEARCH_HIT_TEXT:
-        return text
+        return text, 0, len(text)
     if query:
         for quoted in QUOTED_PHRASE_RE.finditer(query):
             phrase = quoted.group(1).strip()
@@ -58,8 +58,48 @@ def _bounded_search_text(text: str, query: str | None) -> str:
             start = max(0, match.start() - (available // 2))
             end = min(len(text), start + MAX_SEARCH_HIT_TEXT)
             start = max(0, end - MAX_SEARCH_HIT_TEXT)
-            return text[start:end]
-    return text[:MAX_SEARCH_HIT_TEXT]
+            return text[start:end], start, end
+        terms = sorted(set(tokenize(query)), key=lambda value: (-len(value), value))
+        occurrences: list[int] = []
+        folded = text.casefold()
+        for term in terms[:64]:
+            offset = folded.find(term.casefold())
+            if offset >= 0:
+                occurrences.append(offset)
+        if occurrences:
+            best: tuple[int, int, int] | None = None
+            for offset in occurrences:
+                start = max(0, offset - MAX_SEARCH_HIT_TEXT // 2)
+                end = min(len(text), start + MAX_SEARCH_HIT_TEXT)
+                start = max(0, end - MAX_SEARCH_HIT_TEXT)
+                window = folded[start:end]
+                score = sum(term.casefold() in window for term in terms)
+                candidate = (score, offset, start)
+                if best is None or candidate > best:
+                    best = candidate
+            assert best is not None
+            start = best[2]
+            end = min(len(text), start + MAX_SEARCH_HIT_TEXT)
+            return text[start:end], start, end
+    return text[:MAX_SEARCH_HIT_TEXT], 0, MAX_SEARCH_HIT_TEXT
+
+
+def _meeting_ancestor_expression(alias: str, column: str) -> str:
+    return f"""
+        (WITH RECURSIVE lineage(artifact_id, entity, parent_artifact_id, occurred_at, depth) AS (
+            SELECT {alias}.artifact_id, {alias}.entity, {alias}.parent_artifact_id,
+                   {alias}.occurred_at, 0
+            UNION ALL
+            SELECT parent.artifact_id, parent.entity, parent.parent_artifact_id,
+                   parent.occurred_at, lineage.depth + 1
+            FROM artifacts AS parent
+            JOIN lineage ON parent.artifact_id = lineage.parent_artifact_id
+            WHERE lineage.depth < 8
+              AND parent.deleted_at IS NULL
+              AND parent.redacted_at IS NULL
+        ) SELECT {column} FROM lineage WHERE entity = 'meeting'
+          ORDER BY depth LIMIT 1)
+    """
 
 
 def _cursor_encode(row: sqlite3.Row) -> str:
@@ -89,15 +129,6 @@ def _cursor_decode(value: str) -> tuple[str, str]:
     ):
         raise ValueError("The artifact cursor has an invalid format.")
     return occurred_at, artifact_value
-
-
-def _comparison(
-    operator: Literal["<", ">"],
-) -> str:
-    return (
-        f"(COALESCE(a.occurred_at, '') {operator} ? OR "
-        f"(COALESCE(a.occurred_at, '') = ? AND a.artifact_id {operator} ?))"
-    )
 
 
 def _utc_iso(value: datetime) -> str:
@@ -148,7 +179,103 @@ class ArtifactSearch:
             "a.redacted_at IS NULL",
             active_ancestor_predicate("a"),
         ]
-        parameters: list[object] = [fts_expression(query)]
+        parameters: list[object] = []
+        if selected_scope.source is not None:
+            conditions.append("a.source = ?")
+            parameters.append(selected_scope.source)
+        if selected_scope.source_instance is not None:
+            conditions.append("a.source_instance = ?")
+            parameters.append(selected_scope.source_instance)
+        if selected_scope.entities:
+            if selected_scope.entities == ("meeting",):
+                conditions.append(
+                    f"{_meeting_ancestor_expression('a', 'artifact_id')} IS NOT NULL"
+                )
+            else:
+                placeholders = ", ".join("?" for _ in selected_scope.entities)
+                conditions.append(f"a.entity IN ({placeholders})")
+                parameters.extend(selected_scope.entities)
+        if selected_scope.parent is not None:
+            conditions.append("a.parent_artifact_id = ?")
+            parameters.append(_parent_id(selected_scope.parent))
+        if selected_scope.date_from is not None:
+            date_expression = (
+                _meeting_ancestor_expression("a", "occurred_at")
+                if selected_scope.entities == ("meeting",)
+                else "a.occurred_at"
+            )
+            conditions.append(f"{date_expression} >= ?")
+            parameters.append(_utc_iso(selected_scope.date_from))
+        if selected_scope.date_to is not None:
+            date_expression = (
+                _meeting_ancestor_expression("a", "occurred_at")
+                if selected_scope.entities == ("meeting",)
+                else "a.occurred_at"
+            )
+            conditions.append(f"{date_expression} <= ?")
+            parameters.append(_utc_iso(selected_scope.date_to))
+
+        with self._connection() as connection:
+            by_id: dict[str, sqlite3.Row] = {}
+            for expression in fts_expressions(query):
+                rows = connection.execute(
+                    f"""
+                SELECT a.*,
+                       (SELECT entity FROM artifacts AS direct_parent
+                        WHERE direct_parent.artifact_id = a.parent_artifact_id)
+                           AS parent_entity,
+                       {_meeting_ancestor_expression('a', 'artifact_id')}
+                           AS meeting_artifact_id,
+                       bm25(
+                    artifacts_fts, 2.0, 1.0, 5.0, 1.0
+                ) AS lexical_score
+                FROM artifacts_fts
+                JOIN artifacts AS a ON a.rowid = artifacts_fts.rowid
+                WHERE {' AND '.join(conditions)}
+                ORDER BY lexical_score, a.artifact_id
+                LIMIT ?
+                """,
+                    [expression, *parameters, max(limit * 4, 40)],
+                ).fetchall()
+                for row in rows:
+                    artifact_id = str(row["artifact_id"])
+                    prior = by_id.get(artifact_id)
+                    if prior is None or float(row["lexical_score"]) < float(
+                        prior["lexical_score"]
+                    ):
+                        by_id[artifact_id] = row
+        rows = sorted(
+            by_id.values(),
+            key=lambda row: (float(row["lexical_score"]), str(row["artifact_id"])),
+        )[:limit]
+        return [self._search_hit(row, query=query) for row in rows]
+
+    def find_identity(
+        self,
+        identity: str,
+        scope: ArtifactScope | None = None,
+        limit: int = 20,
+    ) -> list[ArtifactSearchHit]:
+        """Return active artifacts that match one exact provider identity."""
+        identity = identity.strip().strip('"')
+        if not identity:
+            return []
+        if limit <= 0:
+            raise ValueError("The artifact identity limit must be positive.")
+        limit = min(limit, 100)
+        selected_scope = scope or ArtifactScope()
+        conditions = [
+            "a.deleted_at IS NULL",
+            "a.redacted_at IS NULL",
+            active_ancestor_predicate("a"),
+        ]
+        parameters: list[object] = [
+            identity,
+            identity,
+            identity,
+            identity,
+            identity,
+        ]
         if selected_scope.source is not None:
             conditions.append("a.source = ?")
             parameters.append(selected_scope.source)
@@ -170,21 +297,54 @@ class ArtifactSearch:
             parameters.append(_utc_iso(selected_scope.date_to))
         parameters.append(limit)
 
+        # Provider aliases are normalized outside FTS. Query them before the
+        # hybrid path so a call or drive ID cannot fall through to graph search.
         with self._connection() as connection:
             rows = connection.execute(
                 f"""
-                SELECT a.*, bm25(
-                    artifacts_fts, 2.0, 1.0, 5.0, 1.0
-                ) AS lexical_score
-                FROM artifacts_fts
-                JOIN artifacts AS a ON a.rowid = artifacts_fts.rowid
+                WITH identity_candidates AS (
+                    SELECT artifact_id, 0 AS identity_rank
+                    FROM artifacts
+                    WHERE artifact_id = ?
+                    UNION ALL
+                    SELECT artifact_id, 1 AS identity_rank
+                    FROM artifacts
+                    WHERE external_id = ?
+                    UNION ALL
+                    SELECT artifact_id, 2 AS identity_rank
+                    FROM artifacts
+                    WHERE substr(external_id, -(length(?) + 1)) = ':' || ?
+                    UNION ALL
+                    SELECT artifact_id, 2 AS identity_rank
+                    FROM artifact_aliases
+                    WHERE alias_value = ?
+                ), ranked_candidates AS (
+                    SELECT artifact_id, MIN(identity_rank) AS identity_rank
+                    FROM identity_candidates
+                    GROUP BY artifact_id
+                )
+                SELECT a.*, ranked_candidates.identity_rank
+                FROM ranked_candidates
+                JOIN artifacts AS a
+                    ON a.artifact_id = ranked_candidates.artifact_id
                 WHERE {' AND '.join(conditions)}
-                ORDER BY lexical_score, a.artifact_id
+                ORDER BY
+                    ranked_candidates.identity_rank,
+                    COALESCE(a.occurred_at, '') DESC,
+                    a.artifact_id
                 LIMIT ?
                 """,
                 parameters,
             ).fetchall()
-        return [self._search_hit(row, query=query) for row in rows]
+        return [
+            self._search_hit(
+                row,
+                score=1.0,
+                query=identity,
+                matched_identity=identity,
+            )
+            for row in rows
+        ]
 
     def get(
         self,
@@ -238,10 +398,19 @@ class ArtifactSearch:
         *,
         score: float | None = None,
         query: str | None = None,
+        matched_identity: str = "",
     ) -> ArtifactSearchHit:
         if score is None:
             relevance = max(0.0, -float(row["lexical_score"]))
             score = relevance / (1.0 + relevance)
+        text, segment_start, segment_end = _bounded_search_span(
+            str(row["text_content"]), query
+        )
+        meeting_id = None
+        # Search queries add no ancestor column, so callers receive it only
+        # when the result row already contains the derived value.
+        if "meeting_artifact_id" in row.keys() and row["meeting_artifact_id"]:
+            meeting_id = str(row["meeting_artifact_id"])
         return ArtifactSearchHit(
             artifact_id=str(row["artifact_id"]),
             artifact_uri=artifact_uri(
@@ -253,11 +422,32 @@ class ArtifactSearch:
             source_instance=str(row["source_instance"]),
             external_id=str(row["external_id"]),
             title=str(row["title"]),
-            text=_bounded_search_text(str(row["text_content"]), query),
+            text=text,
             author_name=str(row["author_name"]),
             occurred_at=row["occurred_at"],
             score=score,
             evidence_class="raw",
+            segment_start=segment_start,
+            segment_end=segment_end,
+            anchor_artifact_uri=artifact_uri(
+                str(row["entity"]), str(row["artifact_id"])
+            ),
+            parent_artifact_uri=(
+                artifact_uri(
+                    str(row["parent_entity"]), str(row["parent_artifact_id"])
+                )
+                if (
+                    row["parent_artifact_id"] is not None
+                    and "parent_entity" in row.keys()
+                    and row["parent_entity"] is not None
+                )
+                else None
+            ),
+            meeting_artifact_uri=(
+                artifact_uri("meeting", meeting_id) if meeting_id else None
+            ),
+            continuation=(segment_start > 0 or segment_end < len(str(row["text_content"]))),
+            matched_identity=matched_identity,
         )
 
     def read(
@@ -433,14 +623,24 @@ class ArtifactSearch:
         if limit <= 0:
             return []
         order = "DESC" if descending else "ASC"
+        source_order = connection.execute(
+            "SELECT order_group, order_value FROM artifact_source_order WHERE artifact_id = ?", (key[1],)
+        ).fetchone()
+        if source_order is not None:
+            position = (source_order[0], source_order[1], key[1])
+        elif key[1] in {"", "\U0010ffff"}:
+            position = (4, 0, "") if operator == "<" else (-1, 0, "")
+        else:
+            raise ValueError("The artifact cursor source is not available.")
         return connection.execute(
             f"""
             SELECT a.* FROM ({base_sql}) AS a
-            WHERE {_comparison(operator)}
-            ORDER BY COALESCE(a.occurred_at, '') {order}, a.artifact_id {order}
+            JOIN artifact_source_order AS o ON o.artifact_id = a.artifact_id
+            WHERE (o.order_group, o.order_value, a.artifact_id) {operator} (?, ?, ?)
+            ORDER BY o.order_group {order}, o.order_value {order}, a.artifact_id {order}
             LIMIT ?
             """,
-            [*base_parameters, key[0], key[0], key[1], limit],
+            [*base_parameters, *position, limit],
         ).fetchall()
 
     @staticmethod

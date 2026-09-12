@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 
 from ai_memory_mcp.config import Settings
-from ai_memory_mcp.ann import ANN_BANDS, available as ann_available
+from ai_memory_mcp.ann import (
+    ANN_BACKEND,
+    available as ann_available,
+    candidate_recall_at_k,
+    tie_aware_candidate_recall_at_k,
+)
 from ai_memory_mcp.embedding import (
     EmbeddingUnavailable,
     HashedProvider,
@@ -63,6 +68,21 @@ def test_hashed_provider_matches_legacy_semantic_vector() -> None:
     assert provider.dimensions == 256
     text = "restart the proxy without a terminal window"
     assert provider.embed(text) == semantic_vector(text, 256)
+
+
+def test_ann_recall_ignores_arbitrary_identities_at_a_score_tie() -> None:
+    exact = [("target", 0.9), ("tie-a", 0.2), ("tie-b", 0.2)]
+
+    assert tie_aware_candidate_recall_at_k(
+        exact,
+        [("target", 0.9), ("tie-c", 0.2), ("tie-d", 0.2)],
+        3,
+    ) == 1.0
+
+
+def test_ann_candidate_recall_uses_exact_neighbor_identity() -> None:
+    assert candidate_recall_at_k(["a", "b", "c"], ["b", "x", "a"], 3) == 2 / 3
+    assert candidate_recall_at_k([], [], 10) == 1.0
 
 
 def test_index_records_embedding_fingerprint(tmp_path: Path) -> None:
@@ -147,7 +167,7 @@ def test_markdown_index_embeds_only_changed_documents(
 
 
 @pytest.mark.skipif(not ann_available(), reason="NumPy ANN backend is unavailable")
-def test_markdown_backend_transition_rebuilds_all_ann_buckets(
+def test_markdown_backend_transition_rebuilds_all_ann_signatures(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -164,7 +184,7 @@ def test_markdown_backend_transition_rebuilds_all_ann_buckets(
         connection.execute(
             "UPDATE metadata SET value = 'exact' WHERE key = 'ann_backend'"
         )
-        connection.execute("DELETE FROM chunk_ann_buckets")
+        connection.execute("UPDATE chunks SET ann_vector = X''")
         connection.commit()
     changed = settings.memory_root / "Tools" / "Record-1.md"
     changed.write_text(
@@ -175,10 +195,12 @@ def test_markdown_backend_transition_rebuilds_all_ann_buckets(
     second = build_index(settings)
     with sqlite3.connect(second["snapshot"]) as connection:
         chunks = int(connection.execute("SELECT count(*) FROM chunks").fetchone()[0])
-        buckets = int(
-            connection.execute("SELECT count(*) FROM chunk_ann_buckets").fetchone()[0]
+        vectors = int(
+            connection.execute(
+                "SELECT count(*) FROM chunks WHERE length(ann_vector) > 0"
+            ).fetchone()[0]
         )
-    assert buckets == chunks * ANN_BANDS
+    assert vectors == chunks
 
 
 def test_auto_falls_back_to_hashed_without_model2vec(monkeypatch) -> None:
@@ -264,8 +286,5 @@ def test_large_vector_corpus_uses_ann_candidates_with_exact_reranking(
     )
 
     assert packet.results[0].memory_id == "mem-record-2049"
-    assert (
-        packet.diagnostics["semantic_search"]["backend"]
-        == "random-projection-lsh-v1"
-    )
+    assert packet.diagnostics["semantic_search"]["backend"] == ANN_BACKEND
     assert packet.diagnostics["semantic_search"]["candidates"] < 2_050

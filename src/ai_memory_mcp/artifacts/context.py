@@ -14,7 +14,7 @@ def active_ancestor_predicate(alias: str) -> str:
                    parent.deleted_at, parent.redacted_at
             FROM artifacts AS parent
             WHERE parent.artifact_id = {alias}.parent_artifact_id
-            UNION ALL
+            UNION
             SELECT parent.artifact_id, parent.parent_artifact_id,
                    parent.deleted_at, parent.redacted_at
             FROM artifacts AS parent

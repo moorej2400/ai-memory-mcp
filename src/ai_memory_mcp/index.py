@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
+import math
 import os
 import sqlite3
 import struct
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -15,17 +18,19 @@ from .audit import append_event, file_lock
 from .ann import (
     ANN_BACKEND,
     available as ann_available,
-    bucket_clause,
-    multiprobe_buckets,
-    vector_buckets,
+    quantized_shortlist,
+    quantized_vector,
 )
+from .artifacts.schema import ClosingSQLiteConnection
 from .config import Settings
 from .embedding import fingerprint, resolve_provider
 from .models import MemoryChunk, MemoryDocument, ScopeFilter
-from .text import chunk_document, parse_document
+from .text import chunk_document, cosine_sparse, parse_document
 
-SCHEMA_VERSION = 5
+# Version 9 pins full-document artifact provenance with each indexed claim.
+SCHEMA_VERSION = 9
 _VECTOR_ITEM = struct.Struct("<He")
+_REPOSITORY_SCOPE_KINDS = frozenset({"repo", "repository"})
 
 
 def _utc_now() -> str:
@@ -34,9 +39,13 @@ def _utc_now() -> str:
 
 def _connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     if read_only:
-        connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        connection = sqlite3.connect(
+            f"file:{path.as_posix()}?mode=ro",
+            uri=True,
+            factory=ClosingSQLiteConnection,
+        )
     else:
-        connection = sqlite3.connect(path)
+        connection = sqlite3.connect(path, factory=ClosingSQLiteConnection)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
@@ -68,7 +77,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             repos_json TEXT NOT NULL,
             tools_json TEXT NOT NULL,
             content_hash TEXT NOT NULL,
-            mtime_ns INTEGER NOT NULL
+            mtime_ns INTEGER NOT NULL,
+            artifact_references_json TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS chunks (
             chunk_id TEXT PRIMARY KEY,
@@ -79,19 +89,28 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             heading TEXT NOT NULL,
             ordinal INTEGER NOT NULL,
             text TEXT NOT NULL,
-            vector_blob BLOB NOT NULL
+            vector_blob BLOB NOT NULL,
+            ann_vector BLOB NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_chunks_memory ON chunks(memory_id, ordinal);
-        CREATE TABLE IF NOT EXISTS chunk_ann_buckets (
-            chunk_id TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
-            band INTEGER NOT NULL,
-            bucket INTEGER NOT NULL,
-            PRIMARY KEY(chunk_id, band)
-        );
-        CREATE INDEX IF NOT EXISTS idx_chunk_ann_lookup
-            ON chunk_ann_buckets(band, bucket, chunk_id);
         CREATE INDEX IF NOT EXISTS idx_documents_scope
             ON documents(source_id, root_scope, status, scope_kind, scope_id);
+        CREATE TABLE IF NOT EXISTS document_identity_aliases (
+            identity TEXT COLLATE NOCASE NOT NULL,
+            memory_id TEXT NOT NULL REFERENCES documents(memory_id) ON DELETE CASCADE,
+            priority INTEGER NOT NULL,
+            PRIMARY KEY(identity, memory_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_document_identity_memory
+            ON document_identity_aliases(memory_id);
+        CREATE TABLE IF NOT EXISTS document_scope_aliases (
+            kind TEXT NOT NULL,
+            alias TEXT COLLATE NOCASE NOT NULL,
+            memory_id TEXT NOT NULL REFERENCES documents(memory_id) ON DELETE CASCADE,
+            PRIMARY KEY(kind, alias, memory_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_document_scope_alias_memory
+            ON document_scope_aliases(memory_id, kind);
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
             chunk_id UNINDEXED,
             title,
@@ -104,16 +123,115 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _normalized_alias(value: str) -> str:
+    return value.strip().replace("\\", "/").strip("/").casefold()
+
+
+def _repository_aliases(value: str) -> set[str]:
+    normalized = _normalized_alias(value)
+    if not normalized:
+        return set()
+    aliases = {normalized}
+    repository = normalized
+    if ":" in repository:
+        provider, candidate = repository.split(":", 1)
+        if "/" in candidate:
+            repository = candidate.strip("/")
+            aliases.add(repository)
+            aliases.add(f"{provider}--{repository.replace('/', '--')}")
+    if "/" in repository:
+        aliases.add(repository.rsplit("/", 1)[-1])
+    return aliases
+
+
+def _path_scope_aliases(path: str) -> dict[str, set[str]]:
+    parts = path.replace("\\", "/").split("/")
+    aliases: dict[str, set[str]] = {
+        "repository": set(),
+        "project": set(),
+        "ticket": set(),
+    }
+    markers = {
+        "repos": "repository",
+        "projects": "project",
+        "tickets": "ticket",
+    }
+    for index, part in enumerate(parts[:-1]):
+        kind = markers.get(part.casefold())
+        if kind:
+            value = _normalized_alias(parts[index + 1])
+            if value:
+                aliases[kind].add(value)
+    return aliases
+
+
+def _scope_alias_rows(document: MemoryDocument) -> list[tuple[str, str, str]]:
+    aliases = _path_scope_aliases(document.path)
+    scope_kind = document.scope_kind.casefold()
+    if scope_kind in _REPOSITORY_SCOPE_KINDS:
+        aliases["repository"].update(_repository_aliases(document.scope_id))
+    elif scope_kind in aliases and document.scope_id:
+        aliases[scope_kind].add(_normalized_alias(document.scope_id))
+    for value in document.repos:
+        aliases["repository"].update(_repository_aliases(value))
+    for kind, values in (
+        ("project", document.projects),
+        (
+            "ticket",
+            [
+                *document.identifiers,
+                *([document.scope_id] if scope_kind == "ticket" else []),
+            ],
+        ),
+    ):
+        aliases[kind].update(
+            alias for value in values if (alias := _normalized_alias(value))
+        )
+    return [
+        (kind, alias, document.memory_id)
+        for kind, values in aliases.items()
+        for alias in sorted(values)
+    ]
+
+
+def _identity_alias_rows(document: MemoryDocument) -> list[tuple[str, str, int]]:
+    relative_path = document.path.split("/", 1)[-1]
+    candidates = (
+        (document.memory_id, 0),
+        (document.path, 1),
+        (relative_path, 1),
+        (document.title, 2),
+        (Path(document.path).stem, 3),
+        *((identifier, 4) for identifier in document.identifiers),
+    )
+    priorities: dict[str, int] = {}
+    for value, priority in candidates:
+        identity = _normalized_alias(value)
+        if identity:
+            priorities[identity] = min(priority, priorities.get(identity, priority))
+    return [
+        (identity, document.memory_id, priority)
+        for identity, priority in priorities.items()
+    ]
+
+
 def _eligible_markdown(root: Path) -> list[Path]:
     paths: list[Path] = []
-    for path in root.rglob("*.md"):
-        relative = path.relative_to(root)
-        parts = {part.casefold() for part in relative.parts}
-        if any(part.startswith(".") for part in relative.parts):
-            continue
-        if "restricted" in parts or ".trash" in parts:
-            continue
-        paths.append(path)
+    # pathlib.rglob enters excluded subtrees before this filter runs. Prune
+    # them during os.walk and avoid glob-matcher overhead on every directory.
+    for directory, directories, filenames in os.walk(root):
+        directories[:] = [
+            name
+            for name in directories
+            if not name.startswith(".")
+            and name.casefold() not in {"restricted", ".trash"}
+        ]
+        parent = Path(directory)
+        paths.extend(
+            parent / name
+            for name in filenames
+            if name.casefold().endswith(".md") and not name.startswith(".")
+        )
     return sorted(paths, key=lambda item: item.as_posix().casefold())
 
 
@@ -131,7 +249,7 @@ def _insert_document(
             :memory_id, :source_id, :path, :title, :body, :status, :root_scope,
             :scope_kind, :scope_id, :updated, :review_after, :related_json,
             :identifiers_json, :projects_json, :repos_json, :tools_json,
-            :content_hash, :mtime_ns
+            :content_hash, :mtime_ns, :artifact_references_json
         )
         """,
         {
@@ -141,12 +259,22 @@ def _insert_document(
             "projects_json": json.dumps(document.projects),
             "repos_json": json.dumps(document.repos),
             "tools_json": json.dumps(document.tools),
+            "artifact_references_json": json.dumps(document.artifact_references),
         },
+    )
+    connection.executemany(
+        "INSERT INTO document_identity_aliases VALUES (?, ?, ?)",
+        _identity_alias_rows(document),
+    )
+    # Compact aliases keep scoped misses off document bodies and JSON fields.
+    connection.executemany(
+        "INSERT INTO document_scope_aliases VALUES (?, ?, ?)",
+        _scope_alias_rows(document),
     )
     identifiers = " ".join(document.identifiers)
     for chunk in chunks:
         connection.execute(
-            "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 chunk.chunk_id,
                 chunk.memory_id,
@@ -157,17 +285,7 @@ def _insert_document(
                 chunk.ordinal,
                 chunk.text,
                 encode_vector(chunk.vector),
-            ),
-        )
-        connection.executemany(
-            "INSERT INTO chunk_ann_buckets(chunk_id, band, bucket) "
-            "VALUES (?, ?, ?)",
-            (
-                (chunk.chunk_id, band, bucket)
-                for band, bucket in vector_buckets(
-                    chunk.vector,
-                    semantic_dimensions,
-                )
+                quantized_vector(chunk.vector, semantic_dimensions),
             ),
         )
         connection.execute(
@@ -471,20 +589,15 @@ def _build_index(
                 """
             ).fetchone()
             if rebuild_ann:
-                connection.execute("DELETE FROM chunk_ann_buckets")
                 for row in connection.execute(
                     "SELECT chunk_id, vector_blob FROM chunks"
                 ):
                     vector = decode_vector(bytes(row["vector_blob"]))
-                    connection.executemany(
-                        "INSERT INTO chunk_ann_buckets(chunk_id, band, bucket) "
-                        "VALUES (?, ?, ?)",
+                    connection.execute(
+                        "UPDATE chunks SET ann_vector = ? WHERE chunk_id = ?",
                         (
-                            (str(row["chunk_id"]), band, bucket)
-                            for band, bucket in vector_buckets(
-                                vector,
-                                provider.dimensions,
-                            )
+                            quantized_vector(vector, provider.dimensions),
+                            str(row["chunk_id"]),
                         ),
                     )
             metadata = {
@@ -607,9 +720,6 @@ def build_index(
 class MemoryIndex:
     def __init__(self, settings: Settings, path: Path | None = None):
         self.settings = settings
-        self._vector_cache: dict[
-            tuple[str | None, ...], list[tuple[sqlite3.Row, dict[int, float]]]
-        ] = {}
         self.path = path or current_index_path(settings)
         if self.path is None:
             raise FileNotFoundError(
@@ -658,32 +768,14 @@ class MemoryIndex:
         with self.connection() as connection:
             row = connection.execute(
                 f"""
-                SELECT d.* FROM documents d
-                WHERE (
-                    d.memory_id = ?
-                    OR lower(d.path) = lower(?)
-                    OR lower(d.title) = lower(?)
-                )
+                SELECT d.* FROM document_identity_aliases i
+                JOIN documents d USING(memory_id)
+                WHERE i.identity = ? COLLATE NOCASE
                 {scope_clause}
-                ORDER BY
-                    CASE
-                        WHEN d.memory_id = ? THEN 0
-                        WHEN d.path = ? THEN 1
-                        WHEN lower(d.title) = lower(?) THEN 2
-                        ELSE 3
-                    END,
-                    length(d.path)
+                ORDER BY i.priority, length(d.path)
                 LIMIT 1
                 """,
-                (
-                    identity,
-                    identity,
-                    identity,
-                    *parameters,
-                    identity,
-                    identity,
-                    identity,
-                ),
+                (identity, *parameters),
             ).fetchone()
         return decode_document(row) if row else None
 
@@ -695,44 +787,48 @@ class MemoryIndex:
         limit: int = 3,
     ) -> list[dict[str, object]]:
         where, parameters = scope_sql(scope)
+        scope_clause = where.replace("WHERE", "AND", 1) if where else ""
         with self.connection() as connection:
             rows = connection.execute(
-                f"SELECT d.* FROM documents d {where}",
+                f"""
+                SELECT i.identity, i.memory_id, i.priority
+                FROM document_identity_aliases i
+                JOIN documents d USING(memory_id)
+                WHERE i.priority <= 3
+                {scope_clause}
+                """,
                 parameters,
             ).fetchall()
         query_text = query.casefold()
-        matches: list[tuple[int, int, dict[str, object]]] = []
+        matches: list[tuple[int, int, int, str]] = []
         for row in rows:
-            document = decode_document(row)
-            path = str(document["path"])
-            identities = {
-                str(document["memory_id"]),
-                path,
-                Path(path).stem,
-                str(document["title"]),
-            }
-            matched = [
-                (query_text.index(identity.casefold()), len(identity))
-                for identity in identities
-                if len(identity) >= 4 and identity.casefold() in query_text
-            ]
-            if matched:
-                position, matched_length = min(
-                    matched,
-                    key=lambda item: (item[0], -item[1]),
+            identity = str(row["identity"])
+            if len(identity) >= 4 and identity in query_text:
+                matches.append(
+                    (
+                        query_text.index(identity),
+                        -len(identity),
+                        int(row["priority"]),
+                        str(row["memory_id"]),
+                    )
                 )
-                matches.append((position, matched_length, document))
-        matches.sort(
-            key=lambda item: (
-                item[0],
-                -item[1],
-                str(item[2]["title"]).casefold(),
-            )
-        )
-        return [
-            document
-            for _, _, document in matches[: max(1, limit)]
-        ]
+        matches.sort(key=lambda item: item[:3])
+        memory_ids = list(
+            dict.fromkeys(match[3] for match in matches)
+        )[: max(1, limit)]
+        if not memory_ids:
+            return []
+        placeholders = ", ".join("?" for _ in memory_ids)
+        with self.connection() as connection:
+            documents = {
+                str(row["memory_id"]): decode_document(row)
+                for row in connection.execute(
+                    f"SELECT d.* FROM documents d "
+                    f"WHERE d.memory_id IN ({placeholders})",
+                    memory_ids,
+                )
+            }
+        return [documents[memory_id] for memory_id in memory_ids]
 
     def scoped_identities(self, scope: ScopeFilter) -> set[str]:
         """Return normalized document identities that are inside one scope."""
@@ -760,41 +856,6 @@ class MemoryIndex:
             )
         return identities
 
-    def all_vectors(
-        self, scope: ScopeFilter
-    ) -> list[tuple[sqlite3.Row, dict[int, float]]]:
-        cache_key = (
-            scope.source_id,
-            scope.root_scope,
-            scope.repository,
-            scope.project,
-            scope.ticket,
-            scope.status,
-            scope.path_prefix,
-        )
-        cached = self._vector_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        where, parameters = scope_sql(scope)
-        with self.connection() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT c.*, d.status, d.root_scope, d.scope_kind, d.scope_id,
-                       d.projects_json, d.repos_json, d.updated, d.review_after
-                FROM chunks c JOIN documents d USING(memory_id)
-                {where}
-                """,
-                parameters,
-            ).fetchall()
-        decoded = [
-            (row, decode_vector(row["vector_blob"]))
-            for row in rows
-        ]
-        # A published snapshot is immutable, so decoded vectors remain valid
-        # until MemoryService replaces the engine after the next refresh.
-        self._vector_cache[cache_key] = decoded
-        return decoded
-
     def vector_candidates(
         self,
         scope: ScopeFilter,
@@ -803,11 +864,11 @@ class MemoryIndex:
     ) -> tuple[list[tuple[sqlite3.Row, dict[int, float]]], str]:
         metadata = self.metadata()
         if metadata.get("ann_backend") != ANN_BACKEND:
-            return self.all_vectors(scope), "exact-fallback"
+            return self._exact_vector_candidates(scope, query_vector, limit)
         dimensions = int(metadata.get("semantic_dimensions", "0"))
-        buckets = vector_buckets(query_vector, dimensions)
-        if not buckets:
-            return self.all_vectors(scope), "exact-fallback"
+        ann_query = quantized_vector(query_vector, dimensions)
+        if not ann_query:
+            return self._exact_vector_candidates(scope, query_vector, limit)
         where, scope_parameters = scope_sql(scope)
         scope_clause = where.replace("WHERE", "AND", 1) if where else ""
         with self.connection() as connection:
@@ -819,35 +880,102 @@ class MemoryIndex:
                 ).fetchone()[0]
             )
             if total <= 2_000:
-                return self.all_vectors(scope), "exact-small-corpus"
-            match_clause, match_parameters = bucket_clause(
-                multiprobe_buckets(buckets),
-                table_alias="a",
+                candidates, _backend = self._exact_vector_candidates(
+                    scope, query_vector, limit
+                )
+                return candidates, "exact-small-corpus"
+            candidate_limit = min(
+                total,
+                self.settings.ann_candidate_limit,
+                max(2_000, math.ceil(math.sqrt(total)) * 40),
             )
-            candidate_limit = min(2_000, max(400, limit * 12))
+            ann_rows = connection.execute(
+                f"SELECT c.chunk_id, c.ann_vector FROM chunks c "
+                f"JOIN documents d USING(memory_id) {where}",
+                scope_parameters,
+            )
+            shortlist = quantized_shortlist(
+                ann_rows,
+                ann_query,
+                dimensions,
+                candidate_limit,
+                block_size=max(8192, self.settings.vector_block_size),
+            )
+            connection.execute(
+                "CREATE TEMP TABLE query_ann_candidates("
+                "chunk_id TEXT PRIMARY KEY, distance REAL NOT NULL) WITHOUT ROWID"
+            )
+            connection.executemany(
+                "INSERT INTO query_ann_candidates VALUES (?, ?)",
+                ((identity, distance) for distance, identity in shortlist),
+            )
             rows = connection.execute(
                 f"""
                 SELECT c.*, d.status, d.root_scope, d.scope_kind, d.scope_id,
-                       d.projects_json, d.repos_json, d.updated, d.review_after,
-                       count(*) AS ann_matches
-                FROM chunk_ann_buckets a
-                JOIN chunks c USING(chunk_id)
-                JOIN documents d USING(memory_id)
-                WHERE ({match_clause})
-                {scope_clause}
-                GROUP BY c.chunk_id
-                ORDER BY ann_matches DESC, c.chunk_id
-                LIMIT ?
+                       d.projects_json, d.repos_json, d.updated, d.review_after
+                FROM query_ann_candidates AS candidate
+                JOIN chunks c ON c.chunk_id = candidate.chunk_id
+                JOIN documents d ON d.memory_id = c.memory_id
+                ORDER BY candidate.distance, c.chunk_id
                 """,
-                [*match_parameters, *scope_parameters, candidate_limit],
             ).fetchall()
         minimum = min(total, 20)
         if len(rows) < minimum:
-            return self.all_vectors(scope), "exact-fallback"
+            return self._exact_vector_candidates(scope, query_vector, limit)
         return (
             [(row, decode_vector(row["vector_blob"])) for row in rows],
             ANN_BACKEND,
         )
+
+    def _exact_vector_candidates(
+        self,
+        scope: ScopeFilter,
+        query_vector: dict[int, float],
+        limit: int,
+    ) -> tuple[list[tuple[sqlite3.Row, dict[int, float]]], str]:
+        """Score compact vector blocks with fixed work and memory bounds."""
+        where, parameters = scope_sql(scope)
+        top: list[tuple[float, str, sqlite3.Row, dict[int, float]]] = []
+        scored = 0
+        started = time.monotonic()
+        target = max(1, min(limit, 2_000))
+        exhausted = False
+        with self.connection() as connection:
+            cursor = connection.execute(
+                f"""
+                SELECT c.*, d.status, d.root_scope, d.scope_kind, d.scope_id,
+                       d.projects_json, d.repos_json, d.updated, d.review_after
+                FROM chunks c JOIN documents d USING(memory_id)
+                {where}
+                """,
+                parameters,
+            )
+            while True:
+                rows = cursor.fetchmany(self.settings.vector_block_size)
+                if not rows:
+                    break
+                for row in rows:
+                    if (
+                        scored >= self.settings.vector_max_vectors
+                        or time.monotonic() - started >= self.settings.vector_max_seconds
+                    ):
+                        exhausted = True
+                        break
+                    vector = decode_vector(row["vector_blob"])
+                    score = cosine_sparse(query_vector, vector)
+                    scored += 1
+                    item = (score, str(row["chunk_id"]), row, vector)
+                    if len(top) < target:
+                        heapq.heappush(top, item)
+                    elif item[:2] > top[0][:2]:
+                        heapq.heapreplace(top, item)
+                if exhausted:
+                    break
+        candidates = [
+            (row, vector)
+            for _score, _identity, row, vector in sorted(top, reverse=True)
+        ]
+        return candidates, "exact-budget-exhausted" if exhausted else "exact-budgeted"
 
     def chunks_for_memories(
         self,
@@ -881,6 +1009,7 @@ def decode_document(row: sqlite3.Row) -> dict[str, object]:
         "projects_json",
         "repos_json",
         "tools_json",
+        "artifact_references_json",
     ):
         result[key.removesuffix("_json")] = json.loads(result.pop(key))
     return result
@@ -904,63 +1033,39 @@ def scope_sql(scope: ScopeFilter) -> tuple[str, list[str]]:
     if scope.repository:
         clauses.append(
             """
-            (
-                EXISTS (
-                    SELECT 1 FROM json_each(d.repos_json)
-                    WHERE lower(value) = lower(?)
-                )
-                OR lower(d.scope_id) = lower(?)
-                OR lower(d.path) LIKE lower(?) ESCAPE '\\'
+            EXISTS (
+                SELECT 1 FROM document_scope_aliases a
+                WHERE a.memory_id = d.memory_id
+                AND a.kind = 'repository'
+                AND a.alias = ? COLLATE NOCASE
             )
             """
         )
-        parameters.extend(
-            (
-                scope.repository,
-                scope.repository,
-                f"%/{_like_literal(scope.repository)}/%",
-            )
-        )
+        parameters.append(_normalized_alias(scope.repository))
     if scope.project:
         clauses.append(
             """
-            (
-                EXISTS (
-                    SELECT 1 FROM json_each(d.projects_json)
-                    WHERE lower(value) = lower(?)
-                )
-                OR lower(d.scope_id) = lower(?)
-                OR lower(d.path) LIKE lower(?) ESCAPE '\\'
+            EXISTS (
+                SELECT 1 FROM document_scope_aliases a
+                WHERE a.memory_id = d.memory_id
+                AND a.kind = 'project'
+                AND a.alias = ? COLLATE NOCASE
             )
             """
         )
-        parameters.extend(
-            (
-                scope.project,
-                scope.project,
-                f"%/{_like_literal(scope.project)}/%",
-            )
-        )
+        parameters.append(_normalized_alias(scope.project))
     if scope.ticket:
         clauses.append(
             """
-            (
-                EXISTS (
-                    SELECT 1 FROM json_each(d.identifiers_json)
-                    WHERE lower(value) = lower(?)
-                )
-                OR lower(d.scope_id) = lower(?)
-                OR lower(d.path) LIKE lower(?) ESCAPE '\\'
+            EXISTS (
+                SELECT 1 FROM document_scope_aliases a
+                WHERE a.memory_id = d.memory_id
+                AND a.kind = 'ticket'
+                AND a.alias = ? COLLATE NOCASE
             )
             """
         )
-        parameters.extend(
-            (
-                scope.ticket,
-                scope.ticket,
-                f"%/{_like_literal(scope.ticket)}/%",
-            )
-        )
+        parameters.append(_normalized_alias(scope.ticket))
     return (f"WHERE {' AND '.join(clauses)}" if clauses else "", parameters)
 
 

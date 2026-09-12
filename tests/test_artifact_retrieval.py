@@ -10,6 +10,7 @@ import pytest
 
 from ai_memory_mcp.artifacts.identity import artifact_id, artifact_uri
 from ai_memory_mcp.artifacts.models import (
+    ArtifactAlias,
     ArtifactBatchManifest,
     ArtifactEvent,
     ArtifactPayload,
@@ -29,12 +30,14 @@ def _raw_batch(
     external_id: str = "message-1",
     text: str = "Use the documented rotation procedure.",
     occurred_at: str = "2026-01-02T10:00:00Z",
+    entity: str = "message",
+    aliases: list[ArtifactAlias] | None = None,
 ) -> ParsedArtifactBatch:
     event = ArtifactEvent.model_validate(
         {
             "schema": "ai-memory/artifact-event@1",
             "record": "event",
-            "entity": "message",
+            "entity": entity,
             "operation": "upsert",
             "external_id": external_id,
             "source_updated_at": occurred_at,
@@ -42,6 +45,7 @@ def _raw_batch(
                 text=text,
                 occurred_at=occurred_at,
                 content_format="plain",
+                aliases=aliases or [],
             ),
         }
     )
@@ -257,11 +261,10 @@ def test_exact_artifact_uri_enforces_artifact_scope(
         "message",
         artifact_id("chat-source", "workspace", "message", "message-1"),
     )
-    with pytest.raises(KeyError, match="scope|inactive|exist"):
-        MemoryService(artifact_settings).recall(
-            reference,
-            source_label="different-source",
-        )
+    response = MemoryService(artifact_settings).recall(reference, source_label="different-source")
+    assert response.evidence == []
+    assert response.status == "no_answer"
+    assert response._execution_state.execution == "complete"
 
 
 def test_recall_rejects_mixed_markdown_and_artifact_filters(
@@ -318,6 +321,66 @@ def test_old_exact_external_identifier_can_answer(
         source_label="chat-source",
     )
     assert response.status == "answered"
+    assert response.evidence[0].reasons == ["exact identifier"]
+
+
+def test_exact_alias_identifier_short_circuits_hybrid_search(
+    artifact_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ArtifactStore(artifact_settings).apply_batch(
+        _raw_batch(
+            external_id="meeting:call:call-4",
+            text="",
+            entity="meeting",
+            aliases=[ArtifactAlias(kind="call", value="call-4")],
+        )
+    )
+
+    def fail_vector_search(*args: object, **kwargs: object) -> object:
+        raise AssertionError("Exact artifact aliases must bypass vector search.")
+
+    monkeypatch.setattr(
+        "ai_memory_mcp.artifacts.vector_index.search_artifact_vectors",
+        fail_vector_search,
+    )
+
+    response = MemoryService(artifact_settings).recall(
+        "call-4",
+        source_label="chat-source",
+        source_instance="workspace",
+        artifact_kind="meeting",
+    )
+
+    assert response.status == "answered"
+    assert response.intent == "exact"
+    assert response.evidence[0].artifact_uri is not None
+    assert response.evidence[0].artifact_uri.startswith("artifact://meeting/")
+    assert response.evidence[0].reasons == ["exact identifier"]
+
+
+def test_namespaced_external_identifier_answers_by_provider_id(
+    artifact_settings: Settings,
+) -> None:
+    ArtifactStore(artifact_settings).apply_batch(
+        _raw_batch(
+            external_id="recording:drive-item-4",
+            text="",
+            entity="recording",
+        )
+    )
+
+    response = MemoryService(artifact_settings).recall(
+        "drive-item-4",
+        source_label="chat-source",
+        source_instance="workspace",
+        artifact_kind="recording",
+    )
+
+    assert response.status == "answered"
+    assert response.intent == "exact"
+    assert response.evidence[0].artifact_uri is not None
+    assert response.evidence[0].artifact_uri.startswith("artifact://recording/")
     assert response.evidence[0].reasons == ["exact identifier"]
 
 
@@ -539,7 +602,7 @@ def test_status_and_ordered_read_include_artifact_state(
     service = MemoryService(artifact_settings)
     status = service.status()
     assert status.artifact_database.available is True
-    assert status.artifact_database.schema_version == 4
+    assert status.artifact_database.schema_version == 6
     assert status.artifact_database.artifacts == 1
 
     reference = artifact_uri(

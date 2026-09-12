@@ -75,7 +75,18 @@ def _ensure_venv(venv_root: Path, bootstrap: list[str], label: str) -> Path:
 def _initialize_artifact_store(application_python: Path, root: Path) -> None:
     # Use the installed entry point so setup verifies the same command that
     # operators and automation use after provisioning.
-    artifact_cli = venv_executable(root / ".venv", "ai-memory-artifact")
+    executable_suffix = ".exe" if application_python.suffix.casefold() == ".exe" else ""
+    scripts_directory = (
+        "Scripts"
+        if application_python.parent.name.casefold() == "scripts"
+        else "bin"
+    )
+    artifact_cli = (
+        root
+        / ".venv"
+        / scripts_directory
+        / f"ai-memory-artifact{executable_suffix}"
+    )
     _run(
         [str(artifact_cli), "init"],
         "Failed to initialize the artifact database.",

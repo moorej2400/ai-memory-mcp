@@ -5,21 +5,25 @@ import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from ai_memory_mcp.artifacts.models import (
     ArtifactBatchManifest,
     ArtifactEvent,
     ArtifactPayload,
     ParsedArtifactBatch,
 )
-from ai_memory_mcp.artifacts.schema import migrate_artifact_db
+from ai_memory_mcp.artifacts.schema import connect_artifact_db, migrate_artifact_db
 from ai_memory_mcp.artifacts.store import ArtifactStore
 from ai_memory_mcp.config import Settings
 from ai_memory_mcp.generation import (
     _cleanup_failed_generation,
+    _publish_json,
     _retire_old_generations,
     lease_current_generation,
     load_current_generation,
 )
+from ai_memory_mcp.index import MemoryIndex
 from ai_memory_mcp.service import MemoryService
 
 
@@ -87,6 +91,33 @@ def _raw_batch(batch_id: str, text: str) -> ParsedArtifactBatch:
     )
 
 
+def test_response_coverage_stays_with_the_searched_generation(tmp_path):
+    from ai_memory_mcp.server import _modern_response
+    settings = _settings(tmp_path)
+    service = MemoryService(settings)
+    assert service.sync().ok
+    ArtifactStore(settings).apply_batch(_raw_batch("new-event", "New raw evidence is available."))
+    response = service.recall("new raw evidence")
+    assert response._execution_state.coverage.artifact_semantic_lag == 1
+    scoped = service.recall("generation record", root_scope="work")
+    assert scoped._execution_state.execution == "complete"
+    assert service.sync().ok
+    assert _modern_response(response, settings).coverage.artifact_semantic_lag == 1
+
+
+def test_corrupt_immutable_segment_cannot_pass_retention_validation(tmp_path):
+    from ai_memory_mcp.artifacts.vector_index import artifact_segment_paths
+    from ai_memory_mcp.generation import _valid_generation_components
+    settings = _settings(tmp_path)
+    assert MemoryService(settings).sync().ok
+    generation = load_current_generation(settings)
+    segment = artifact_segment_paths(settings.state_dir / generation["artifact_snapshot"])[0]
+    # Corrupt only synthetic derived data. The source database stays untouched.
+    with sqlite3.connect(segment) as connection:
+        connection.execute("DROP TABLE bursts")
+    assert not _valid_generation_components(settings, generation)
+
+
 def test_sync_publishes_one_consistent_generation(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
 
@@ -117,6 +148,63 @@ def test_sync_publishes_one_consistent_generation(tmp_path: Path) -> None:
     assert status.index.generation_id == generation["generation_id"]
     assert status.artifact_vector.stale is False
     assert status.graphify.stale is False
+
+
+def test_sync_rejects_an_outdated_artifact_schema_before_indexing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = _settings(tmp_path)
+    with connect_artifact_db(settings.artifact_db) as connection:
+        connection.execute(
+            "DELETE FROM artifact_schema_migrations WHERE version = 6"
+        )
+        connection.commit()
+
+    index_called = False
+
+    def fail_if_indexed(*args, **kwargs):
+        nonlocal index_called
+        index_called = True
+        raise AssertionError("Markdown indexing must follow schema validation.")
+
+    monkeypatch.setattr("ai_memory_mcp.index.build_index", fail_if_indexed)
+    result = MemoryService(settings).sync()
+
+    assert result.ok is False
+    assert index_called is False
+    assert "ai-memory-artifact init" in result.errors[0]
+    health = json.loads(settings.generation_health_path.read_text(encoding="utf-8"))
+    assert health["last_failure"]["layer"] == "artifact-schema"
+
+
+def test_json_publication_retries_a_transient_windows_lock(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    target = tmp_path / "current-generation.json"
+    original_replace = __import__("os").replace
+    attempts = 0
+
+    def flaky_replace(source: Path, destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError("synthetic OneDrive lock")
+        original_replace(source, destination)
+
+    monkeypatch.setattr("ai_memory_mcp.generation.os.replace", flaky_replace)
+    monkeypatch.setattr(
+        "ai_memory_mcp.generation.POINTER_REPLACE_RETRY_INTERVAL_SECONDS",
+        0.0,
+    )
+
+    _publish_json(target, {"generation_id": "retry-safe"})
+
+    assert attempts == 2
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "generation_id": "retry-safe"
+    }
 
 
 def test_failed_layer_keeps_the_previous_generation(
@@ -274,6 +362,27 @@ def test_status_and_recall_report_newer_canonical_markdown(
     assert any("Canonical Markdown is newer" in item for item in recall.warnings)
 
 
+def test_warm_recall_does_not_walk_the_canonical_markdown_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    service = MemoryService(settings)
+    assert service.sync().ok is True
+    generation = load_current_generation(settings)
+    assert generation is not None
+    assert service._engine_for_generation(generation) is not None
+
+    def fail_if_reconciled(*_args, **_kwargs):
+        raise AssertionError("Warm recall must not scan canonical Markdown.")
+
+    monkeypatch.setattr(MemoryIndex, "canonical_stale", fail_if_reconciled)
+
+    response = service.recall("coordinated generation")
+
+    assert response.evidence
+
+
 def test_status_reports_corrupt_generation_components_without_raising(
     tmp_path: Path,
 ) -> None:
@@ -374,7 +483,7 @@ def test_empty_graph_is_a_valid_available_generation(tmp_path: Path) -> None:
     assert status.ok is True
 
 
-def test_recall_does_not_mix_new_artifacts_with_an_old_generation(
+def test_recall_keeps_raw_search_available_during_semantic_index_lag(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -387,8 +496,8 @@ def test_recall_does_not_mix_new_artifacts_with_an_old_generation(
     stale = service.recall("newly delivered private marker")
     stale_status = service.status()
 
-    assert all(item.evidence_class == "distilled" for item in stale.evidence)
-    assert any("newer than the active" in warning for warning in stale.warnings)
+    assert any(item.evidence_class == "raw" for item in stale.evidence)
+    assert any("semantic data is older" in warning for warning in stale.warnings)
     assert stale_status.ok is False
     assert stale_status.artifact_vector.stale is True
     assert service.sync().ok is True
@@ -494,3 +603,43 @@ def test_retention_keeps_an_older_verified_generation_when_newer_is_invalid(
         settings.state_dir / str(generations[2]["graph_snapshot"])
     ).is_file()
     assert middle_graph.exists() is False
+
+
+def test_retention_skips_a_locked_obsolete_file_without_rolling_back(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = replace(_settings(tmp_path), generation_retention_count=3)
+    service = MemoryService(settings)
+    generations: list[dict[str, object]] = []
+    for index in range(3):
+        note = settings.memory_root / "Record.md"
+        note.write_text(
+            note.read_text(encoding="utf-8") + f"\nLocked cleanup {index}.\n",
+            encoding="utf-8",
+        )
+        assert service.sync().ok is True
+        generation = load_current_generation(settings)
+        assert generation is not None
+        generations.append(generation)
+
+    locked = settings.state_dir / str(generations[0]["graph_snapshot"])
+    current_id = str(generations[-1]["generation_id"])
+    original_replace = Path.replace
+
+    def selectively_locked(path: Path, *args, **kwargs) -> None:
+        if path == locked:
+            raise PermissionError("synthetic OneDrive lock")
+        return original_replace(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "replace", selectively_locked)
+    result = _retire_old_generations(
+        replace(settings, generation_retention_count=2),
+        legacy_keep=set(),
+    )
+
+    current = load_current_generation(settings)
+    assert current is not None
+    assert current["generation_id"] == current_id
+    assert locked.is_file()
+    assert result["removal_errors"] == 1

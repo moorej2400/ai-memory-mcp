@@ -21,6 +21,11 @@ HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
 WIKILINK_RE = re.compile(r"\[\[([^]|]+)(?:\|[^]]+)?]]")
 TARGET_CHUNK_CHARS = 1800
 MAX_CHUNK_CHARS = 5000
+MAX_FTS_TERMS = 24
+MAX_FTS_GROUPS = 8
+FTS_GROUP_OVERLAP = 6
+MAX_EMBED_QUERY_CHARACTERS = 5000
+EMBED_QUERY_OVERLAP_CHARACTERS = 500
 
 
 def normalize_token(value: str) -> str:
@@ -35,14 +40,62 @@ def tokenize(value: str) -> list[str]:
     ]
 
 
-def fts_expression(query: str) -> str:
-    """Build one bounded FTS expression from quoted, normalized tokens."""
+def _quoted_term(term: str) -> str:
+    return f'"{term.replace(chr(34), chr(34) * 2)}"'
+
+
+def fts_expressions(query: str) -> list[str]:
+    """Build bounded alternative FTS groups across the complete query."""
     terms = list(dict.fromkeys(tokenize(query)))
     if not terms:
-        return '""'
-    return " OR ".join(
-        f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms[:24]
-    )
+        return ['""']
+    if len(terms) <= MAX_FTS_TERMS:
+        return [" OR ".join(_quoted_term(term) for term in terms)]
+    step = MAX_FTS_TERMS - FTS_GROUP_OVERLAP
+    starts = list(range(0, len(terms), step))
+    # Sampling window positions loses unique lexical anchors. The accepted
+    # query size bounds work; every accepted term must reach a producer.
+    groups = []
+    for start in starts:
+        window = terms[start : start + MAX_FTS_TERMS]
+        if window:
+            groups.append(" OR ".join(_quoted_term(term) for term in window))
+    return groups
+
+
+def fts_expression(query: str) -> str:
+    """Build one bounded expression that includes the final query terms."""
+    groups = fts_expressions(query)
+    if len(groups) == 1:
+        return groups[0]
+    terms = list(dict.fromkeys(tokenize(query)))
+    if len(terms) <= MAX_FTS_TERMS:
+        selected = terms
+    else:
+        selected = [
+            terms[round(index * (len(terms) - 1) / (MAX_FTS_TERMS - 1))]
+            for index in range(MAX_FTS_TERMS)
+        ]
+    return " OR ".join(_quoted_term(term) for term in selected)
+
+
+def query_windows(query: str) -> list[str]:
+    """Return overlapping semantic inputs without discarding the query tail."""
+    if len(query) <= MAX_EMBED_QUERY_CHARACTERS:
+        return [query]
+    result: list[str] = []
+    start = 0
+    while start < len(query):
+        end = min(len(query), start + MAX_EMBED_QUERY_CHARACTERS)
+        if end < len(query):
+            boundary = query.rfind(" ", start + 1, end)
+            if boundary > start:
+                end = boundary
+        result.append(query[start:end])
+        if end >= len(query):
+            break
+        start = max(start + 1, end - EMBED_QUERY_OVERLAP_CHARACTERS)
+    return result
 
 
 def query_identifiers(value: str) -> list[str]:
@@ -97,6 +150,7 @@ def parse_document(path: Path, root: Path, source_id: str = "core") -> MemoryDoc
         path=source_path,
         title=title,
         body=body,
+        artifact_references=list(dict.fromkeys(re.findall(r"artifact://[a-z][a-z0-9-]*/art_[a-z0-9]{20,80}", raw)))[:50],
         status=str(metadata.get("status") or "active"),
         root_scope=str(metadata.get("root_scope") or "work"),
         scope_kind=str(primary.get("kind") or "reference"),

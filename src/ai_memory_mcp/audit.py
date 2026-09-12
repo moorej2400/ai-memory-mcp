@@ -112,13 +112,16 @@ def append_event(
         **payload,
     }
     try:
-        with _PROCESS_LOCK:
+        deadline = time.monotonic() + settings.audit_lock_timeout_seconds
+        if not _PROCESS_LOCK.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            raise TimeoutError("The process audit lock exceeded its time limit.")
+        try:
             log_dir = settings.resolved_log_dir
             log_dir.mkdir(parents=True, exist_ok=True)
             path = log_dir / f"{stream}.jsonl"
             with file_lock(
                 log_dir / "audit.lock",
-                settings.audit_lock_timeout_seconds,
+                max(0.0, deadline - time.monotonic()),
             ):
                 _rotate_recoverably(path, settings.audit_log_max_bytes)
                 with path.open("a", encoding="utf-8", newline="\n") as handle:
@@ -132,6 +135,8 @@ def append_event(
                         + "\n"
                     )
                     handle.flush()
+        finally:
+            _PROCESS_LOCK.release()
         _LAST_ERROR = None
         return True
     except (OSError, TimeoutError, TypeError, ValueError) as exc:

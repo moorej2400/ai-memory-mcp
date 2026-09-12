@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 import ai_memory_mcp.artifacts.schema as schema_module
-from ai_memory_mcp.ann import ANN_BANDS, available as ann_available
+from ai_memory_mcp.ann import available as ann_available
+import ai_memory_mcp.artifacts.vector_index as vector_index_module
 from ai_memory_mcp.artifacts.models import (
     ArtifactBatchManifest,
     ArtifactEvent,
@@ -19,6 +20,7 @@ from ai_memory_mcp.artifacts.models import (
     ParsedArtifactBatch,
 )
 from ai_memory_mcp.artifacts.store import ArtifactStore
+from ai_memory_mcp.artifacts.identity import artifact_id
 from ai_memory_mcp.artifacts.vector_index import (
     build_artifact_vector_index,
     current_artifact_index_path,
@@ -117,7 +119,7 @@ def test_vector_index_publishes_revisioned_snapshot(
     _populate(artifact_settings)
     first = build_artifact_vector_index(artifact_settings)
     assert first.bursts == 2
-    assert first.embedded_bursts == 1
+    assert first.embedded_bursts == 2
     assert first.unchanged is False
     snapshot = Path(first.snapshot)
     assert snapshot.is_file()
@@ -159,7 +161,7 @@ def test_vector_index_reuses_unchanged_burst_embeddings(
     _populate(artifact_settings)
     first = build_artifact_vector_index(artifact_settings)
     first_call_count = len(calls)
-    assert first_call_count == first.embedded_bursts == 1
+    assert first_call_count == first.embedded_bursts == 2
 
     ArtifactStore(artifact_settings).apply_batch(
         _batch(
@@ -187,6 +189,10 @@ def test_vector_index_reuses_unchanged_burst_embeddings(
     assert second.embedded_updates == 1
     assert second.reused_bursts == first.bursts
     assert len(calls) == first_call_count + 1
+    with sqlite3.connect(second.snapshot) as connection:
+        metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+    assert metadata["publication_mode"] == "immutable-delta"
+    assert metadata["segment_fanout"] == "2"
 
 
 def test_vector_index_groups_only_dirty_parents_after_the_first_build(
@@ -218,13 +224,13 @@ def test_vector_index_groups_only_dirty_parents_after_the_first_build(
     )
     build_artifact_vector_index(artifact_settings)
     grouped_parents: list[set[str]] = []
-    original_group = vector_index.group_bursts
+    original_group = vector_index.build_representations
 
-    def capture(records):
+    def capture(records, **kwargs):
         grouped_parents.append({record.parent_artifact_id for record in records})
-        return original_group(records)
+        return original_group(records, **kwargs)
 
-    monkeypatch.setattr(vector_index, "group_bursts", capture)
+    monkeypatch.setattr(vector_index, "build_representations", capture)
     ArtifactStore(artifact_settings).apply_batch(
         _batch(
             "vector-one-parent-change",
@@ -246,8 +252,185 @@ def test_vector_index_groups_only_dirty_parents_after_the_first_build(
     assert len(grouped_parents[0]) == 1
 
 
+@pytest.mark.parametrize("position_key", [None, "ordinal", "message_index"])
+def test_immutable_deltas_match_full_rebuild_after_edit_append_and_delete(artifact_settings, position_key):
+    store = ArtifactStore(artifact_settings)
+    def message(index):
+        event = _event("message", f"record-{index}", f"Context record {index} contains unique detail.",
+                      f"2026-01-02T10:00:{index:02d}Z", parent=("conversation", "context-parent"))
+        if position_key:
+            event = event.model_copy(update={"payload": event.payload.model_copy(update={
+                "source_payload": {position_key: index},
+                "occurred_at": datetime(2026, 1, 2, tzinfo=timezone.utc),
+            })})
+        return event
+    store.apply_batch(_batch("context-initial", [
+        _event("conversation", "context-parent", "Context history", "2026-01-02T10:00:00Z"),
+        *(message(index) for index in range(20)),
+    ]))
+    first = build_artifact_vector_index(artifact_settings)
+    initial_segment = vector_index_module.artifact_segment_paths(Path(first.snapshot))[0]
+    initial_bytes = initial_segment.read_bytes()
+    edited = message(10).model_copy(update={
+        "source_updated_at": datetime(2027, 1, 1, tzinfo=timezone.utc),
+        "payload": message(10).payload.model_copy(update={"text": "A corrected detail about orchard links."}),
+    })
+    deleted = message(9).model_copy(update={
+        "operation": "delete", "payload": None,
+        "source_updated_at": datetime(2027, 1, 2, tzinfo=timezone.utc),
+    })
+    for number, event in enumerate((edited, message(20), deleted)):
+        store.apply_batch(_batch(f"context-update-{number}", [event]))
+        incremental = build_artifact_vector_index(artifact_settings)
+        full = build_artifact_vector_index(artifact_settings, force=True, publish_pointer=False)
+        with vector_index_module._connect(Path(incremental.snapshot), read_only=True) as inc, \
+                vector_index_module._connect(Path(full.snapshot), read_only=True) as rebuilt:
+            for table in ("bursts", "representation_dependencies", "representation_coverage"):
+                assert sorted(map(tuple, inc.execute(f"SELECT * FROM {table}"))) == sorted(
+                    map(tuple, rebuilt.execute(f"SELECT * FROM {table}"))
+                )
+        assert initial_segment.read_bytes() == initial_bytes
+        assert Path(incremental.snapshot).stat().st_size < initial_segment.stat().st_size
+    segments = vector_index_module.artifact_segment_paths(Path(incremental.snapshot))
+    assert len(segments) == 4
+    compacted = vector_index_module._compact_segments(artifact_settings, Path(incremental.snapshot))
+    assert len(compacted) == 1
+    store.apply_batch(_batch("context-after-compaction", [message(21)]))
+    after = build_artifact_vector_index(artifact_settings)
+    assert vector_index_module.artifact_segment_paths(Path(after.snapshot))[0] == compacted[0]
+    assert len(vector_index_module.artifact_segment_paths(Path(after.snapshot))) == 2
+    full = build_artifact_vector_index(artifact_settings, force=True, publish_pointer=False)
+    with vector_index_module._connect(Path(after.snapshot), read_only=True) as inc, \
+            vector_index_module._connect(Path(full.snapshot), read_only=True) as rebuilt:
+        assert sorted(map(tuple, inc.execute("SELECT * FROM bursts"))) == sorted(
+            map(tuple, rebuilt.execute("SELECT * FROM bursts"))
+        )
+
+
+@pytest.mark.parametrize("record_count", [100, 1000])
+def test_neighbor_lookup_does_not_scan_the_parent_history(artifact_settings, record_count):
+    from ai_memory_mcp.artifacts.schema import connect_artifact_db
+    store = ArtifactStore(artifact_settings)
+    events = [_event("conversation", "bounded-parent", "Bounded history", "2026-01-01T00:00:00Z")]
+    for index in range(record_count):
+        event = _event("message", f"bounded-{index}", "Ordered source text.", "2026-01-01T00:00:00Z",
+                       parent=("conversation", "bounded-parent"))
+        events.append(event.model_copy(update={"payload": event.payload.model_copy(update={
+            "source_payload": {"ordinal": index},
+        })}))
+    store.apply_batch(_batch("bounded-parent-batch", events))
+    anchor = artifact_id("chat-source", "workspace", "message", f"bounded-{record_count - 1}")
+    steps = 0
+    def count():
+        nonlocal steps
+        steps += 1
+        return 0
+    with connect_artifact_db(artifact_settings.artifact_db, read_only=True) as connection:
+        connection.set_progress_handler(count, 1)
+        neighbors = vector_index_module._context_neighbor_ids(connection, {anchor})
+    assert len(neighbors) == 2
+    # Include SQLite's initial schema work. A parent scan used thousands of
+    # operations even at 100 rows; indexed lookups stay below this same bound.
+    assert steps < 1000
+
+
+def test_vector_append_reads_only_bounded_neighbor_records(
+    artifact_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = _event(
+        "conversation",
+        "conversation-large",
+        "Large conversation",
+        "2026-01-02T10:00:00Z",
+    )
+    messages = [
+        _event(
+            "message",
+            f"message-{index:03d}",
+            f"Bounded history record {index} contains reusable context.",
+            f"2026-01-02T10:{index // 60:02d}:{index % 60:02d}Z",
+            parent=("conversation", "conversation-large"),
+        )
+        for index in range(100)
+    ]
+    ArtifactStore(artifact_settings).apply_batch(
+        _batch("large-conversation", [conversation, *messages])
+    )
+    build_artifact_vector_index(artifact_settings)
+
+    observed: list[tuple[int, int | None]] = []
+    original = vector_index_module.build_representations
+
+    def capture(records, *, anchor_artifact_uris=None):
+        observed.append(
+            (
+                len(records),
+                len(anchor_artifact_uris)
+                if anchor_artifact_uris is not None
+                else None,
+            )
+        )
+        return original(records, anchor_artifact_uris=anchor_artifact_uris)
+
+    monkeypatch.setattr(vector_index_module, "build_representations", capture)
+    ArtifactStore(artifact_settings).apply_batch(
+        _batch(
+            "large-conversation-append",
+            [
+                _event(
+                    "message",
+                    "message-100",
+                    "The appended violet boundary marker remains searchable.",
+                    "2026-01-02T10:01:40Z",
+                    parent=("conversation", "conversation-large"),
+                )
+            ],
+        )
+    )
+
+    build_artifact_vector_index(artifact_settings)
+
+    assert observed
+    loaded_records, rebuilt_anchors = observed[0]
+    assert loaded_records <= 5
+    assert rebuilt_anchors is not None
+    assert rebuilt_anchors <= 5
+
+
+def test_interrupted_pointer_publication_keeps_previous_snapshot(
+    artifact_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _populate(artifact_settings)
+    first = build_artifact_vector_index(artifact_settings)
+    ArtifactStore(artifact_settings).apply_batch(
+        _batch(
+            "interrupted-publication",
+            [
+                _event(
+                    "message",
+                    "message-interrupted",
+                    "This update must not replace the prior pointer after failure.",
+                    "2026-01-02T10:31:00Z",
+                    parent=("conversation", "conversation-1"),
+                )
+            ],
+        )
+    )
+
+    def fail_pointer(*_args, **_kwargs):
+        raise OSError("synthetic pointer failure")
+
+    monkeypatch.setattr(vector_index_module, "_publish_pointer", fail_pointer)
+    with pytest.raises(OSError, match="synthetic pointer failure"):
+        build_artifact_vector_index(artifact_settings)
+
+    assert current_artifact_index_path(artifact_settings) == Path(first.snapshot)
+
+
 @pytest.mark.skipif(not ann_available(), reason="NumPy ANN backend is unavailable")
-def test_artifact_backend_transition_rebuilds_all_ann_buckets(
+def test_artifact_backend_transition_rebuilds_all_ann_signatures(
     artifact_settings: Settings,
 ) -> None:
     _populate(artifact_settings)
@@ -256,7 +439,10 @@ def test_artifact_backend_transition_rebuilds_all_ann_buckets(
         connection.execute(
             "UPDATE metadata SET value = 'exact' WHERE key = 'ann_backend'"
         )
-        connection.execute("DELETE FROM burst_ann_buckets")
+        connection.commit()
+    segment = vector_index_module.artifact_segment_paths(Path(first.snapshot))[0]
+    with sqlite3.connect(segment) as connection:
+        connection.execute("UPDATE bursts SET ann_vector = X''")
         connection.commit()
     ArtifactStore(artifact_settings).apply_batch(
         _batch(
@@ -274,16 +460,19 @@ def test_artifact_backend_transition_rebuilds_all_ann_buckets(
     )
 
     second = build_artifact_vector_index(artifact_settings)
-    with sqlite3.connect(second.snapshot) as connection:
+    with vector_index_module._connect(Path(second.snapshot), read_only=True) as connection:
         vectors = int(
             connection.execute(
                 "SELECT count(*) FROM bursts WHERE vector_blob IS NOT NULL"
             ).fetchone()[0]
         )
-        buckets = int(
-            connection.execute("SELECT count(*) FROM burst_ann_buckets").fetchone()[0]
+        ann_vectors = int(
+            connection.execute(
+                "SELECT count(*) FROM bursts WHERE vector_blob IS NOT NULL "
+                "AND length(ann_vector) > 0"
+            ).fetchone()[0]
         )
-    assert buckets == vectors * ANN_BANDS
+    assert ann_vectors == vectors
 
 
 def test_vector_index_rejects_a_network_filesystem_snapshot(
@@ -311,6 +500,32 @@ def test_force_build_preserves_previous_snapshot(
     assert second.snapshot != first.snapshot
     assert Path(first.snapshot).is_file()
     assert Path(second.snapshot).is_file()
+
+
+def test_pointer_publication_retries_a_transient_file_lock(
+    artifact_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_settings.state_dir.mkdir(parents=True)
+    snapshot = artifact_settings.state_dir / "artifact-index-test.sqlite"
+    snapshot.touch()
+    real_replace = vector_index_module.os.replace
+    attempts = 0
+
+    def replace_after_transient_lock(source: Path, destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError("Synthetic transient pointer lock.")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(vector_index_module.os, "replace", replace_after_transient_lock)
+    monkeypatch.setattr(vector_index_module.time, "sleep", lambda _seconds: None)
+
+    vector_index_module._publish_pointer(artifact_settings, snapshot)
+
+    assert attempts == 2
+    assert artifact_settings.artifact_pointer_path.is_file()
 
 
 def test_failed_vector_build_leaves_no_final_looking_snapshot(
@@ -440,8 +655,8 @@ def test_vector_query_does_not_return_a_burst_across_date_boundaries(
         limit=10,
     )
 
-    assert before_end.hits == []
-    assert after_start.hits == []
+    assert before_end.hits
+    assert after_start.hits
     assert fully_contained.hits
 
 
@@ -536,6 +751,194 @@ def test_sync_preserves_an_exact_external_id_raw_match(
     assert after.status == "answered"
     assert after.evidence[0].evidence_class == "raw"
     assert after.evidence[0].reasons == ["exact identifier"]
+
+
+def test_timestamp_free_cue_is_indexed_by_source_order(
+    artifact_settings: Settings,
+) -> None:
+    conversation = _event(
+        "meeting", "meeting-order", "Order review", "2026-01-02T10:00:00Z"
+    )
+    transcript = _event(
+        "transcript",
+        "transcript-order",
+        "",
+        "2026-01-02T10:00:00Z",
+        parent=("meeting", "meeting-order"),
+    )
+    cue = ArtifactEvent.model_validate(
+        {
+            "schema": "ai-memory/artifact-event@1",
+            "record": "event",
+            "entity": "transcript-cue",
+            "operation": "upsert",
+            "external_id": "cue-without-time",
+            "parent": {
+                "entity": "transcript",
+                "external_id": "transcript-order",
+            },
+            "source_sequence": 7,
+            "payload": {
+                "text": "The timestamp-free orchid marker remains searchable.",
+                "content_format": "plain",
+            },
+        }
+    )
+    ArtifactStore(artifact_settings).apply_batch(
+        _batch("timestamp-free-cue", [conversation, transcript, cue])
+    )
+
+    built = build_artifact_vector_index(artifact_settings)
+    result = search_artifact_vectors(
+        artifact_settings,
+        "orchid marker",
+        ArtifactScope(entities=("transcript-cue",)),
+        10,
+    )
+
+    assert built.missing_absolute_time == 1
+    assert result.hits[0].artifact_id == artifact_id(
+        "chat-source", "workspace", "transcript-cue", "cue-without-time"
+    )
+    assert result.hits[0].occurred_at is None
+
+
+def test_long_message_tail_keeps_offsets_and_winning_text(
+    artifact_settings: Settings,
+) -> None:
+    tail = "The unique zircon-tail-marker closes the record."
+    ArtifactStore(artifact_settings).apply_batch(
+        _batch(
+            "long-message-tail",
+            [
+                _event(
+                    "conversation",
+                    "conversation-long",
+                    "Long record",
+                    "2026-01-02T10:00:00Z",
+                ),
+                _event(
+                    "message",
+                    "message-long",
+                    ("Neutral prefix content. " * 400) + tail,
+                    "2026-01-02T10:01:00Z",
+                    parent=("conversation", "conversation-long"),
+                ),
+            ],
+        )
+    )
+    build_artifact_vector_index(artifact_settings)
+
+    result = search_artifact_vectors(
+        artifact_settings,
+        "zircon tail marker",
+        ArtifactScope(entities=("message",)),
+        10,
+    )
+
+    assert tail in result.hits[0].text
+    assert result.hits[0].segment_start is not None
+    assert result.hits[0].segment_start > 0
+
+
+def test_short_reply_uses_cross_speaker_context_but_cites_reply(
+    artifact_settings: Settings,
+) -> None:
+    first = _event(
+        "conversation",
+        "conversation-fruit",
+        "Fruit",
+        "2026-01-02T10:00:00Z",
+    )
+    question = _event(
+        "message",
+        "fruit-question",
+        "Where can I buy apples?",
+        "2026-01-02T10:01:00Z",
+        parent=("conversation", "conversation-fruit"),
+    )
+    reply = ArtifactEvent.model_validate(
+        {
+            "schema": "ai-memory/artifact-event@1",
+            "record": "event",
+            "entity": "message",
+            "operation": "upsert",
+            "external_id": "fruit-reply",
+            "parent": {
+                "entity": "conversation",
+                "external_id": "conversation-fruit",
+            },
+            "source_updated_at": "2026-01-02T10:02:00Z",
+            "payload": {
+                "text": "Here is the link to the fruit you like: https://fruit.example",
+                "occurred_at": "2026-01-02T10:02:00Z",
+                "author": {"id": "actor-b", "name": "Actor B"},
+                "links": [
+                    {
+                        "relation": "reply-to",
+                        "target": {
+                            "entity": "message",
+                            "external_id": "fruit-question",
+                        },
+                    }
+                ],
+            },
+        }
+    )
+    ArtifactStore(artifact_settings).apply_batch(
+        _batch("reply-context", [first, question, reply])
+    )
+    build_artifact_vector_index(artifact_settings)
+
+    result = search_artifact_vectors(
+        artifact_settings,
+        "link to buy apples",
+        ArtifactScope(entities=("message",)),
+        10,
+    )
+    reply_id = artifact_id(
+        "chat-source", "workspace", "message", "fruit-reply"
+    )
+
+    assert any(hit.artifact_id == reply_id for hit in result.hits)
+    reply_hit = next(hit for hit in result.hits if hit.artifact_id == reply_id)
+    assert "fruit you like" in reply_hit.text
+    assert "Where can I buy apples" not in reply_hit.text
+
+
+@pytest.mark.parametrize("record_count", [100, 10_000])
+def test_ann_hydration_reads_selected_ids_without_scanning_segments(record_count):
+    # Reproduce the production UNION and tombstone shape without embeddings.
+    # VM work must stay bounded as the unselected population grows.
+    with sqlite3.connect(":memory:") as connection:
+        connection.row_factory = sqlite3.Row
+        for number in range(2):
+            connection.execute(f"ATTACH ':memory:' AS s{number}")
+            connection.execute(f"CREATE TABLE s{number}.bursts(burst_id TEXT PRIMARY KEY, anchor_artifact_uri TEXT, text_content TEXT)")
+            connection.execute(f"CREATE TABLE s{number}.updated_anchors(artifact_uri TEXT PRIMARY KEY)")
+        connection.executemany(
+            "INSERT INTO s0.bursts VALUES (?, ?, ?)",
+            ((f"id-{n}", f"anchor-{n}", "original") for n in range(record_count)),
+        )
+        connection.execute("INSERT INTO s1.updated_anchors VALUES ('anchor-0')")
+        connection.execute("INSERT INTO s1.bursts VALUES ('id-0', 'anchor-0', 'updated')")
+        connection.execute(
+            "CREATE TEMP VIEW bursts AS SELECT r.* FROM s0.bursts r "
+            "WHERE NOT EXISTS (SELECT 1 FROM s1.updated_anchors u WHERE u.artifact_uri=r.anchor_artifact_uri) "
+            "UNION ALL SELECT * FROM s1.bursts"
+        )
+        connection.execute("CREATE TEMP TABLE query_ann_candidates(burst_id TEXT PRIMARY KEY, distance REAL) WITHOUT ROWID")
+        connection.executemany("INSERT INTO query_ann_candidates VALUES (?, 0)", [("id-0",), ("id-1",)])
+        operations = 0
+        def progress():
+            nonlocal operations
+            operations += 1
+            return 0
+        connection.set_progress_handler(progress, 1)
+        rows = vector_index_module._fetch_ann_candidates(connection)
+        connection.set_progress_handler(None, 0)
+    assert {row["burst_id"]: row["text_content"] for row in rows} == {"id-0": "updated", "id-1": "original"}
+    assert operations < 200
 
 
 def test_sync_does_not_publish_a_partial_generation(

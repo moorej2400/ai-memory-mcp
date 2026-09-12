@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ai_memory_mcp.config import Settings
-from ai_memory_mcp.index import MemoryIndex, build_index
+from ai_memory_mcp.index import MemoryIndex, _eligible_markdown, build_index
 from ai_memory_mcp.text import parse_document, semantic_vector
 
 
@@ -96,6 +96,24 @@ def test_index_excludes_internal_data_markdown(tmp_path: Path) -> None:
 
     assert result["documents"] == 0
     assert result["parse_errors"] == []
+
+
+def test_markdown_discovery_prunes_excluded_directories(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    allowed = vault / "Projects" / "Allowed.md"
+    excluded = [
+        vault / ".hidden" / "Hidden.md",
+        vault / "Restricted" / "Restricted.md",
+        vault / ".trash" / "Trash.md",
+        vault / "Projects" / ".Hidden.md",
+    ]
+    allowed.parent.mkdir(parents=True)
+    allowed.write_text("# Allowed\n", encoding="utf-8")
+    for path in excluded:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Excluded\n", encoding="utf-8")
+
+    assert _eligible_markdown(vault) == [allowed]
 
 
 def test_semantic_vector_is_deterministic() -> None:

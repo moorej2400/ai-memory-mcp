@@ -152,14 +152,17 @@ For recall requests:
 2. Call `memory_recall` first with source, domain, repository, ticket, project, status, or path scope when known.
 3. Inspect the returned source ID, Markdown path, status, freshness, and provenance.
 4. Prefer an active canonical memory note over legacy session or vault results.
-5. Treat `no_answer` evidence as unverified leads. Read the cited Markdown before you use a lead, and state when no lead survived verification.
-6. Search canonical Markdown directly when the facade is unavailable, stale, ambiguous, or missing expected results.
-7. State when an answer came only from legacy, stale, or unverified memory.
+5. Check `execution` before you interpret `result_kind` in response version 2.
+6. Treat ranked evidence as candidates. Read each cited source before you use its content.
+7. If execution is partial or failed, report its reason codes and available coverage.
+8. Search canonical Markdown directly when the facade is unavailable, stale, ambiguous, or missing expected results.
+9. State when an answer came only from legacy, stale, or unverified memory.
 
 Do not treat a Graphify node as authority for a write target until the canonical Markdown exists and has been inspected.
 
-Raw artifact evidence is a lead unless recall reports an exact match.
 Use `memory_artifact_read` to inspect ordered context from an `artifact://` citation.
+Use `supporting_artifact_uris` to inspect source passages for a distilled memory.
+Do not claim that recall verified people, dates, decisions, or exclusions in a natural-language sentence.
 
 ## Distill Raw Artifacts
 
