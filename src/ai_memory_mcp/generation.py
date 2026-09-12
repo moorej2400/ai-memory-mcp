@@ -22,6 +22,8 @@ _PROCESS_LEASE_LOCK = threading.RLock()
 _PROCESS_LEASES: dict[str, tuple[Path, int]] = {}
 POINTER_REPLACE_RETRY_SECONDS = 2.0
 POINTER_REPLACE_RETRY_INTERVAL_SECONDS = 0.05
+RETENTION_ARCHIVE_RETRY_SECONDS = 2.0
+RETENTION_ARCHIVE_RETRY_INTERVAL_SECONDS = 0.05
 
 
 def _utc_now() -> str:
@@ -143,6 +145,44 @@ def _publish_json_no_overwrite(path: Path, payload: dict[str, Any]) -> None:
 def _pid_is_running(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        # Signal zero is CTRL_C_EVENT on Windows. Query the process handle so a
+        # lease check cannot interrupt this process or its console group.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        )
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        process_query_limited_information = 0x1000
+        still_active = 259
+        handle = kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            pid,
+        )
+        if not handle:
+            # Access denied confirms that the process exists under another owner.
+            return ctypes.get_last_error() == 5
+        try:
+            exit_code = wintypes.DWORD()
+            return bool(
+                kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+                and exit_code.value == still_active
+            )
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -180,6 +220,15 @@ def _active_generation_leases(settings: Settings) -> set[str]:
         except OSError:
             pass
     return active
+
+
+def _generation_lease_owner() -> str:
+    owner = os.getenv("AI_MEMORY_GENERATION_LEASE_OWNER", "")
+    if len(owner) == 32 and all(
+        character in "0123456789abcdef" for character in owner
+    ):
+        return owner
+    return str(os.getpid())
 
 
 @contextmanager
@@ -221,8 +270,9 @@ def lease_current_generation(
                                 count + 1,
                             )
                         else:
+                            lease_owner = _generation_lease_owner()
                             lease_path = settings.state_dir / (
-                                f".generation-lease-{generation_id}-{os.getpid()}-"
+                                f".generation-lease-{generation_id}-{lease_owner}-"
                                 f"{uuid.uuid4().hex}.json"
                             )
                             with lease_path.open(
@@ -234,6 +284,7 @@ def lease_current_generation(
                                     {
                                         "generation_id": generation_id,
                                         "pid": os.getpid(),
+                                        "owner": lease_owner,
                                         "created_at": _utc_now(),
                                     },
                                     stream,
@@ -483,6 +534,7 @@ def _retire_old_generations(
     removed = 0
     removed_bytes = 0
     removal_errors = 0
+    archive = settings.state_dir / "retired-generations"
     candidates: list[Path] = []
     for _, manifest_path, manifest in manifests:
         candidates.append(manifest_path)
@@ -490,17 +542,45 @@ def _retire_old_generations(
             component = _state_child(settings, manifest.get(key))
             if component is not None:
                 candidates.append(component)
+    # An earlier cleanup can archive a manifest before Windows releases one of
+    # its components. The archived manifest keeps that component discoverable.
+    if archive.is_dir():
+        for archived_manifest in archive.glob("*.json"):
+            manifest = _read_json(archived_manifest)
+            if not manifest or manifest.get("schema") != GENERATION_SCHEMA:
+                continue
+            for key in ("markdown_snapshot", "artifact_snapshot", "graph_snapshot"):
+                component = _state_child(settings, manifest.get(key))
+                if component is not None:
+                    candidates.append(component)
     candidates.extend(legacy_candidates or set())
-    for path in sorted(set(candidates), key=lambda item: item.name):
+    for path in sorted(
+        set(candidates),
+        key=lambda item: (item.name.startswith("generation-"), item.name),
+    ):
         if not path.is_file() or path.resolve() in keep:
             continue
         try:
             byte_count = path.stat().st_size
             # Cleanup is best-effort after generation validation. A transient lock
             # must not roll back to a generation whose files may already be pruned.
-            archive = settings.state_dir / "retired-generations"
             archive.mkdir(exist_ok=True)
-            path.replace(archive / path.name)
+            deadline = time.monotonic() + RETENTION_ARCHIVE_RETRY_SECONDS
+            while True:
+                destination = archive / path.name
+                if destination.exists():
+                    destination = archive / (
+                        f"{path.stem}-{uuid.uuid4().hex}{path.suffix}"
+                    )
+                try:
+                    path.replace(destination)
+                    break
+                except FileNotFoundError:
+                    raise
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(RETENTION_ARCHIVE_RETRY_INTERVAL_SECONDS)
         except FileNotFoundError:
             continue
         except OSError:

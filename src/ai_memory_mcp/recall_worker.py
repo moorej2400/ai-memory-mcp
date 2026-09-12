@@ -5,6 +5,7 @@ import atexit
 import asyncio
 import concurrent.futures
 import json
+import os
 import queue
 import struct
 import subprocess
@@ -21,12 +22,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .audit import append_event
 from .config import MemorySource, Settings
+from .embedding import preload_embedding_runtime
 from .models import RecallExecutionState, RecallResponse
 from .service import MemoryService
 
 
 _MAX_WORKER_RESULT_BYTES = 16 * 1024 * 1024
 _MAX_WORKER_REQUEST_BYTES = 1024 * 1024
+_WORKER_READY = b"ai-memory-worker-ready"
 _PROCESS_STOP_GRACE_SECONDS = 1.0
 _TIMEOUT_AUDIT_LOCK_SECONDS = 0.1
 
@@ -157,9 +160,84 @@ def _deserialize_settings(payload: dict[str, Any]) -> Settings:
     return Settings(**values)
 
 
+def _terminate_windows_process_tree(root_pid: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    children: dict[int, list[int]] = {}
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    invalid_handle = ctypes.c_void_p(-1).value
+    if snapshot and snapshot != invalid_handle:
+        try:
+            entry = ProcessEntry()
+            entry.dwSize = ctypes.sizeof(entry)
+            found = bool(kernel32.Process32FirstW(snapshot, ctypes.byref(entry)))
+            while found:
+                children.setdefault(int(entry.th32ParentProcessID), []).append(
+                    int(entry.th32ProcessID)
+                )
+                found = bool(kernel32.Process32NextW(snapshot, ctypes.byref(entry)))
+        finally:
+            kernel32.CloseHandle(snapshot)
+
+    process_ids = [root_pid]
+    for process_id in process_ids:
+        process_ids.extend(children.get(process_id, ()))
+
+    # The virtual-environment launcher can wait for its Python child. Terminate
+    # descendants first and use native handles to keep cancellation bounded.
+    handles = []
+    try:
+        for process_id in reversed(process_ids):
+            handle = kernel32.OpenProcess(0x00100001, False, process_id)
+            if handle:
+                handles.append(handle)
+                kernel32.TerminateProcess(handle, 1)
+        deadline = time.monotonic() + _PROCESS_STOP_GRACE_SECONDS
+        for handle in handles:
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            kernel32.WaitForSingleObject(handle, remaining_ms)
+    finally:
+        for handle in handles:
+            kernel32.CloseHandle(handle)
+
+
 def _stop_subprocess(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is None:
-        process.terminate()
+        if os.name == "nt":
+            _terminate_windows_process_tree(process.pid)
+        else:
+            process.terminate()
         try:
             process.wait(timeout=_PROCESS_STOP_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
@@ -210,7 +288,9 @@ def _write_frame(stream: Any, payload: bytes) -> None:
 @dataclass(slots=True)
 class _WarmWorker:
     process: subprocess.Popen[bytes]
+    lease_owner: str = ""
     request_count: int = 0
+    ready_frame_pending: bool = False
 
 
 class _WorkerPool:
@@ -233,17 +313,57 @@ class _WorkerPool:
 
     @staticmethod
     def _spawn() -> _WarmWorker:
+        # Use a stable owner because the Windows launcher PID can differ from the
+        # Python PID that writes and holds the generation lease.
+        lease_owner = uuid.uuid4().hex
+        environment = os.environ.copy()
+        environment["AI_MEMORY_GENERATION_LEASE_OWNER"] = lease_owner
         process = subprocess.Popen(
             [sys.executable, "-m", "ai_memory_mcp.recall_worker", "--pool-child"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            env=environment,
         )
-        return _WarmWorker(process=process)
+        return _WarmWorker(
+            process=process,
+            lease_owner=lease_owner,
+            ready_frame_pending=True,
+        )
+
+    @staticmethod
+    def _await_ready(worker: _WarmWorker, deadline: float) -> None:
+        if not worker.ready_frame_pending:
+            return
+        if worker.process.stdout is None:
+            raise WorkerExecutionFailed("The memory recall worker has no result stream.")
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(_read_frame, worker.process.stdout)
+        try:
+            remaining = max(0.0, deadline - time.monotonic())
+            ready = future.result(timeout=remaining)
+            if ready != _WORKER_READY:
+                raise WorkerExecutionFailed(
+                    "The memory recall worker returned an invalid startup frame."
+                )
+            worker.ready_frame_pending = False
+        except concurrent.futures.TimeoutError as exc:
+            _stop_subprocess(worker.process)
+            raise WorkerDeadlineExceeded(worker.process.pid) from exc
+        except (EOFError, OSError, ValueError, WorkerExecutionFailed) as exc:
+            _stop_subprocess(worker.process)
+            raise WorkerExecutionFailed(
+                "The memory recall worker did not finish startup."
+            ) from exc
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
 
     def _replace(self, worker: _WarmWorker) -> _WarmWorker:
         _stop_subprocess(worker.process)
-        _archive_worker_generation_leases(self.settings, worker.process.pid)
+        _archive_worker_generation_leases(
+            self.settings,
+            worker.lease_owner or str(worker.process.pid),
+        )
         return self._spawn()
 
     def request(
@@ -303,6 +423,7 @@ class _WorkerPool:
                 worker = self._replace(worker)
                 if timing is not None:
                     timing["replacement"] = True
+            self._await_ready(worker, deadline)
             try:
                 worker_started = time.monotonic()
                 executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -372,7 +493,10 @@ class _WorkerPool:
             if worker is not None:
                 if self.closed:
                     _stop_subprocess(worker.process)
-                    _archive_worker_generation_leases(self.settings, worker.process.pid)
+                    _archive_worker_generation_leases(
+                        self.settings,
+                        worker.lease_owner or str(worker.process.pid),
+                    )
                 else:
                     self.available.put(worker)
             if not capacity_reserved:
@@ -390,7 +514,10 @@ class _WorkerPool:
                 except queue.Empty:
                     break
                 _stop_subprocess(worker.process)
-                _archive_worker_generation_leases(self.settings, worker.process.pid)
+                _archive_worker_generation_leases(
+                    self.settings,
+                    worker.lease_owner or str(worker.process.pid),
+                )
 
 
 _POOLS: dict[str, _WorkerPool] = {}
@@ -413,6 +540,19 @@ def _close_pools() -> None:
         _POOLS.clear()
     for pool in pools:
         pool.close()
+
+
+def warm_recall_workers(settings: Settings) -> None:
+    pool = _pool_for(settings)
+    workers = [pool.available.get_nowait() for _ in range(settings.recall_worker_count)]
+    deadline = time.monotonic() + settings.recall_timeout_seconds
+    try:
+        # Complete native imports before the MCP server accepts timed requests.
+        for worker in workers:
+            pool._await_ready(worker, deadline)
+    finally:
+        for worker in workers:
+            pool.available.put(worker)
 
 
 atexit.register(_close_pools)
@@ -469,6 +609,8 @@ def _run_recall_subprocess(
 def _pool_child_main() -> int:
     service: MemoryService | None = None
     serialized_settings = ""
+    preload_embedding_runtime()
+    _write_frame(sys.stdout.buffer, _WORKER_READY)
     while True:
         try:
             raw = _read_frame(sys.stdin.buffer, _MAX_WORKER_REQUEST_BYTES)
@@ -504,12 +646,15 @@ def _pool_child_main() -> int:
 
 def _archive_worker_generation_leases(
     settings: Settings,
-    worker_pid: int,
+    worker_owner: str | int,
 ) -> int:
+    owner = str(worker_owner)
+    if not owner.isascii() or not owner.isalnum():
+        raise ValueError("The worker lease owner is invalid.")
     archive = settings.state_dir / "retired-generation-leases"
     moved = 0
     for lease in settings.state_dir.glob(
-        f".generation-lease-*-{worker_pid}-*.json"
+        f".generation-lease-*-{owner}-*.json"
     ):
         archive.mkdir(parents=True, exist_ok=True)
         destination = archive / lease.name

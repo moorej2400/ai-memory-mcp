@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from copy import deepcopy
@@ -20,6 +22,7 @@ from ai_memory_mcp.ann import tie_aware_candidate_recall_at_k
 from ai_memory_mcp.artifacts.bursts import MAX_CONTEXT_CHARACTERS, build_representations
 from ai_memory_mcp.artifacts.models import ArtifactBurstRecord, ArtifactSearchHit
 from ai_memory_mcp.models import EvidencePacket, SearchHit
+from ai_memory_mcp.generation import _pid_is_running
 from ai_memory_mcp.recall_worker import (
     _close_pools, _pool_for, _WarmWorker, _stop_subprocess,
     recall_in_worker_async, WorkerCancelled, WorkerDeadlineExceeded,
@@ -218,9 +221,23 @@ def test_production_pool_stop_releases_the_sqlite_snapshot_and_lease(benchmark_s
         "MemoryService._recall = stuck",
         "_pool_child_main()",
     ])
-    process = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    pool.available.put(_WarmWorker(process))
+    lease_owner = uuid.uuid4().hex
+    environment = os.environ.copy()
+    environment["AI_MEMORY_GENERATION_LEASE_OWNER"] = lease_owner
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=environment,
+    )
+    pool.available.put(
+        _WarmWorker(
+            process,
+            lease_owner=lease_owner,
+            ready_frame_pending=True,
+        )
+    )
     from ai_memory_mcp.recall_worker import RecallWorkerEnvelope, _serialize_settings
     payload = RecallWorkerEnvelope(settings=_serialize_settings(settings),
                                    arguments={"query": "release snapshot"}).model_dump_json().encode()
@@ -232,15 +249,27 @@ def test_production_pool_stop_releases_the_sqlite_snapshot_and_lease(benchmark_s
             while not marker.exists() and time.monotonic() < deadline:
                 time.sleep(.02)
             assert marker.exists()
-            leases = list(settings.state_dir.glob(f".generation-lease-*-{process.pid}-*.json"))
+            leases = list(
+                settings.state_dir.glob(
+                    f".generation-lease-*-{lease_owner}-*.json"
+                )
+            )
             assert leases
+            worker_pid = int(json.loads(leases[0].read_text())["pid"])
             if cancel:
                 event.set()
             with pytest.raises(WorkerCancelled if cancel else WorkerDeadlineExceeded):
                 future.result(timeout=4)
         assert process.poll() is not None
-        assert not list(settings.state_dir.glob(f".generation-lease-*-{process.pid}-*.json"))
-        assert list((settings.state_dir / "retired-generation-leases").glob(f"*-{process.pid}-*.json"))
+        assert not _pid_is_running(worker_pid)
+        assert not list(
+            settings.state_dir.glob(f".generation-lease-*-{lease_owner}-*.json")
+        )
+        assert list(
+            (settings.state_dir / "retired-generation-leases").glob(
+                f"*-{lease_owner}-*.json"
+            )
+        )
         with sqlite3.connect(settings.artifact_db, timeout=.2) as connection:
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             connection.execute("BEGIN EXCLUSIVE")
@@ -282,6 +311,33 @@ def test_server_background_reconciliation_detects_edits(benchmark_settings, tmp_
                 await asyncio.sleep(.05)
             assert marker["stale"] is True
     asyncio.run(run())
+
+
+def test_server_preloads_embedding_runtime_before_reconciliation(
+    benchmark_settings,
+    monkeypatch,
+):
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        "ai_memory_mcp.server.preload_embedding_runtime",
+        lambda: events.append("preload"),
+    )
+    monkeypatch.setattr(
+        "ai_memory_mcp.server.reconcile_markdown",
+        lambda _settings: events.append("reconcile"),
+    )
+    server = create_server(benchmark_settings)
+
+    async def run():
+        async with server._mcp_server.lifespan(server._mcp_server):
+            deadline = time.monotonic() + 1
+            while "reconcile" not in events and time.monotonic() < deadline:
+                await asyncio.sleep(.01)
+
+    asyncio.run(run())
+
+    assert events[:2] == ["preload", "reconcile"]
 
 
 def test_audit_process_lock_obeys_the_timeout_budget(benchmark_settings):

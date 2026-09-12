@@ -150,6 +150,20 @@ def test_sync_publishes_one_consistent_generation(tmp_path: Path) -> None:
     assert status.graphify.stale is False
 
 
+def test_status_releases_the_artifact_snapshot_file(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    service = MemoryService(settings)
+    assert service.sync().ok is True
+    generation = load_current_generation(settings)
+    assert generation is not None
+    snapshot = settings.state_dir / str(generation["artifact_snapshot"])
+    moved = snapshot.with_name(f"moved-{snapshot.name}")
+
+    assert service.status().artifact_vector.available is True
+    snapshot.replace(moved)
+    moved.replace(snapshot)
+
+
 def test_sync_rejects_an_outdated_artifact_schema_before_indexing(
     tmp_path: Path,
     monkeypatch,
@@ -633,6 +647,10 @@ def test_retention_skips_a_locked_obsolete_file_without_rolling_back(
         return original_replace(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "replace", selectively_locked)
+    monkeypatch.setattr(
+        "ai_memory_mcp.generation.RETENTION_ARCHIVE_RETRY_SECONDS",
+        0.0,
+    )
     result = _retire_old_generations(
         replace(settings, generation_retention_count=2),
         legacy_keep=set(),
@@ -643,3 +661,59 @@ def test_retention_skips_a_locked_obsolete_file_without_rolling_back(
     assert current["generation_id"] == current_id
     assert locked.is_file()
     assert result["removal_errors"] == 1
+
+    monkeypatch.setattr(Path, "replace", original_replace)
+    retry = _retire_old_generations(
+        replace(settings, generation_retention_count=2),
+        legacy_keep=set(),
+    )
+
+    assert retry["removal_errors"] == 0
+    assert locked.exists() is False
+    assert list((settings.state_dir / "retired-generations").glob(locked.name))
+
+
+def test_retention_retries_a_transient_archive_lock(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = replace(_settings(tmp_path), generation_retention_count=3)
+    service = MemoryService(settings)
+    generations: list[dict[str, object]] = []
+    for index in range(3):
+        note = settings.memory_root / "Record.md"
+        note.write_text(
+            note.read_text(encoding="utf-8") + f"\nRetry cleanup {index}.\n",
+            encoding="utf-8",
+        )
+        assert service.sync().ok is True
+        generation = load_current_generation(settings)
+        assert generation is not None
+        generations.append(generation)
+
+    locked = settings.state_dir / str(generations[0]["graph_snapshot"])
+    original_replace = Path.replace
+    attempts = 0
+
+    def transient_lock(path: Path, *args, **kwargs):
+        nonlocal attempts
+        if path == locked and attempts < 2:
+            attempts += 1
+            raise PermissionError("synthetic transient lock")
+        if path == locked:
+            attempts += 1
+        return original_replace(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "replace", transient_lock)
+    monkeypatch.setattr(
+        "ai_memory_mcp.generation.RETENTION_ARCHIVE_RETRY_INTERVAL_SECONDS",
+        0.0,
+    )
+    result = _retire_old_generations(
+        replace(settings, generation_retention_count=2),
+        legacy_keep=set(),
+    )
+
+    assert attempts == 3
+    assert result["removal_errors"] == 0
+    assert locked.exists() is False

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import math
 from typing import Protocol
 
@@ -34,6 +35,16 @@ class HashedProvider:
 
 
 DEFAULT_MODEL2VEC_MODEL = "minishlab/potion-base-8M"
+
+
+def preload_embedding_runtime() -> None:
+    try:
+        # Every provider can use NumPy through the vector indexes. On Windows,
+        # its first import can stall after a background thread starts.
+        importlib.import_module("numpy")
+    except Exception:
+        # The indexes and provider resolver retain their non-NumPy fallbacks.
+        pass
 
 
 class Model2VecProvider:

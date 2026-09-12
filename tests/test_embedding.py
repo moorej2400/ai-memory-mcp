@@ -16,6 +16,7 @@ from ai_memory_mcp.ann import (
 from ai_memory_mcp.embedding import (
     EmbeddingUnavailable,
     HashedProvider,
+    preload_embedding_runtime,
     resolve_provider,
 )
 from ai_memory_mcp.index import build_index
@@ -236,6 +237,20 @@ def test_auto_prefers_model2vec_when_loadable(monkeypatch) -> None:
     )
     assert resolve_provider("auto", dimensions=64).name == "model2vec"
     assert resolve_provider("model2vec").name == "model2vec"
+
+
+def test_preload_imports_numpy_and_preserves_optional_fallback(monkeypatch) -> None:
+    imported: list[str] = []
+
+    def unavailable(name: str):
+        imported.append(name)
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr("ai_memory_mcp.embedding.importlib.import_module", unavailable)
+
+    preload_embedding_runtime()
+
+    assert imported == ["numpy"]
 
 
 def test_engine_disables_semantic_when_provider_unavailable(

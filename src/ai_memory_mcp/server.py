@@ -15,6 +15,7 @@ from pydantic import Field
 
 from .artifacts.models import ArtifactReadResponse
 from .config import Settings
+from .embedding import preload_embedding_runtime
 from .models import (
     RecallCoverage,
     RecallResponse,
@@ -28,6 +29,7 @@ from .recall_worker import (
     WorkerExecutionFailed,
     WorkerQueueFull,
     recall_in_worker_async,
+    warm_recall_workers,
 )
 from .service import MemoryService
 from .freshness import RECONCILIATION_INTERVAL_SECONDS, reconcile_markdown
@@ -80,6 +82,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         raise ValueError(
             "AI Memory MCP requires a loopback host until authentication is available."
         )
+    preload_embedding_runtime()
     service = MemoryService(settings)
 
     @asynccontextmanager
@@ -384,7 +387,13 @@ def main() -> None:
         default="stdio",
     )
     args = parser.parse_args()
-    create_server().run(transport=args.transport)
+    settings = Settings.from_env()
+    server = create_server(settings)
+    warm_recall_workers(settings)
+    # Warm workers can answer immediately. Publish freshness before the
+    # transport accepts the first request.
+    reconcile_markdown(settings)
+    server.run(transport=args.transport)
 
 
 if __name__ == "__main__":

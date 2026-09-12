@@ -19,6 +19,7 @@ from .artifacts.identity import parse_artifact_uri
 from .artifacts.context import active_ancestor_predicate
 from .artifacts.models import ArtifactReadResponse, ArtifactScope
 from .artifacts.schema import (
+    ClosingSQLiteConnection,
     artifact_database_status,
     connect_artifact_db,
     require_current_artifact_schema,
@@ -488,7 +489,6 @@ class MemoryService:
                 coverage.artifact_lexical_available = pinned.artifact_search is not None
                 if pinned.artifact_vector_path is not None:
                     try:
-                        from .artifacts.schema import ClosingSQLiteConnection
                         with sqlite3.connect(pinned.artifact_vector_path.as_uri() + "?mode=ro", uri=True,
                                              factory=ClosingSQLiteConnection) as connection:
                             metadata = dict(connection.execute("SELECT key, value FROM metadata"))
@@ -1400,9 +1400,12 @@ class MemoryService:
         )
         if artifact_vector_path is not None:
             try:
+                # sqlite3.Connection.__exit__ does not close its file handle;
+                # Windows retention then cannot archive an obsolete snapshot.
                 with sqlite3.connect(
                     f"file:{artifact_vector_path.resolve().as_posix()}?mode=ro",
                     uri=True,
+                    factory=ClosingSQLiteConnection,
                 ) as connection:
                     integrity = str(
                         connection.execute("PRAGMA quick_check").fetchone()[0]
