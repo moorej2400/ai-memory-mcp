@@ -4,6 +4,7 @@ import hashlib
 import atexit
 import asyncio
 import concurrent.futures
+import contextvars
 import json
 import queue
 import struct
@@ -23,11 +24,13 @@ from .audit import append_event
 from .config import MemorySource, Settings
 from .models import RecallExecutionState, RecallResponse
 from .service import MemoryService
+from .query_log import QueryTrace, accept_worker_log_report, current_trace, query_logging_status
 
 
 _MAX_WORKER_RESULT_BYTES = 16 * 1024 * 1024
 _MAX_WORKER_REQUEST_BYTES = 1024 * 1024
 _PROCESS_STOP_GRACE_SECONDS = 1.0
+_PROCESS_RETIRE_GRACE_SECONDS = 5.25
 _TIMEOUT_AUDIT_LOCK_SECONDS = 0.1
 
 
@@ -100,6 +103,7 @@ def _decode_worker_payload(raw: bytes, expected_request_id: str | None = None) -
             "The memory recall worker returned an invalid result."
         )
     if payload["status"] == "error":
+        accept_worker_log_report(payload.get("_query_log"))
         error_type = payload.get("error_type")
         safe_type = error_type if isinstance(error_type, str) else "UnknownError"
         raise WorkerExecutionFailed(
@@ -109,6 +113,7 @@ def _decode_worker_payload(raw: bytes, expected_request_id: str | None = None) -
         raise WorkerExecutionFailed(
             "The memory recall worker returned a mismatched request identifier."
         )
+    accept_worker_log_report(payload.get("_query_log"))
     return payload.get("result")
 
 
@@ -177,6 +182,27 @@ def _stop_subprocess(process: subprocess.Popen[bytes]) -> None:
                 pass
 
 
+def _close_retired_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None and process.stdin is not None:
+        try:
+            # EOF exits the child loop normally, which runs its atexit log flush.
+            process.stdin.close()
+        except OSError:
+            pass
+    if process.poll() is None:
+        try:
+            process.wait(timeout=_PROCESS_RETIRE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            _stop_subprocess(process)
+            return
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
 
 
 def _read_exact(stream: Any, length: int) -> bytes:
@@ -224,6 +250,8 @@ class _WorkerPool:
         )
         self.closed = False
         self.lock = threading.Lock()
+        self.retiring: set[subprocess.Popen[bytes]] = set()
+        self.retiring_lock = threading.Lock()
         self.managers = concurrent.futures.ThreadPoolExecutor(
             max_workers=settings.recall_worker_count,
             thread_name_prefix="recall-manager",
@@ -245,6 +273,33 @@ class _WorkerPool:
         _stop_subprocess(worker.process)
         _archive_worker_generation_leases(self.settings, worker.process.pid)
         return self._spawn()
+
+    def _retire(self, worker: _WarmWorker) -> _WarmWorker:
+        process = worker.process
+        with self.retiring_lock:
+            # Keep retirement outside the active worker count, but cap its
+            # temporary model/process memory under slow diagnostic storage.
+            if len(self.retiring) >= self.settings.recall_worker_count:
+                return worker
+            self.retiring.add(process)
+        try:
+            replacement = self._spawn()
+        except OSError:
+            with self.retiring_lock:
+                self.retiring.discard(process)
+            return worker
+
+        def finish() -> None:
+            try:
+                _close_retired_process(process)
+                _archive_worker_generation_leases(self.settings, process.pid)
+            finally:
+                with self.retiring_lock:
+                    self.retiring.discard(process)
+
+        # The completed response does not wait for diagnostic disk I/O.
+        threading.Thread(target=finish, daemon=True, name="recall-worker-retirement").start()
+        return replacement
 
     def request(
         self,
@@ -272,6 +327,7 @@ class _WorkerPool:
                 )
             raise WorkerQueueFull("The memory recall worker queue is full.")
         worker: _WarmWorker | None = None
+        worker_started: float | None = None
         try:
             while worker is None:
                 if cancel_event is not None and cancel_event.is_set():
@@ -290,6 +346,7 @@ class _WorkerPool:
             if timing is not None:
                 timing["queue_ms"] = round((time.monotonic() - started) * 1000, 3)
                 timing["cold"] = worker.request_count == 0
+                timing["worker_pid"] = worker.process.pid
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 if timing is not None:
@@ -303,6 +360,8 @@ class _WorkerPool:
                 worker = self._replace(worker)
                 if timing is not None:
                     timing["replacement"] = True
+                    timing["worker_pid"] = worker.process.pid
+                    timing["cold"] = True
             try:
                 worker_started = time.monotonic()
                 executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -362,13 +421,17 @@ class _WorkerPool:
                 )
                 timing["outcome"] = "complete"
             if worker.request_count >= self.settings.recall_worker_max_requests:
-                worker = self._replace(worker)
-                if timing is not None:
+                retired = self._retire(worker)
+                if timing is not None and retired is not worker:
                     timing["replacement"] = True
+                worker = retired
             return output
         finally:
             if timing is not None:
                 timing["total_ms"] = round((time.monotonic() - started) * 1000, 3)
+                if worker_started is not None and "worker_ms" not in timing:
+                    timing["worker_ms"] = round((time.monotonic() - worker_started) * 1000, 3)
+                timing.setdefault("queue_ms", timing["total_ms"])
             if worker is not None:
                 if self.closed:
                     _stop_subprocess(worker.process)
@@ -391,6 +454,11 @@ class _WorkerPool:
                     break
                 _stop_subprocess(worker.process)
                 _archive_worker_generation_leases(self.settings, worker.process.pid)
+            with self.retiring_lock:
+                retiring = list(self.retiring)
+            for process in retiring:
+                _stop_subprocess(process)
+                _archive_worker_generation_leases(self.settings, process.pid)
 
 
 _POOLS: dict[str, _WorkerPool] = {}
@@ -432,6 +500,7 @@ def _run_recall_subprocess(
     envelope = RecallWorkerEnvelope(
         settings=_serialize_settings(settings),
         arguments=RecallArguments.model_validate(arguments),
+        request_id=current_trace().request_id if current_trace() else uuid.uuid4().hex,
     )
     request = envelope.model_dump_json().encode("utf-8")
     if len(request) > _MAX_WORKER_REQUEST_BYTES:
@@ -469,6 +538,7 @@ def _run_recall_subprocess(
 def _pool_child_main() -> int:
     service: MemoryService | None = None
     serialized_settings = ""
+    reported_log_failures = 0
     while True:
         try:
             raw = _read_frame(sys.stdin.buffer, _MAX_WORKER_REQUEST_BYTES)
@@ -480,13 +550,17 @@ def _pool_child_main() -> int:
             if service is None or settings_key != serialized_settings:
                 service = MemoryService(_deserialize_settings(request.settings))
                 serialized_settings = settings_key
-            response = service.recall(**request.arguments.model_dump())
+            with QueryTrace(service.settings, {}, "worker", request_id=request.request_id) as trace:
+                response = service.recall(**request.arguments.model_dump())
+                trace.set_result(response)
+            response._diagnostics["log_events_failed"] = trace.failed_events
             payload: dict[str, Any] = {
                 "status": "ok",
                 "request_id": request.request_id,
                 "result": {
                     **response.model_dump(mode="json"),
                     "_execution_state": response._execution_state.model_dump(mode="json"),
+                    "_diagnostics": response._diagnostics,
                 },
             }
         except BaseException as exc:
@@ -494,6 +568,18 @@ def _pool_child_main() -> int:
                 "status": "error",
                 "error_type": type(exc).__name__,
             }
+        if service is not None and service.settings.query_log_content:
+            log_status = query_logging_status(service.settings)
+            # Include terminal-enqueue failures and asynchronous failures observed
+            # since the previous response. Later disk failures arrive on a later
+            # response; pending counts distinguish that delay from confirmed loss.
+            payload["_query_log"] = {
+                "failed_events": log_status["failed_events"] - reported_log_failures,
+                "last_error": log_status["last_error"],
+                "pending_events": log_status["pending_events"],
+                "pending_bytes": log_status["pending_bytes"],
+            }
+            reported_log_failures = log_status["failed_events"]
         encoded = json.dumps(
             payload, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
@@ -568,8 +654,10 @@ def recall_in_worker(
         )
         raise
     state = result.pop("_execution_state", {})
+    diagnostics = result.pop("_diagnostics", {})
     response = RecallResponse.model_validate(result)
     response._execution_state = RecallExecutionState.model_validate(state)
+    response._diagnostics = diagnostics
     return response
 
 
@@ -581,13 +669,34 @@ async def recall_in_worker_async(
     # Admission precedes executor submission. Its queue cannot add uncounted
     # work, and the same absolute deadline includes all scheduling delay.
     if not pool.capacity.acquire(blocking=False):
+        trace = current_trace()
+        if trace is not None:
+            trace.timing.update({"outcome": "queue_full", "queue_ms": 0.0})
         raise WorkerQueueFull("The memory recall worker queue is full.")
     cancelled = threading.Event()
     future = None
+    submitted = time.monotonic()
+    timing: dict[str, Any] = {}
+
+    def run():
+        scheduled_ms = (time.monotonic() - submitted) * 1000
+        try:
+            return recall_in_worker(settings, arguments, cancelled, timing,
+                                    deadline=deadline, capacity_reserved=True)
+        except WorkerExecutionFailed:
+            # A successful pipe exchange is not proof of a valid worker result.
+            timing["outcome"] = "worker_failed"
+            raise
+        finally:
+            timing["executor_queue_ms"] = round(scheduled_ms, 3)
+            timing["queue_ms"] = round(timing.get("queue_ms", 0.0) + scheduled_ms, 3)
+
     try:
+        # Context does not propagate through ThreadPoolExecutor automatically.
+        # Carry the parent trace ID into the worker envelope, not a new request ID.
+        context = contextvars.copy_context()
         future = pool.managers.submit(
-            recall_in_worker, settings, arguments, cancelled,
-            deadline=deadline, capacity_reserved=True,
+            context.run, run,
         )
         wrapped = asyncio.wrap_future(future)
         try:
@@ -596,15 +705,24 @@ async def recall_in_worker_async(
             )
         except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
             cancelled.set()
-            if not future.cancel():
+            if future.cancel():
+                queued_ms = round((time.monotonic() - submitted) * 1000, 3)
+                timing.update({"queue_ms": queued_ms, "executor_queue_ms": queued_ms})
+            else:
                 try:
                     await asyncio.shield(wrapped)
                 except BaseException:
                     pass
             if isinstance(exc, asyncio.CancelledError):
+                timing["outcome"] = "cancelled"
                 raise
+            timing["outcome"] = "deadline_exceeded"
             raise WorkerDeadlineExceeded(None) from exc
     finally:
+        trace = current_trace()
+        if trace is not None:
+            trace.timing.update(timing)
+            trace.timing["total_ms"] = round((time.monotonic() - (deadline - settings.recall_timeout_seconds)) * 1000, 3)
         pool.capacity.release()
 
 

@@ -183,6 +183,7 @@ class RecallExecutionState(StrictOutput):
 class RecallResponse(StrictOutput):
     # This state travels in the private worker envelope, not the V1 wire schema.
     _execution_state: RecallExecutionState = PrivateAttr(default_factory=RecallExecutionState)
+    _diagnostics: dict[str, Any] = PrivateAttr(default_factory=dict)
     status: Literal["answered", "no_answer"]
     intent: Literal["exact", "relationship", "search"]
     query: str
@@ -365,12 +366,24 @@ class LogStreamStatus(StrictOutput):
     bytes: int = Field(ge=0)
 
 
+class QueryLoggingStatus(StrictOutput):
+    content_enabled: bool
+    directory: str
+    pending_events: int = Field(ge=0)
+    pending_bytes: int = Field(ge=0)
+    failed_events: int = Field(ge=0)
+    last_error: str | None = None
+    worker_failed_events: int = Field(default=0, ge=0)
+    last_worker_error: str | None = None
+
+
 class LoggingStatus(StrictOutput):
     enabled: bool
     directory: str
     writable: bool
     streams: dict[str, LogStreamStatus] = Field(default_factory=dict)
     last_error: str | None = None
+    query_log: QueryLoggingStatus | None = None
 
 
 class RuntimeStatus(StrictOutput):

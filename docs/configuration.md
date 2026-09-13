@@ -118,6 +118,7 @@ repository-owned scripts.
 | `AI_MEMORY_MCP_RRF_K` | `60` | Sets the RRF constant. |
 | `AI_MEMORY_MCP_GRAPH_DEPTH` | `2` | Sets the graph traversal depth. |
 | `AI_MEMORY_AUDIT_LOGGING` | `true` | Enables local index and retrieval logs. |
+| `AI_MEMORY_QUERY_LOG_CONTENT` | `false` | Enables private query, response, and stage logs. |
 | `AI_MEMORY_AUDIT_LOG_MAX_BYTES` | `25000000` | Sets the active JSONL log size limit. |
 | `AI_MEMORY_AUDIT_LOCK_TIMEOUT_SECONDS` | `10` | Sets the audit log lock timeout. |
 | `AI_MEMORY_INDEX_LOCK_TIMEOUT_SECONDS` | `300` | Sets the index publisher lock timeout. |
@@ -129,9 +130,11 @@ The recall deadline contains failed work.
 It does not define acceptable retrieval performance.
 Response version 2 reports a deadline as failed execution, not an empty search.
 
-The retrieval log contains Markdown queries and returned evidence.
-Artifact routes store query hashes, evidence digests, and metadata.
+The standard retrieval log contains query hashes, evidence digests, and metadata.
+The optional private query log contains full query arguments and returned values.
+Both flags must be `true` for private query logs.
 Keep the log directory outside the repository.
+See [Query Logging](query-logging.md) for setup, record fields, and failure limits.
 
 ## Repository privacy
 

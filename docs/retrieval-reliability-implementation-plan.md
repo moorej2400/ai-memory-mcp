@@ -905,12 +905,14 @@ The Windows checkout contains no implementation or validation changes.
 Validation did not deploy the changes to a live host.
 The [validation report](retrieval-reliability-validation.md) replaces the earlier measurements and completion claims.
 Independent held-out evaluation and replacement-model comparisons remain open in T09 and T13.
-The final workload run passed quality checks but failed the unchanged MCP p95 latency gate.
-Only the regression profile has a passing complete performance run for the final code.
+The workload follow-up passed quality, latency, throughput, and memory gates with full query logging enabled.
+Serialized MCP p95 latency decreased from `7047.10 ms` to `1925.40 ms` without changing the five-second gate.
+Both regression and workload profiles have passing complete performance runs.
 The growth profile remains outside the supported capacity claim.
+The [private query log guide](query-logging.md) describes the requested diagnostic records and their storage limits.
 
 - [ ] Each enabled task has its tests and exit evidence.
-- [ ] The workload profile passes its five-second MCP p95 latency gate.
+- [x] The workload profile passes its five-second MCP p95 latency gate.
 - [x] The real MCP path returns useful old-message and meeting-passage results.
 - [x] Coverage reports explain all remaining exclusions and backlog.
 - [x] Performance reports include completed workload and growth runs or clearly state the supported limit.

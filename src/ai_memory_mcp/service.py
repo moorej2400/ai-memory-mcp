@@ -25,6 +25,7 @@ from .artifacts.schema import (
 )
 from .artifacts.search import ArtifactSearch
 from .audit import append_event, logging_status
+from .query_log import current_trace, log_library_query, query_stage, trace_progress
 from .config import Settings
 from .graphify import GraphifyAdapter
 from .generation import (
@@ -412,6 +413,7 @@ class MemoryService:
             finally:
                 self._pinned_engine.reset(token)
 
+    @log_library_query
     def recall(
         self,
         query: str,
@@ -473,17 +475,21 @@ class MemoryService:
         # and scope values can contain the same private data as raw artifacts.
         artifact_audit_route = True
         try:
+            trace_progress("generation_pin")
             with self._pin_recall_generation(
                 artifact_only=(
                     artifact_scope_requested
                     or query.strip().startswith("artifact://")
                 ),
             ) as pinned:
+                pin_ms = round((time.perf_counter() - started) * 1000, 3)
+                trace_progress("retrieval")
                 execution_state = RecallExecutionState(reason_codes=[
                     reason for reason in pinned.reason_codes
                     if not markdown_scope_requested or reason not in {"semantic_lag", "semantic_unavailable"}
                 ])
                 coverage = execution_state.coverage
+                metadata: dict[str, str] = {}
                 coverage.markdown_available = pinned.engine is not None
                 coverage.artifact_lexical_available = pinned.artifact_search is not None
                 if pinned.artifact_vector_path is not None:
@@ -537,6 +543,18 @@ class MemoryService:
                     else "partial" if execution_state.reason_codes else "complete"
                 )
                 response._execution_state = execution_state
+                response._diagnostics = {
+                    "pin_ms": pin_ms,
+                    "generation_id": pinned.generation_id,
+                    "artifact_change_counter": pinned.raw_change_counter,
+                    "artifact_embedding": {key: metadata.get(key) for key in (
+                        "embedding_provider", "embedding_model", "embedding_dimensions", "embedding_fingerprint",
+                    )},
+                    **diagnostics,
+                }
+                trace = current_trace()
+                if trace is not None:
+                    response._diagnostics["log_events_failed"] = trace.failed_events
         except Exception as exc:
             append_event(
                 self.settings,
@@ -955,6 +973,7 @@ class MemoryService:
             )
         return response, diagnostics
 
+    @query_stage("response_assembly")
     def _packet_response(
         self,
         query: str,
@@ -1124,6 +1143,7 @@ class MemoryService:
             )
         return valid, warnings
 
+    @log_library_query
     def artifact_read(
         self,
         reference: str,

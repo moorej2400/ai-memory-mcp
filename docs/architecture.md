@@ -92,6 +92,12 @@ It updates vectors only for changed Markdown chunks.
 Large vector searches use an ANN candidate index before exact reranking.
 Portable installations use exact search when the ANN backend is unavailable.
 
+Artifact vector schema `7` adds a compact covering index to each immutable segment.
+Candidate counts and compact-vector scans use this index without reading full vectors or source text.
+The index includes scope fields and source identities for segment visibility checks.
+The next successful synchronization rebuilds incompatible derived vector indexes.
+Canonical Markdown and artifact records do not change.
+
 ### Exact and lexical retrieval
 
 SQLite FTS5 supplies exact and lexical results.

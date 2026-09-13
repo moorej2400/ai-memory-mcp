@@ -25,6 +25,7 @@ from ai_memory_mcp.config import Settings
 from ai_memory_mcp.embedding import fingerprint, resolve_provider
 from ai_memory_mcp.index import decode_vector, encode_vector
 from ai_memory_mcp.models import ArtifactIndexResult
+from ai_memory_mcp.query_log import query_stage
 from ai_memory_mcp.text import cosine_sparse
 
 from .bursts import REPRESENTATION_VERSION, build_representations
@@ -45,7 +46,7 @@ from .schema import (
 )
 from .search import _bounded_search_span
 
-ARTIFACT_VECTOR_SCHEMA_VERSION = 6
+ARTIFACT_VECTOR_SCHEMA_VERSION = 7
 MAX_SEGMENT_FANOUT = 8
 COMPACTION_THRESHOLD = 4
 COMPACTION_BLOCK_ROWS = 512
@@ -54,6 +55,10 @@ _COMPACTION_LOCK = threading.Lock()
 POINTER_REPLACE_RETRY_SECONDS = 1.0
 POINTER_REPLACE_RETRY_INTERVAL_SECONDS = 0.05
 _NUMPY_VECTOR_DTYPE = [("index", "<u2"), ("value", "<f2")]
+_ANN_SCAN_COLUMNS = (
+    "source", "source_instance", "entity", "parent_artifact_id", "started_at", "ended_at",
+    "meeting_artifact_uri", "meeting_occurred_at", "anchor_artifact_uri", "burst_id", "ann_vector",
+)
 
 
 @lru_cache(maxsize=16)
@@ -176,6 +181,7 @@ def _connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
         # Readers pin only the small manifest; its immutable segments never change.
         for table, anchor in (
             ("bursts", "r.anchor_artifact_uri"),
+            ("vector_candidates", "r.anchor_artifact_uri"),
             ("representation_coverage", "r.artifact_uri"),
             ("representation_dependencies", "b.anchor_artifact_uri"),
         ):
@@ -188,9 +194,22 @@ def _connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
                     f"WHERE u.artifact_uri = {anchor})"
                     for later in range(number + 1, len(names))
                 ]
+                compact = table == "vector_candidates"
+                if compact:
+                    # An outer count over the full UNION view reads vector_blob
+                    # from every arm. Project only covered columns after checking
+                    # vector eligibility inside each arm; preserve all tombstones.
+                    conditions.insert(0, "r.vector_blob IS NOT NULL")
                 where = " WHERE " + " AND ".join(conditions) if conditions else ""
-                parts.append(f"SELECT r.* FROM s{number}.{table} r{join}{where}")
+                projection = ", ".join(f"r.{column}" for column in _ANN_SCAN_COLUMNS) if compact else "r.*"
+                source_table = "bursts" if compact else table
+                parts.append(f"SELECT {projection} FROM s{number}.{source_table} r{join}{where}")
             connection.execute(f"CREATE TEMP VIEW {table} AS " + " UNION ALL ".join(parts))
+    elif connection.execute("SELECT 1 FROM sqlite_master WHERE name = 'bursts'").fetchone():
+        connection.execute(
+            "CREATE TEMP VIEW vector_candidates AS SELECT " + ", ".join(_ANN_SCAN_COLUMNS)
+            + " FROM bursts WHERE vector_blob IS NOT NULL"
+        )
     return connection
 
 
@@ -710,6 +729,15 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _create_ann_scan_index(connection: sqlite3.Connection) -> None:
+    # Candidate counting and int8 scanning must not read source text or full
+    # vectors. Include every scope and tombstone key used by the segment view.
+    connection.execute(
+        "CREATE INDEX bursts_ann_scan_idx ON bursts(" + ", ".join(_ANN_SCAN_COLUMNS) + ") "
+        "WHERE vector_blob IS NOT NULL"
+    )
+
+
 def _burst_digest(burst: ArtifactBurst) -> str:
     payload = {
         "burst_id": burst.burst_id,
@@ -931,6 +959,7 @@ def _compact_segments(settings: Settings, snapshot: Path) -> list[Path]:
         with _connect(snapshot, read_only=True) as source, _connect(temporary) as dest:
             _create_schema(dest)
             source.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
+            dest.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
             for table in ("bursts", "representation_dependencies", "representation_coverage"):
                 cursor = source.execute(f"SELECT * FROM {table}")
                 while rows := cursor.fetchmany(COMPACTION_BLOCK_ROWS):
@@ -940,6 +969,7 @@ def _compact_segments(settings: Settings, snapshot: Path) -> list[Path]:
                     dest.executemany(f"INSERT INTO {table} VALUES ({placeholders})", rows)
                     rows_copied += len(rows)
             dest.execute("INSERT INTO updated_anchors SELECT artifact_uri FROM representation_coverage")
+            _create_ann_scan_index(dest)
             dest.commit()
             if dest.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                 raise RuntimeError("Vector compaction failed its integrity check.")
@@ -1206,6 +1236,9 @@ def build_artifact_vector_index(
                             int(record.occurred_at is None),
                         ),
                     )
+                # Build once after the batch to avoid maintaining a wide B-tree
+                # for each inserted representation. Published segments are immutable.
+                _create_ann_scan_index(connection)
                 embedded = int(
                     connection.execute(
                         "SELECT count(*) FROM bursts "
@@ -1328,6 +1361,7 @@ def build_artifact_vector_index(
     )
 
 
+@query_stage("candidate_fetch")
 def _fetch_ann_candidates(connection: sqlite3.Connection) -> list[sqlite3.Row]:
     # IN pushes the selected IDs into each immutable segment's primary-key
     # lookup. A join can scan or materialize the complete UNION view instead.
@@ -1338,6 +1372,7 @@ def _fetch_ann_candidates(connection: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+@query_stage("artifact_semantic")
 def search_artifact_vectors(
     settings: Settings,
     query: str,
@@ -1371,7 +1406,7 @@ def search_artifact_vectors(
     ):
         return ArtifactVectorSearchResult(available=True, stale=True)
 
-    conditions = ["b.vector_blob IS NOT NULL"]
+    conditions = ["1 = 1"]
     parameters: list[Any] = []
     if scope.source is not None:
         conditions.append("b.source = ?")
@@ -1417,7 +1452,7 @@ def search_artifact_vectors(
     with _connect(current, read_only=True) as connection:
         total = int(
             connection.execute(
-                "SELECT count(*) FROM bursts b WHERE "
+                "SELECT count(*) FROM vector_candidates b WHERE "
                 + " AND ".join(conditions),
                 parameters,
             ).fetchone()[0]
@@ -1439,7 +1474,7 @@ def search_artifact_vectors(
                 max(2_000, math.ceil(math.sqrt(total)) * 40),
             )
             ann_cursor = connection.execute(
-                "SELECT b.burst_id, b.ann_vector FROM bursts b WHERE "
+                "SELECT b.burst_id, b.ann_vector FROM vector_candidates b WHERE "
                 + " AND ".join(conditions)
                 + " AND b.ann_vector IS NOT NULL",
                 parameters,
@@ -1464,7 +1499,7 @@ def search_artifact_vectors(
                 backend = ANN_BACKEND
         if backend != ANN_BACKEND:
             cursor = connection.execute(
-                "SELECT b.* FROM bursts b WHERE "
+                "SELECT b.* FROM bursts b WHERE b.vector_blob IS NOT NULL AND "
                 + " AND ".join(conditions),
                 parameters,
             )

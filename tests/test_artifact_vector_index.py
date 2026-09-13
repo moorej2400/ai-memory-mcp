@@ -139,6 +139,60 @@ def test_vector_index_publishes_revisioned_snapshot(
     assert repeated.unchanged is True
 
 
+def test_vector_candidate_scans_use_compact_index_for_each_scope(artifact_settings):
+    _populate(artifact_settings)
+    first = build_artifact_vector_index(artifact_settings)
+    receipt = ArtifactStore(artifact_settings).apply_batch(_batch("compact-scan-delta", [
+        _event("message", "message-1", "Updated validation instructions.",
+               "2026-01-02T10:02:00Z", parent=("conversation", "conversation-1")),
+    ]))
+    assert receipt.accepted == 1
+    second = build_artifact_vector_index(artifact_settings)
+    assert not second.unchanged
+    assert len(vector_index_module.artifact_segment_paths(Path(second.snapshot))) == 2
+    for snapshot in (first.snapshot, second.snapshot):
+        with vector_index_module._connect(Path(snapshot), read_only=True) as connection:
+            table_roots = {
+                (database[0], connection.execute(
+                    f"SELECT rootpage FROM {database[1]}.sqlite_master WHERE name = 'bursts'"
+                ).fetchone()[0])
+                for database in connection.execute("PRAGMA database_list").fetchall()
+                if database[1].startswith("s")
+            }
+            for extra, params in (
+                ("", ()),
+                (" AND b.source = ? AND b.entity = ?", ("chat-source", "message")),
+                (" AND b.meeting_artifact_uri IS NOT NULL AND b.meeting_occurred_at >= ?", ("2026-01-01",)),
+                (" AND b.parent_artifact_id = ? AND b.started_at >= ? AND b.ended_at <= ?", ("parent", "2026-01-01", "2026-12-31")),
+            ):
+                for projection in ("count(*)", "b.burst_id, b.ann_vector"):
+                    sql = "SELECT " + projection + " FROM vector_candidates b WHERE 1 = 1" + extra
+                    plan = [row[3] for row in connection.execute("EXPLAIN QUERY PLAN " + sql, params)]
+                    assert any("bursts_ann_scan_idx" in step for step in plan), plan
+                    bytecode = connection.execute("EXPLAIN " + sql, params).fetchall()
+                    table_cursors = {row[2] for row in bytecode if row[1] == "OpenRead" and (row[4], row[3]) in table_roots}
+                    # An outer coroutine scan is safe. A Column instruction on a
+                    # base-table cursor proves the compact scan is not covered.
+                    assert not any(row[1] == "Column" and row[2] in table_cursors for row in bytecode)
+                    full_sql = "SELECT " + projection + " FROM bursts b WHERE b.vector_blob IS NOT NULL" + extra
+                    assert sorted(tuple(row) for row in connection.execute(sql, params)) == sorted(
+                        tuple(row) for row in connection.execute(full_sql, params)
+                    )
+
+
+def test_old_vector_schema_rebuilds_the_compact_index(artifact_settings):
+    _populate(artifact_settings)
+    first = build_artifact_vector_index(artifact_settings)
+    with sqlite3.connect(first.snapshot) as connection:
+        connection.execute("UPDATE metadata SET value = '6' WHERE key = 'schema_version'")
+    second = build_artifact_vector_index(artifact_settings)
+    assert not second.unchanged
+    assert second.snapshot != first.snapshot
+    for path in vector_index_module.artifact_segment_paths(Path(second.snapshot)):
+        with sqlite3.connect(path) as connection:
+            assert connection.execute("SELECT name FROM sqlite_master WHERE name = 'bursts_ann_scan_idx'").fetchone()
+
+
 def test_vector_index_reuses_unchanged_burst_embeddings(
     artifact_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,

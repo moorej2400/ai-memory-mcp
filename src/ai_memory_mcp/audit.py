@@ -145,6 +145,7 @@ def append_event(
 
 
 def logging_status(settings: "Settings") -> dict[str, Any]:
+    from .query_log import query_logging_status
     log_dir = settings.resolved_log_dir
     streams = {}
     for name in (
@@ -167,4 +168,5 @@ def logging_status(settings: "Settings") -> dict[str, Any]:
         "writable": probe.exists() and os.access(probe, os.W_OK),
         "streams": streams,
         "last_error": _LAST_ERROR,
+        "query_log": query_logging_status(settings),
     }

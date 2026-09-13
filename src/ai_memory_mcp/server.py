@@ -30,6 +30,7 @@ from .recall_worker import (
     recall_in_worker_async,
 )
 from .service import MemoryService
+from .query_log import QueryTrace, flush_query_logs
 from .freshness import RECONCILIATION_INTERVAL_SECONDS, reconcile_markdown
 
 
@@ -73,6 +74,43 @@ def _modern_response(response: RecallResponse, settings: Settings) -> RecallResp
     )
 
 
+async def _execute_recall(settings: Settings, arguments: dict, response_version: str):
+    query = arguments["query"]
+    with QueryTrace(settings, arguments, "mcp", response_version=response_version) as trace:
+        try:
+            response = await recall_in_worker_async(settings, arguments)
+            trace.diagnostics.update(response._diagnostics)
+            trace.execution_state = response._execution_state.model_dump(mode="json")
+            if response_version == "1" and response._execution_state.execution != "complete":
+                raise WorkerExecutionFailed(
+                    "Memory recall did not complete. Use response version 2 for execution details."
+                )
+            return trace.set_result(response if response_version == "1" else _modern_response(response, settings))
+        except WorkerDeadlineExceeded:
+            if response_version == "1":
+                # Legacy clients cannot represent incomplete execution safely.
+                raise
+            return trace.set_result(RecallResponseV2(
+                execution="failed", result_kind="empty",
+                intent="exact" if query.strip().startswith("artifact://") else "search",
+                query=query, reason_codes=["deadline_exceeded"], coverage=RecallCoverage(),
+                warnings=["Memory recall exceeded its time limit. Retry the request."],
+            ))
+        except (WorkerQueueFull, WorkerExecutionFailed) as exc:
+            trace.diagnostics["worker_error"] = {"error_type": type(exc).__name__, "message": str(exc)}
+            if response_version == "1":
+                raise
+            queue_full = isinstance(exc, WorkerQueueFull)
+            return trace.set_result(RecallResponseV2(
+                execution="failed", result_kind="empty",
+                intent="exact" if query.strip().startswith("artifact://") else "search",
+                query=query, reason_codes=["queue_full" if queue_full else "worker_failed"],
+                coverage=RecallCoverage(),
+                warnings=["Memory recall capacity is full. Retry the request." if queue_full
+                          else "The memory recall worker failed. Retry the request."],
+            ))
+
+
 def create_server(settings: Settings | None = None) -> FastMCP:
     settings = settings or Settings.from_env()
     # Streamable HTTP has no authentication boundary in this release.
@@ -102,6 +140,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         finally:
             stopped.set()
             await asyncio.to_thread(reconciler.join, 2.0)
+            await asyncio.to_thread(flush_query_logs, 1.0)
 
     mcp = FastMCP(
         "ai-memory",
@@ -250,50 +289,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
             "date_to": date_to,
             "limit": limit,
         }
-        try:
-            response = await recall_in_worker_async(settings, arguments)
-            if response_version == "1" and response._execution_state.execution != "complete":
-                raise WorkerExecutionFailed(
-                    "Memory recall did not complete. Use response version 2 for execution details."
-                )
-            return (
-                response
-                if response_version == "1"
-                else _modern_response(response, settings)
-            )
-        except WorkerDeadlineExceeded:
-            if response_version == "1":
-                # Version 1 cannot represent incomplete execution safely.
-                # Let FastMCP return a tool error instead of a false empty result.
-                raise
-            return RecallResponseV2(
-                execution="failed",
-                result_kind="empty",
-                intent="exact" if query.strip().startswith("artifact://") else "search",
-                query=query,
-                reason_codes=["deadline_exceeded"],
-                coverage=RecallCoverage(),
-                warnings=[
-                    "Memory recall exceeded its time limit. Retry the request."
-                ],
-            )
-        except (WorkerQueueFull, WorkerExecutionFailed) as exc:
-            if response_version == "1":
-                raise
-            queue_full = isinstance(exc, WorkerQueueFull)
-            return RecallResponseV2(
-                execution="failed",
-                result_kind="empty",
-                intent="exact" if query.strip().startswith("artifact://") else "search",
-                query=query,
-                reason_codes=["queue_full" if queue_full else "worker_failed"],
-                coverage=RecallCoverage(),
-                warnings=[
-                    "Memory recall capacity is full. Retry the request."
-                    if queue_full
-                    else "The memory recall worker failed. Retry the request."
-                ],
-            )
+        return await _execute_recall(settings, arguments, response_version)
 
     @mcp.tool(
         annotations=ToolAnnotations(
@@ -339,13 +335,10 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         ] = False,
     ) -> ArtifactReadResponse:
         """Read ordered raw context from one stable artifact citation."""
-        return service.artifact_read(
-            reference,
-            cursor=cursor,
-            direction=direction,
-            limit=limit,
-            include_payload=include_payload,
-        )
+        arguments = {"reference": reference, "cursor": cursor, "direction": direction,
+                     "limit": limit, "include_payload": include_payload}
+        with QueryTrace(settings, arguments, "mcp", operation="memory_artifact_read") as trace:
+            return trace.set_result(service.artifact_read(**arguments))
 
     @mcp.tool(
         annotations=ToolAnnotations(

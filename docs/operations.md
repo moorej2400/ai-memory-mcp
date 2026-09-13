@@ -401,7 +401,8 @@ The logger moves a full active log to a timestamped local archive.
 Graphify refresh events use a separate local directory.
 Read these files under `AI_MEMORY_GRAPHIFY_STATE_DIR\logs\ai-memory-refresh`.
 
-These structured logs do not contain raw artifact text or sensitive queries.
+The standard audit logs do not contain raw artifact text or sensitive queries.
+The optional [private query log](query-logging.md) contains full query arguments and returned values.
 Do not copy these logs into the repository.
 
 ## Control the Graphify MCP service

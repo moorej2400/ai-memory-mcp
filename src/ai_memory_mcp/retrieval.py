@@ -18,6 +18,7 @@ from .graphify import GraphifyAdapter
 from .generation import current_graph_path
 from .index import MemoryIndex, scope_sql
 from .models import EvidencePacket, ScopeFilter, SearchHit
+from .query_log import query_stage
 from .text import (
     cosine_sparse,
     fts_expressions,
@@ -416,6 +417,7 @@ class RetrievalEngine:
         # can narrow scope because many older notes have incomplete metadata.
         return copy.deepcopy(supplied) if supplied is not None else ScopeFilter()
 
+    @query_stage("markdown_lexical")
     def _lexical(
         self, query: str, scope: ScopeFilter, limit: int
     ) -> list[SearchHit]:
@@ -466,6 +468,7 @@ class RetrievalEngine:
             for rank, row in enumerate(rows, 1)
         ]
 
+    @query_stage("markdown_semantic")
     def _semantic(
         self,
         query: str,
@@ -510,6 +513,7 @@ class RetrievalEngine:
             if score > 0
         ]
 
+    @query_stage("graph")
     def _graph(
         self,
         query: str,

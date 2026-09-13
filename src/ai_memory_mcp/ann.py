@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from itertools import islice
 from typing import Any
+from .query_log import query_stage
 
 ANN_BACKEND = "int8-flat-v4"
 
@@ -35,6 +36,7 @@ def quantized_vector(vector: dict[int, float], dimensions: int) -> bytes:
     ).tobytes()
 
 
+@query_stage("compact_vector_selection")
 def quantized_shortlist(
     rows: Any,
     query_vector: bytes,
@@ -49,12 +51,15 @@ def quantized_shortlist(
         return []
     query = numpy.frombuffer(query_vector, dtype=numpy.int8).astype(numpy.float32)
     iterator = iter(rows)
-    best: list[tuple[float, str]] = []
+    best_scores = numpy.empty(0, dtype=numpy.float32)
+    # Object arrays retain string references. Fixed-width Unicode arrays pad
+    # every candidate to the longest valid memory ID in the current block.
+    best_ids = numpy.empty(0, dtype=object)
     while True:
         block = list(islice(iterator, block_size))
         if not block:
             break
-        identities = [str(row[0]) for row in block]
+        identities = numpy.asarray([str(row[0]) for row in block], dtype=object)
         payload = b"".join(bytes(row[1]) for row in block)
         if len(payload) != len(block) * dimensions:
             raise ValueError("Stored ANN vector has an invalid byte length.")
@@ -67,10 +72,13 @@ def quantized_shortlist(
             selected = numpy.argpartition(scores, -keep)[-keep:]
         else:
             selected = range(len(block))
-        best.extend((-float(scores[index]), identities[index]) for index in selected)
-        if len(best) > limit:
-            best = sorted(best, key=lambda item: (item[0], item[1]))[:limit]
-    return sorted(best, key=lambda item: (item[0], item[1]))[:limit]
+        best_scores = numpy.concatenate((best_scores, scores[selected]))
+        best_ids = numpy.concatenate((best_ids, identities[selected]))
+        # Keep the existing score/identity ordering in bounded native arrays.
+        # Repeated Python tuple sorting dominates large compact-vector scans.
+        order = numpy.lexsort((best_ids, -best_scores))[:limit]
+        best_scores, best_ids = best_scores[order], best_ids[order]
+    return [(-float(score), str(identity)) for score, identity in zip(best_scores, best_ids)]
 
 
 def candidate_recall_at_k(

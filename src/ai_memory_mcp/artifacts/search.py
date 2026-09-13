@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Iterator, Literal
 
 from ai_memory_mcp.config import Settings
+from ai_memory_mcp.query_log import query_stage
 from ai_memory_mcp.text import fts_expressions, tokenize
 
 from .identity import (
@@ -161,6 +162,7 @@ class ArtifactSearch:
         ) as connection:
             yield connection
 
+    @query_stage("artifact_lexical")
     def search(
         self,
         query: str,
@@ -250,6 +252,7 @@ class ArtifactSearch:
         )[:limit]
         return [self._search_hit(row, query=query) for row in rows]
 
+    @query_stage("artifact_identity")
     def find_identity(
         self,
         identity: str,
@@ -346,6 +349,7 @@ class ArtifactSearch:
             for row in rows
         ]
 
+    @query_stage("artifact_exact")
     def get(
         self,
         reference: str,

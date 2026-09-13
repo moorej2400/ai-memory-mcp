@@ -486,7 +486,8 @@ def _mcp_environment(settings: Settings) -> dict[str, str]:
             "AI_MEMORY_ARTIFACT_DB": str(settings.artifact_db),
             "AI_MEMORY_ARTIFACT_OBJECTS_DIR": str(settings.artifact_objects_dir),
             "AI_MEMORY_ARTIFACT_BACKUP_DIR": str(settings.artifact_backup_dir),
-            "AI_MEMORY_AUDIT_LOGGING": "false",
+            "AI_MEMORY_AUDIT_LOGGING": str(settings.audit_logging_enabled).lower(),
+            "AI_MEMORY_QUERY_LOG_CONTENT": str(settings.query_log_content).lower(),
         }
     )
     return environment
@@ -653,6 +654,7 @@ def run_benchmark(
     enforce_quality: bool = True,
     baseline_path: Path | None = None,
     maximum_regression_ratio: float = 1.5,
+    query_log_content: bool = False,
 ) -> dict[str, Any]:
     if repeats <= 0:
         raise ValueError("The repeat count must be positive.")
@@ -671,6 +673,7 @@ def run_benchmark(
         artifact_db=run_dir / "artifacts.sqlite3",
         artifact_objects_dir=run_dir / "objects",
         artifact_backup_dir=run_dir / "backups",
+        query_log_content=query_log_content,
     )
 
     started = time.perf_counter()
@@ -877,6 +880,8 @@ def run_benchmark(
         "storage_bytes": _directory_bytes(run_dir),
         "peak_resident_bytes": max(_peak_resident_bytes() or 0, mcp_measurement["process_tree_peak_resident_bytes"]),
         "resource_limits": {
+            "query_log_content": settings.query_log_content,
+            "audit_logging_enabled": settings.audit_logging_enabled,
             "vector_block_size": settings.vector_block_size,
             "vector_max_vectors": settings.vector_max_vectors,
             "vector_max_seconds": settings.vector_max_seconds,
@@ -981,6 +986,7 @@ def main() -> None:
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--maximum-regression-ratio", type=float, default=1.5)
     parser.add_argument("--no-quality-gate", action="store_true")
+    parser.add_argument("--log-query-content", action="store_true", help="Write private query and response traces during the benchmark.")
     args = parser.parse_args()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output = args.output_dir or _benchmark_root().parent / "runs" / f"real-world-{stamp}"
@@ -993,6 +999,7 @@ def main() -> None:
             enforce_quality=not args.no_quality_gate,
             baseline_path=args.baseline,
             maximum_regression_ratio=args.maximum_regression_ratio,
+            query_log_content=args.log_query_content,
         )
     except BaseException as exc:
         output.mkdir(parents=True, exist_ok=True)

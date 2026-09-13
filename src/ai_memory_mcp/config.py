@@ -131,6 +131,7 @@ class Settings:
     graph_depth: int = 2
     log_dir: Path | None = None
     audit_logging_enabled: bool = True
+    query_log_content: bool = False
     audit_log_max_bytes: int = 25_000_000
     audit_lock_timeout_seconds: float = 10.0
     index_lock_timeout_seconds: float = 300.0
@@ -252,6 +253,7 @@ class Settings:
                 "AI_MEMORY_AUDIT_LOGGING",
                 True,
             ),
+            query_log_content=_configured_bool("AI_MEMORY_QUERY_LOG_CONTENT", False),
             audit_log_max_bytes=int(
                 os.getenv("AI_MEMORY_AUDIT_LOG_MAX_BYTES", "25000000")
             ),
