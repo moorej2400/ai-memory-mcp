@@ -59,7 +59,12 @@ class RecallArguments(BaseModel):
 
     query: str = Field(min_length=1, max_length=2000)
     source_id: str | None = None
-    root_scope: Literal["work", "personal"] | None = None
+    root_scope: str | None = None
+    domain: str | None = None
+    record_type: str | None = None
+    collection: str | None = None
+    scope_kind: str | None = None
+    scope_id: str | None = None
     repository: str | None = None
     project: str | None = None
     ticket: str | None = None

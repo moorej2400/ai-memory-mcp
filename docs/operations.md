@@ -36,6 +36,37 @@ This maintenance command does not publish a coordinated generation.
 Concurrent commands wait for the current index publisher.
 The default wait limit is 300 seconds.
 
+## Create a collection
+
+Initialize a new generic vault first when no structure exists:
+
+```text
+ai-memory-vault --root <vault>
+```
+
+The command creates `Home.md`, `Notes/`, and three operational Bases.
+The command preserves each existing file.
+
+Create a collection only after its first useful record exists.
+
+```powershell
+.\.venv\Scripts\ai-memory-collection.exe --root <vault> --name Links --record-type link
+```
+
+```bash
+./.venv/bin/ai-memory-collection --root <vault> --name Links --record-type link
+```
+
+The command creates one `Records` directory and one Obsidian Base.
+The command does not replace a changed Base.
+
+## Migrate a Markdown vault
+
+Use the [vault migration procedure](migrations.md) for a layout or schema migration.
+The AI reads the notes and selects their structure and destinations.
+Use the migration commands to record and protect each file operation.
+Use one stable migration ID for all commands in one run.
+
 ## Manage raw artifacts
 
 Put the artifact database and object directory on local storage.
@@ -103,7 +134,7 @@ Read ordered context from one stable citation:
 
 Use `pending` to list artifacts that need Markdown distillation.
 Use `mark-distilled` after you validate the current Markdown note.
-Use `mark-no-durable-memory` only for a reviewed conversation.
+Use `mark-no-durable-memory` for a reviewed meeting or conversation.
 Use `backup` to create a consistent SQLite database backup.
 Use `migrate-legacy` to stage a supported legacy import.
 

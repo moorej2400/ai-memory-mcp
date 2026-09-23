@@ -1,8 +1,12 @@
-# Unified Graphify Memory Skill PRD
+# Legacy Unified Graphify Memory Skill PRD
 
 ## Status
 
-Draft for review. This PRD defines the target behavior for one unified memory skill. It does not authorize a migration, retirement of existing skills, or movement of existing notes.
+Historical design record. This file does not define the current storage or migration contract.
+
+Use [SKILL.md](SKILL.md) for current behavior.
+Use [storage-and-schemas.md](references/storage-and-schemas.md) for the current schema.
+Use [migrations.md](references/migrations.md) for the current migration workflow.
 
 ## Summary
 

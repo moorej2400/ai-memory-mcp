@@ -34,7 +34,7 @@ Read the [retrieval reliability validation](docs/retrieval-reliability-validatio
 ```mermaid
 flowchart TB
     Clients["MCP clients<br/>Claude, Codex, Copilot, VS Code, OpenCode"]
-    Facade["MCP facade<br/>four public tools"]
+    Facade["MCP facade<br/>five public tools"]
     Service["MemoryService<br/>policy and orchestration"]
     Engine["RetrievalEngine<br/>scope, fusion, and reranking"]
 
@@ -171,6 +171,7 @@ The MCP facade never exposes an artifact write operation.
 |---|---|
 | `memory_recall` | Returns cited Markdown and artifact evidence. |
 | `memory_artifact_read` | Returns ordered raw context for one artifact reference. |
+| `memory_upsert` | Creates or updates one validated canonical record. |
 | `memory_sync` | Publishes one coordinated generation after a canonical change. |
 | `memory_status` | Reports strict health for every required layer. |
 

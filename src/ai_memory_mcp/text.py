@@ -18,7 +18,7 @@ IDENTIFIER_RE = re.compile(
     re.IGNORECASE,
 )
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
-WIKILINK_RE = re.compile(r"\[\[([^]|]+)(?:\|[^]]+)?]]")
+from .wikilinks import wikilink_targets
 TARGET_CHUNK_CHARS = 1800
 MAX_CHUNK_CHARS = 5000
 MAX_FTS_TERMS = 24
@@ -138,6 +138,8 @@ def parse_document(path: Path, root: Path, source_id: str = "core") -> MemoryDoc
     if not isinstance(primary, dict):
         primary = {}
     related = _as_strings(metadata.get("related"))
+    scope_kind = str(metadata.get("scope_kind") or primary.get("kind") or "reference")
+    scope_id = str(metadata.get("scope_id") or primary.get("id") or "")
     identifiers = query_identifiers(raw)
     identifiers.extend(
         str(primary.get("id", "")).split()
@@ -152,12 +154,16 @@ def parse_document(path: Path, root: Path, source_id: str = "core") -> MemoryDoc
         body=body,
         artifact_references=list(dict.fromkeys(re.findall(r"artifact://[a-z][a-z0-9-]*/art_[a-z0-9]{20,80}", raw)))[:50],
         status=str(metadata.get("status") or "active"),
-        root_scope=str(metadata.get("root_scope") or "work"),
-        scope_kind=str(primary.get("kind") or "reference"),
-        scope_id=str(primary.get("id") or ""),
+        root_scope=str(metadata.get("domain") or metadata.get("root_scope") or "general"),
+        schema_version=int(metadata.get("schema_version") or 1),
+        record_type=str(metadata.get("record_type") or metadata.get("type") or "note"),
+        collection=str(metadata.get("collection") or ""),
+        scope_kind=scope_kind,
+        scope_id=scope_id,
         updated=str(metadata.get("updated") or ""),
         review_after=str(metadata.get("review_after") or ""),
         related=related,
+        aliases=_as_strings(metadata.get("aliases")),
         identifiers=list(dict.fromkeys(identifiers)),
         projects=_as_strings(metadata.get("related_projects")),
         repos=_as_strings(metadata.get("related_repos")),
@@ -286,10 +292,3 @@ def cosine_sparse(left: dict[int, float], right: dict[int, float]) -> float:
     if len(left) > len(right):
         left, right = right, left
     return sum(value * right.get(key, 0.0) for key, value in left.items())
-
-
-def wikilink_targets(values: Iterable[str]) -> list[str]:
-    targets: list[str] = []
-    for value in values:
-        targets.extend(match.group(1) for match in WIKILINK_RE.finditer(value))
-    return targets

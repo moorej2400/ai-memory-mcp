@@ -7,6 +7,7 @@ import pytest
 from ai_memory_mcp.artifacts.distillation import (
     list_pending_distillations,
     mark_distilled,
+    mark_distilled_targets,
     mark_no_durable_memory,
     recommended_distilled_note_path,
     replace_managed_distillation,
@@ -18,10 +19,12 @@ from ai_memory_mcp.artifacts.models import (
     ArtifactPayload,
     ArtifactReference,
     ArtifactScope,
+    DistillationTarget,
     ParsedArtifactBatch,
     RedactionPayload,
 )
 from ai_memory_mcp.artifacts.store import ArtifactStore
+from ai_memory_mcp.artifacts.schema import connect_artifact_db
 from ai_memory_mcp.config import Settings
 
 
@@ -194,7 +197,7 @@ def test_pending_list_applies_scope_and_recommends_a_safe_path(
     )
     assert scoped == [candidate]
     path = recommended_distilled_note_path(candidate)
-    assert path.as_posix().startswith("References/Meetings/2026/")
+    assert path.as_posix().startswith("Collections/Meetings/Records/2026/")
     assert ".." not in path.parts
     assert candidate.artifact_id.removeprefix("art_")[:10] in path.name
 
@@ -320,6 +323,56 @@ def test_valid_meeting_note_can_mark_the_current_source_distilled(
     assert list_pending_distillations(artifact_settings, limit=10) == []
 
 
+def test_one_artifact_can_distill_to_multiple_topic_notes(
+    artifact_settings: Settings,
+) -> None:
+    candidate = _pending_meeting(artifact_settings)
+    cue_uri = artifact_uri(
+        "transcript-cue",
+        artifact_id("chat-source", "workspace", "transcript-cue", "cue-1"),
+    )
+    records = artifact_settings.memory_root / "Notes"
+    records.mkdir(parents=True)
+    first = Path("Notes/Deployment Setting.md")
+    second = Path("Notes/Validation Owner.md")
+    note = _meeting_note(candidate, cue_uri)
+    (artifact_settings.memory_root / first).write_text(note, encoding="utf-8")
+    (artifact_settings.memory_root / second).write_text(
+        note.replace("mem-review-meeting", "mem-validation-owner"),
+        encoding="utf-8",
+    )
+
+    mark_distilled_targets(
+        artifact_settings,
+        candidate.artifact_uri,
+        [
+            DistillationTarget(
+                memory_id="mem-review-meeting",
+                memory_source_id="core",
+                memory_path=first.as_posix(),
+            ),
+            DistillationTarget(
+                memory_id="mem-validation-owner",
+                memory_source_id="core",
+                memory_path=second.as_posix(),
+            ),
+        ],
+        candidate.latest_event_id,
+        candidate.source_digest,
+    )
+
+    with connect_artifact_db(artifact_settings.artifact_db) as connection:
+        targets = connection.execute(
+            "SELECT memory_id FROM distillation_targets WHERE artifact_id = ? "
+            "ORDER BY memory_id",
+            (candidate.artifact_id,),
+        ).fetchall()
+    assert [row[0] for row in targets] == [
+        "mem-review-meeting",
+        "mem-validation-owner",
+    ]
+
+
 def test_stale_distillation_cannot_clear_new_source_work(
     artifact_settings: Settings,
 ) -> None:
@@ -344,18 +397,18 @@ def test_stale_distillation_cannot_clear_new_source_work(
         )
 
 
-def test_no_durable_memory_is_limited_to_conversations(
+def test_no_durable_memory_accepts_meetings(
     artifact_settings: Settings,
 ) -> None:
     meeting = _pending_meeting(artifact_settings)
-    with pytest.raises(ValueError, match="conversation"):
-        mark_no_durable_memory(
-            artifact_settings,
-            artifact_uri=meeting.artifact_uri,
-            event_id=meeting.latest_event_id,
-            source_digest=meeting.source_digest,
-            reason="No durable content.",
-        )
+    mark_no_durable_memory(
+        artifact_settings,
+        artifact_uri=meeting.artifact_uri,
+        event_id=meeting.latest_event_id,
+        source_digest=meeting.source_digest,
+        reason="No durable content.",
+    )
+    assert list_pending_distillations(artifact_settings, limit=10) == []
 
 
 def test_note_validation_rejects_transcript_like_content_and_missing_evidence(
@@ -429,12 +482,6 @@ def test_note_validation_rejects_a_short_transcript_section(
         ("type", "type: memory", "type: note"),
         ("title", "title: Review Meeting", "title: ''"),
         ("root_scope", "root_scope: work", "root_scope: ''"),
-        ("primary_scope", "  kind: reference", "  kind: project"),
-        (
-            "primary_scope",
-            "  id: artifact:{artifact_id}",
-            "  id: artifact:art_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ),
         ("status", "status: active", "status: draft"),
         ("created", "created: 2026-01-02", "created: not-a-date"),
         ("updated", "updated: 2026-01-02", "updated: not-a-date"),

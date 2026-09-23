@@ -1,202 +1,165 @@
 # Storage and Schema Contract
 
-Read this reference only when choosing a new canonical path, creating or changing a note schema, linking across roots, or handling identity and provenance.
+Read this reference before you create a record, collection, view, link, or migration plan.
 
 ## Canonical Layout
 
-Create folders lazily under the selected configured memory root:
+Create only the folders that contain useful records or views.
 
 ```text
 <memory-root>/
-  AI Memory.md
-  Indexes/
-    Memory Map.md
-    Repo Map.md
-    Project Map.md
-    Review Queue.md
-    Stale Memory.md
-    Conflicts.md
-  Repos/
-    <repo-key>/
-      _repo.md
-      Notes/
-      Tickets/
-        <ticket-id>/
-          _ticket.md
-          Notes/
-          Sessions/
-          Handoffs/
-  Projects/
-    <project-key>/
-      _project.md
-      Notes/
-  Areas/
-    Finance/
-    Immigration/
-    Health/
-    Travel/
-    Home/
-    Learning/
-    Relationships/
-    Other/
-  People/
-  Tools/
-  Workflows/
-  Decisions/
-  References/
-  Templates/
-  Skills/
-    Custom/
-      <skill-name>/
-        SKILL.md
-        references/
-        templates/
-        scripts/
-        assets/
-    Candidates/
+  Home.md
+  Notes/
+  Collections/
+    <collection>/
+      <collection>.base
+      Records/
+  Views/
+    Action Dashboard.base
+    Review Queue.base
+    Memory Health.base
+  Archive/
+  .ai-memory/
 ```
 
-Use `Projects/<project-key>/_project.md` for all new project anchors. Keep flat legacy project notes in place until a separately approved migration.
+`Notes/` is the default destination for durable topic notes.
+`Collections/` contains optional typed record sets with Obsidian Bases views.
+`Views/` contains cross-vault operational views.
+`Archive/` contains inactive material that must remain recoverable.
 
-## Stable Identity
+Do not create an `Objects/` folder only to group unrelated nouns.
+The collection name already identifies an optional object type.
 
-- `memory_id`: globally unique durable-note identity, independent of path and title.
-- `repo_id`: normalized remote identity such as `github:owner/repository`; otherwise an explicit local-only identity.
-- `ticket_id`: tracker-native identity such as `jira:DEMO-1430`.
-- `project_id`: stable project identity independent of display title.
-- `promotion_id`: `session_id:entry_id` when promoted from a session entry.
-- `skill_name`: lowercase hyphenated canonical skill identity matching its folder.
+Common collections include `People`, `Projects`, `Links`, `Recipes`, `Meetings`, and `Tools`.
+These names are examples, not required taxonomy.
 
-Never use a repository basename alone as canonical identity. Account for forks, mirrors, worktrees, renames, and local-only repositories.
+Use this project structure when a project needs several independent notes:
 
-## Structural Anchors
+```text
+Collections/Projects/Records/example/
+  example.md
+  Notes/
+    Deployment process.md
+    Production configuration.md
+```
 
-Use `_repo.md`, `_ticket.md`, and `_project.md` only as navigation and scope anchors:
+Create a collection with `ai-memory-collection` only after the first useful record exists.
+
+## Record Boundaries
+
+Write one independently maintained topic in each note.
+Keep related facts together when they change from the same evidence.
+Split a note when one section needs separate updates, ownership, status, or evidence.
+
+Do not create one file for each fact.
+Do not keep a complete project history in one large note.
+Let the search index create retrieval chunks inside each note.
+
+## Schema Version 2
+
+Use this frontmatter for each new canonical record:
 
 ```yaml
 ---
-type: memory-anchor
-anchor_kind: repo | ticket | project
-memory_id: mem-<unique-id>
-scope_id: github:owner/repository | jira:DEMO-1430 | project:<stable-id>
-title: Human-readable name
-status: active | closed | archived | needs-review
-created: YYYY-MM-DD
-updated: YYYY-MM-DD
-related: []
-provenance: []
----
-```
-
-The structural filename is an explicit exception to filename/title/H1 alignment. Keep the frontmatter `title` and H1 aligned. Put detailed facts in child notes.
-
-## Ordinary Notes
-
-Use this contract for durable memory, new sessions, handoffs, and indexes:
-
-```yaml
----
-type: memory | ai-session | handoff | memory-index
+schema_version: 2
 memory_id: mem-<unique-id>
 title: Human-readable title
-root_scope: work | personal
-primary_scope:
-  kind: repo | ticket | project | area | tool | person | decision | reference
-  id: stable-scope-id
-status: active | needs-review | superseded | archived
+type: memory
+record_type: note
+collection: Projects
+domain: work
+scope_kind: project
+scope_id: project:example
+status: active
 created: YYYY-MM-DD
 updated: YYYY-MM-DD
 review_after: null
+aliases: []
 related: []
-provenance: []
+provenance:
+  - source: manual
+    reference: task:<stable-id>
+    verified: YYYY-MM-DD
 supersedes: []
 superseded_by: null
 ---
 ```
 
-For ordinary notes, keep the filename, `title`, and H1 aligned. Assign exactly one primary scope and link upward to the applicable anchor or index.
+The `collection`, `scope_kind`, and `scope_id` fields are optional.
+If one scope field exists, both scope fields must exist.
+The `memory_id` stays stable after a file move or title change.
 
-### Identifier Extraction
+Use `record_type` to state what the record is.
+Examples include `note`, `person`, `project`, `link`, `recipe`, `meeting`, and `tool`.
+Use `domain` for a broad privacy or operating boundary.
+Do not use the folder path as record meaning.
 
-The full-text index contains the `title`, the headings, the body text, and the extracted identifiers. It does not contain the other frontmatter fields. A term in `related_tools` or `related_projects` alone is not searchable.
+Use `record_type: action` only for an actionable item.
+Add `owner` and `due` when those values are known.
+The Action Dashboard shows active action records.
 
-The index extracts identifiers from the complete file automatically. It finds ticket identifiers, pull-request references, and file paths. The frontmatter has no separate keyword field.
+Keep the filename, frontmatter `title`, and H1 equal.
+Start the body with a useful summary.
 
-Write each name, alias, and exact string into the title, a heading, or the body.
+## Legacy Compatibility
 
-## Session and Handoff Additions
+The indexer continues to read schema-version-1 fields.
+It maps `root_scope` to `domain` during retrieval.
+It maps nested `primary_scope` fields to generic scope filters.
 
-For `type: ai-session`, add stable `session_id` and concise source-thread metadata when available. Preserve only useful sections such as:
+Do not rewrite a legacy note only to change its schema number.
+Use the migration workflow when a content update or structure change also requires conversion.
 
-- Current State
-- Task Specification
-- Important Files and Systems
-- Decisions and Corrections
-- Durable Candidates
-- Promotion Entries
+## Stable Identity
 
-Use promotion-entry provenance in the form `session_id:entry_id`. Reprocessing that value must update or no-op.
+Use `memory_id` as the canonical record identity.
+Use provider-native identities for repositories, tickets, projects, and external records.
+Do not use a display title as the only identity.
 
-For `type: handoff`, keep the body limited to:
+Use `promotion_id` as `session_id:entry_id` when a session produces durable memory.
+Reprocessing one promotion must update or no-op.
 
-- Purpose
-- Current State
-- Important Artifacts
-- Decisions
-- Blockers
-- Next Action
+## Links Collection
+
+Use `Collections/Links/Records/` for saved web pages, products, articles, and external resources.
+Use `record_type: link` for each link record.
+Add fields such as `url`, `site`, `author`, `published`, and `accessed` when available.
+
+Keep the source URL even when the record also contains a durable summary.
+Do not require article fields for a product or general bookmark.
 
 ## Provenance
 
-Keep provenance short and auditable. Include only what helps a future agent judge the claim:
-
-- source session, task, ticket, document, or verified system
-- promotion ID when available
-- verification date or method
-- whether the change was user-requested or automatically captured
-- reason the content is durable
-
-Do not copy transcripts, long logs, or full promotion entries into durable notes.
+Keep provenance short and auditable.
+Record the source, stable reference, and verification date when available.
+Do not copy transcripts, long logs, or complete session entries into Markdown.
 
 ## Link Grammar
 
-- Use path-qualified same-root Obsidian links, such as `[[Repos/github--owner--repository/_repo|repository]]`.
-- Never use bare anchor links like `[[_repo]]`, `[[_ticket]]`, or `[[_project]]`.
-- Use `memory://<root-scope>/<memory-id>` for cross-root or legacy references.
-- Add `source_path` and `source_vault` to provenance for portable cross-root references.
-- Link managed skills to canonical Obsidian `SKILL.md` files, never to harness stubs.
+Use path-qualified links when titles are not unique.
+For example, use `[[Collections/People/Records/Example Person|Example Person]]`.
+Headings and display labels do not change the target identity.
+
+Add a link only when it gives useful context or supports navigation.
+An unlinked note is valid when no real relationship exists.
+Do not add weak links only to change the graph view.
 
 ## Deduplication and Supersession
 
-- Match by stable scope, canonical identity, provenance, and promotion ID before considering title similarity.
-- Reprocessing one promotion may target multiple notes only when the routing record explicitly lists each target.
-- Merge overlapping active notes when one precise note can own the claim.
-- Preserve unresolved contradictions and mark them `needs-review`.
-- When resolved, update both predecessor and successor links before marking the predecessor `superseded`.
-- Never delete the predecessor during ordinary consolidation.
+Match stable identity and provenance before title similarity.
+Merge active records when one precise note can own the same topic.
+Mark unresolved contradictions as `needs-review`.
+Keep a superseded predecessor readable and linked.
 
-## Index Updates
+## Distilled Artifact Records
 
-Update only indexes affected by the change:
+An artifact can produce zero, one, or many durable notes.
+Store each note by its durable topic or collection.
+Do not force all meeting content into one meeting note.
 
-- `Memory Map.md` for top-level discovery
-- `Repo Map.md` for repository anchors
-- `Project Map.md` for projects
-- `Review Queue.md` for unresolved candidates
-- `Stale Memory.md` for review-due facts
-- `Conflicts.md` for contradictory active claims
+Use `Collections/Meetings/Records/` for meeting records that remain useful as meetings.
+Use `Collections/Conversations/Records/` for useful conversation records.
+Store reusable facts in the collection or topic that owns those facts.
 
-Do not rebuild unrelated indexes for a narrow write.
-
-## Distilled artifact notes
-
-Store distilled meeting notes under `References/Meetings/`.
-Store durable conversation notes under `References/Conversations/`.
-
-Add `artifact_kind`, `source_artifact`, `distilled_through_event`, and `source_digest` to the ordinary note frontmatter.
-Put agent-managed content between one begin marker and one end marker.
-Keep manual content outside this managed region.
-
-Do not put complete chat logs or transcripts in Markdown.
-Use short quotations with `artifact://` links for important evidence.
-Use the stable artifact ID suffix to prevent title and case collisions.
+Add `artifact_kind`, `source_artifact`, `distilled_through_event`, and `source_digest` when one artifact controls the managed region.
+Keep complete source material in the artifact database.

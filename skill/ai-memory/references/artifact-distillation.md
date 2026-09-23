@@ -13,10 +13,10 @@ Markdown is the authority for the durable summary.
 5. Preserve all manual Markdown outside the managed region.
 6. Replace only the content between the managed markers.
 7. Add short quotations with `artifact://` evidence links.
-8. Write or update one concise Markdown note.
+8. Write zero, one, or several concise topic notes.
 9. Run `memory_sync` after the Markdown write.
 10. Verify recall for the distilled claim.
-11. Mark the current event and source digest as distilled.
+11. Mark all target notes with the current event and source digest.
 
 Do not mark an artifact before the Markdown note and source digest pass validation.
 If the source digest changes, read the new source context and update the note.
@@ -36,22 +36,32 @@ Managed summary content.
 Do not put a marker inside managed content.
 Do not change text outside the markers unless the user requests that change.
 
-## Meeting notes
+## Outcome selection
+
+Choose `no-durable-memory` when the reviewed artifact has no future value.
+This outcome is valid for a meeting or conversation.
+
+Choose one target when one topic owns all durable content.
+Choose several targets when topics need independent updates, status, or evidence.
+
+Do not create a meeting note only because the source is a meeting.
+
+## Meeting records
 
 A meeting note contains a summary, decisions, actions, open questions, important context, and evidence when applicable.
 The `Evidence` section contains short quotations and stable artifact links.
 The note does not contain a transcript section or the complete transcript.
 
-Use this default path:
+Use this path when the meeting itself remains a durable record:
 
 ```text
-References/Meetings/<YYYY>/<YYYY-MM-DD>-<safe-title>-<short-artifact-id>.md
+Collections/Meetings/Records/<YYYY>/<YYYY-MM-DD>-<safe-title>-<short-artifact-id>.md
 ```
 
 Derive the stable suffix from the artifact ID.
 Do not derive the suffix from the provider external ID.
 
-## Conversation notes
+## Conversation records
 
 Create a conversation note only when the conversation contains durable information.
 Use resolutions, decisions, reusable context, open questions, and evidence when applicable.
@@ -59,11 +69,10 @@ Use resolutions, decisions, reusable context, open questions, and evidence when 
 Use this default path:
 
 ```text
-References/Conversations/<safe-title>-<short-artifact-id>.md
+Collections/Conversations/Records/<safe-title>-<short-artifact-id>.md
 ```
 
-For greetings, scheduling, acknowledgements, or banter, mark the reviewed conversation as `no-durable-memory`.
-Do not use `no-durable-memory` for a meeting.
+For greetings, scheduling, acknowledgements, or banter, use `no-durable-memory`.
 
 ## Required frontmatter
 
@@ -78,3 +87,11 @@ source_digest: <sha256>
 
 Use `artifact_kind: conversation` for a conversation note.
 Keep artifact-store provenance in the ordinary `provenance` list.
+
+For multiple targets, repeat `--target` with one JSON object for each note:
+
+```text
+--target '{"memory_id":"mem-example","memory_source_id":"core","memory_path":"Notes/Example.md"}'
+```
+
+The legacy `--memory-id`, `--source-id`, and `--path` options remain valid for one target.

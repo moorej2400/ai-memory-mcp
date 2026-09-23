@@ -47,6 +47,7 @@ from .models import (
     GraphifyStatus,
     IndexStatus,
     LoggingStatus,
+    MemoryQualityStatus,
     RecallCitation,
     RecallEvidence,
     RecallRelationship,
@@ -420,6 +421,11 @@ class MemoryService:
         *,
         source_id: str | None = None,
         root_scope: str | None = None,
+        domain: str | None = None,
+        record_type: str | None = None,
+        collection: str | None = None,
+        scope_kind: str | None = None,
+        scope_id: str | None = None,
         repository: str | None = None,
         project: str | None = None,
         ticket: str | None = None,
@@ -433,10 +439,18 @@ class MemoryService:
         limit: int | None = None,
     ) -> RecallResponse:
         started = time.perf_counter()
+        if root_scope and domain and root_scope.casefold() != domain.casefold():
+            raise ValueError("root_scope and domain must identify the same domain.")
+        effective_domain = domain or root_scope
         # Retrieval telemetry records filter use, not private filter values.
         scope_payload = {
             "source_id": source_id is not None,
             "root_scope": root_scope is not None,
+            "domain": domain is not None,
+            "record_type": record_type is not None,
+            "collection": collection is not None,
+            "scope_kind": scope_kind is not None,
+            "scope_id": scope_id is not None,
             "repository": repository is not None,
             "project": project is not None,
             "ticket": ticket is not None,
@@ -463,7 +477,11 @@ class MemoryService:
             value is not None
             for value in (
                 source_id,
-                root_scope,
+                effective_domain,
+                record_type,
+                collection,
+                scope_kind,
+                scope_id,
                 repository,
                 project,
                 ticket,
@@ -513,7 +531,11 @@ class MemoryService:
                 response, diagnostics = self._recall(
                     query,
                     source_id=source_id,
-                    root_scope=root_scope,
+                    root_scope=effective_domain,
+                    record_type=record_type,
+                    collection=collection,
+                    scope_kind=scope_kind,
+                    scope_id=scope_id,
                     repository=repository,
                     project=project,
                     ticket=ticket,
@@ -602,6 +624,10 @@ class MemoryService:
         *,
         source_id: str | None = None,
         root_scope: str | None = None,
+        record_type: str | None = None,
+        collection: str | None = None,
+        scope_kind: str | None = None,
+        scope_id: str | None = None,
         repository: str | None = None,
         project: str | None = None,
         ticket: str | None = None,
@@ -625,6 +651,10 @@ class MemoryService:
         scope = ScopeFilter(
             source_id=source_id,
             root_scope=root_scope,
+            record_type=record_type,
+            collection=collection,
+            scope_kind=scope_kind,
+            scope_id=scope_id,
             repository=repository,
             project=project,
             ticket=ticket,
@@ -646,6 +676,10 @@ class MemoryService:
             for value in (
                 source_id,
                 root_scope,
+                record_type,
+                collection,
+                scope_kind,
+                scope_id,
                 repository,
                 project,
                 ticket,
@@ -1260,8 +1294,23 @@ class MemoryService:
     def status(self) -> StatusResponse:
         from .artifacts.vector_index import current_artifact_index_path
         from .generation import generation_health
+        from .intake import inspect_vault
 
         generation = load_current_generation(self.settings)
+        try:
+            quality_data = inspect_vault(self.settings.memory_root)
+            memory_quality = MemoryQualityStatus.model_validate(
+                {
+                    "available": True,
+                    "notes": quality_data["notes"],
+                    "current_schema_notes": quality_data["current_schema_notes"],
+                    "error_count": quality_data["error_count"],
+                    "warning_count": quality_data["warning_count"],
+                    "issue_counts": quality_data["issue_counts"],
+                }
+            )
+        except (OSError, ValueError, TypeError):
+            memory_quality = MemoryQualityStatus(available=False)
         health_state = generation_health(self.settings)
         last_success = health_state.get("last_success", {})
         last_failure = health_state.get("last_failure", {})
@@ -1591,6 +1640,7 @@ class MemoryService:
                 mcp=mcp_version,
                 mcp_supported=mcp_version.startswith("1."),
             ),
+            memory_quality=memory_quality,
             checked_at=datetime.now(timezone.utc).isoformat(),
         )
 

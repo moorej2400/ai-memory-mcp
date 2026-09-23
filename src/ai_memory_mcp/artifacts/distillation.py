@@ -17,7 +17,7 @@ from ai_memory_mcp.audit import append_event
 from .context import active_ancestor_predicate, active_context_ids
 from .identity import artifact_uri as make_artifact_uri
 from .identity import parse_artifact_uri
-from .models import ArtifactScope, DistillationCandidate
+from .models import ArtifactScope, DistillationCandidate, DistillationTarget
 from .schema import connect_artifact_db, migrate_artifact_db
 
 DISTILLED_BEGIN = "%% ai-memory:distilled-begin %%"
@@ -88,10 +88,15 @@ def recommended_distilled_note_path(candidate: DistillationCandidate) -> Path:
     if candidate.entity == "meeting":
         occurred = candidate.occurred_at or datetime.now(timezone.utc)
         date = occurred.date().isoformat()
-        return Path("References") / "Meetings" / date[:4] / (
+        return Path("Collections") / "Meetings" / "Records" / date[:4] / (
             f"{date}-{title}-{suffix}.md"
         )
-    return Path("References") / "Conversations" / f"{title}-{suffix}.md"
+    return (
+        Path("Collections")
+        / "Conversations"
+        / "Records"
+        / f"{title}-{suffix}.md"
+    )
 
 
 def _list_pending_distillations(
@@ -281,30 +286,32 @@ def _validate_required_frontmatter(
     entity: str,
     artifact_reference: str,
 ) -> None:
-    _, artifact_value = parse_artifact_uri(artifact_reference)
     if metadata.get("type") != "memory":
         raise ValueError("The Markdown note type must be memory.")
     if not isinstance(metadata.get("title"), str) or not metadata["title"].strip():
         raise ValueError("The Markdown note title must be a nonempty string.")
-    if (
-        not isinstance(metadata.get("root_scope"), str)
-        or not metadata["root_scope"].strip()
-    ):
-        raise ValueError("The Markdown note root_scope must be a nonempty string.")
+    domain = metadata.get("domain") or metadata.get("root_scope")
+    if not isinstance(domain, str) or not domain.strip():
+        raise ValueError(
+            "The Markdown note domain or root_scope must be a nonempty string."
+        )
     primary_scope = metadata.get("primary_scope")
-    if not isinstance(primary_scope, dict) or primary_scope != {
-        "kind": "reference",
-        "id": f"artifact:{artifact_value}",
-    }:
-        raise ValueError("The Markdown note primary_scope must match the artifact.")
+    if primary_scope is not None and (
+        not isinstance(primary_scope, dict)
+        or not str(primary_scope.get("kind") or "").strip()
+        or not str(primary_scope.get("id") or "").strip()
+    ):
+        raise ValueError("The Markdown note primary_scope must contain kind and id.")
     if metadata.get("status") != "active":
         raise ValueError("The Markdown note status must be active.")
     for field in ("created", "updated"):
         if not _is_note_date(metadata.get(field)):
             raise ValueError(f"The Markdown note {field} must be a calendar date.")
-    if metadata.get("artifact_kind") != entity:
+    if metadata.get("artifact_kind") not in (None, entity):
         raise ValueError("The Markdown note artifact_kind does not match the artifact.")
-    if not isinstance(metadata.get("related"), list):
+    if metadata.get("related") is not None and not isinstance(
+        metadata.get("related"), list
+    ):
         raise ValueError("The Markdown note related field must be a list.")
     provenance = metadata.get("provenance")
     if not isinstance(provenance, list) or not any(
@@ -466,24 +473,31 @@ def _require_current(
         raise ValueError("The artifact source changed after this distillation began.")
 
 
-def _mark_distilled(
+def _mark_distilled_targets(
     settings: Settings,
     artifact_uri: str,
-    memory_id: str,
-    memory_source_id: str,
-    memory_path: str,
+    targets: list[DistillationTarget],
     event_id: str,
     source_digest: str,
 ) -> None:
     entity, artifact_id = parse_artifact_uri(artifact_uri)
     if entity not in {"meeting", "conversation"}:
         raise ValueError("Only a meeting or conversation can be distilled.")
-    if memory_source_id != settings.primary_source_id:
-        raise ValueError("The Markdown note must use the writable memory source.")
-    target = _safe_markdown_path(settings, memory_path)
-    if not target.is_file():
-        raise ValueError("The Markdown note does not exist under the memory root.")
-    markdown = target.read_text(encoding="utf-8-sig")
+    if not targets:
+        raise ValueError("At least one Markdown target is required.")
+    target_notes: list[tuple[DistillationTarget, str]] = []
+    identities: set[tuple[str, str, str]] = set()
+    for item in targets:
+        identity = (item.memory_source_id, item.memory_id, item.memory_path)
+        if identity in identities:
+            raise ValueError("The distillation target list contains a duplicate.")
+        identities.add(identity)
+        if item.memory_source_id != settings.primary_source_id:
+            raise ValueError("The Markdown note must use the writable memory source.")
+        target = _safe_markdown_path(settings, item.memory_path)
+        if not target.is_file():
+            raise ValueError("The Markdown note does not exist under the memory root.")
+        target_notes.append((item, target.read_text(encoding="utf-8-sig")))
     migrate_artifact_db(settings)
     with connect_artifact_db(settings.artifact_db) as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -507,15 +521,36 @@ def _mark_distilled(
                     sorted(context_ids),
                 ).fetchall()
             }
-            _validate_note(
-                markdown,
-                entity=entity,
-                artifact_reference=artifact_uri,
-                memory_id=memory_id,
-                event_id=event_id,
-                source_digest=source_digest,
-                allowed_references=allowed_references,
+            for item, markdown in target_notes:
+                _validate_note(
+                    markdown,
+                    entity=entity,
+                    artifact_reference=artifact_uri,
+                    memory_id=item.memory_id,
+                    event_id=event_id,
+                    source_digest=source_digest,
+                    allowed_references=allowed_references,
+                )
+            now = datetime.now(timezone.utc).isoformat()
+            connection.execute(
+                "DELETE FROM distillation_targets WHERE artifact_id = ?",
+                (artifact_id,),
             )
+            connection.executemany(
+                "INSERT INTO distillation_targets(artifact_id, memory_source_id, "
+                "memory_id, memory_path, created_at) VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        artifact_id,
+                        item.memory_source_id,
+                        item.memory_id,
+                        PurePosixPath(item.memory_path).as_posix(),
+                        now,
+                    )
+                    for item in targets
+                ],
+            )
+            primary = targets[0]
             connection.execute(
                 """
                 UPDATE distillation_state
@@ -529,10 +564,10 @@ def _mark_distilled(
                 (
                     event_id,
                     source_digest,
-                    memory_id,
-                    memory_source_id,
-                    PurePosixPath(memory_path).as_posix(),
-                    datetime.now(timezone.utc).isoformat(),
+                    primary.memory_id,
+                    primary.memory_source_id,
+                    PurePosixPath(primary.memory_path).as_posix(),
+                    now,
                     artifact_id,
                 ),
             )
@@ -554,12 +589,16 @@ def mark_distilled(
 ) -> None:
     started = time.perf_counter()
     try:
-        _mark_distilled(
+        _mark_distilled_targets(
             settings,
             artifact_uri,
-            memory_id,
-            memory_source_id,
-            memory_path,
+            [
+                DistillationTarget(
+                    memory_id=memory_id,
+                    memory_source_id=memory_source_id,
+                    memory_path=memory_path,
+                )
+            ],
             event_id,
             source_digest,
         )
@@ -595,6 +634,51 @@ def mark_distilled(
     )
 
 
+def mark_distilled_targets(
+    settings: Settings,
+    artifact_uri: str,
+    targets: list[DistillationTarget],
+    event_id: str,
+    source_digest: str,
+) -> None:
+    """Confirm that one artifact produced one or more durable memory notes."""
+    started = time.perf_counter()
+    try:
+        _mark_distilled_targets(
+            settings,
+            artifact_uri,
+            targets,
+            event_id,
+            source_digest,
+        )
+    except BaseException as exc:
+        append_event(
+            settings,
+            "distillation",
+            "distillation_mark_failed",
+            {
+                "artifact_uri": artifact_uri,
+                "target_count": len(targets),
+                "latency_ms": round((time.perf_counter() - started) * 1000, 3),
+                "error_type": type(exc).__name__,
+                "error_sha256": hashlib.sha256(
+                    str(exc).encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+        raise
+    append_event(
+        settings,
+        "distillation",
+        "distillation_mark_completed",
+        {
+            "artifact_uri": artifact_uri,
+            "target_count": len(targets),
+            "latency_ms": round((time.perf_counter() - started) * 1000, 3),
+        },
+    )
+
+
 def _mark_no_durable_memory(
     settings: Settings,
     artifact_uri: str,
@@ -603,8 +687,8 @@ def _mark_no_durable_memory(
     reason: str,
 ) -> None:
     entity, artifact_id = parse_artifact_uri(artifact_uri)
-    if entity != "conversation":
-        raise ValueError("Only a conversation can have no durable memory.")
+    if entity not in {"meeting", "conversation"}:
+        raise ValueError("Only a meeting or conversation can have no durable memory.")
     normalized_reason = reason.strip()
     if not normalized_reason or len(normalized_reason) > 1000:
         raise ValueError("The no-durable-memory reason has an invalid length.")
@@ -614,6 +698,10 @@ def _mark_no_durable_memory(
         try:
             state = _current_state(connection, artifact_id, entity)
             _require_current(state, event_id, source_digest)
+            connection.execute(
+                "DELETE FROM distillation_targets WHERE artifact_id = ?",
+                (artifact_id,),
+            )
             connection.execute(
                 """
                 UPDATE distillation_state

@@ -11,63 +11,12 @@ from typing import Any
 from .artifacts.schema import ClosingSQLiteConnection
 from .config import Settings
 from .index import current_index_path
-from .text import wikilink_targets
+from .wikilinks import identity_keys, resolve_link, wikilink_targets
 
 
 def _values(raw: str) -> list[str]:
     value = json.loads(raw)
     return [str(item) for item in value] if isinstance(value, list) else []
-
-
-def _identity_keys(row: sqlite3.Row) -> set[str]:
-    path = str(row["path"]).replace("\\", "/")
-    relative = path.split("/", 1)[-1]
-    keys = {
-        str(row["memory_id"]).casefold(),
-        str(row["title"]).casefold(),
-        path.casefold(),
-        relative.casefold(),
-        Path(relative).stem.casefold(),
-    }
-    keys.update(value.casefold() for value in _values(row["identifiers_json"]))
-    return {key for key in keys if key}
-
-
-def _related_keys(value: str) -> list[str]:
-    normalized = value.strip()
-    if normalized.startswith("[[") and normalized.endswith("]]"):
-        normalized = normalized[2:-2]
-    target, separator, label = normalized.partition("|")
-    target = target.strip().replace("\\", "/")
-    keys = [
-        target.casefold(),
-        Path(target).stem.casefold(),
-    ]
-    if separator and label.strip():
-        keys.append(label.strip().casefold())
-    return list(dict.fromkeys(key for key in keys if key))
-
-
-def _resolve_link(
-    value: str,
-    identity_candidates: dict[str, set[str]],
-) -> tuple[str | None, str]:
-    """Resolve one link target to a memory_id.
-
-    Separating "no such note" from "several notes match" matters: the first is
-    a broken link the author can fix, the second needs a disambiguating title.
-    """
-    candidates: set[str] = set()
-    for key in _related_keys(value):
-        matches = identity_candidates.get(key, set())
-        if len(matches) == 1:
-            return next(iter(matches)), "resolved"
-        candidates.update(matches)
-    if not candidates:
-        return None, "unresolved"
-    if len(candidates) > 1:
-        return None, "ambiguous"
-    return next(iter(candidates)), "resolved"
 
 
 def build_provider_graph(
@@ -91,7 +40,8 @@ def build_provider_graph(
             """
             SELECT memory_id, source_id, path, title, body, status, root_scope,
                    scope_kind, scope_id, related_json, identifiers_json,
-                   projects_json, repos_json, tools_json, content_hash, mtime_ns
+                   aliases_json, projects_json, repos_json, tools_json,
+                   content_hash, mtime_ns
             FROM documents
             ORDER BY source_id, path
             """
@@ -103,7 +53,12 @@ def build_provider_graph(
     }
     identity_candidates: dict[str, set[str]] = defaultdict(set)
     for row in rows:
-        for key in _identity_keys(row):
+        for key in identity_keys(
+            memory_id=str(row["memory_id"]),
+            title=str(row["title"]),
+            path=str(row["path"]),
+            aliases=_values(row["aliases_json"]),
+        ):
             identity_candidates[key].add(str(row["memory_id"]))
 
     nodes: list[dict[str, Any]] = []
@@ -150,18 +105,13 @@ def build_provider_graph(
                 )
 
         for related in _values(row["related_json"]):
-            candidates: set[str] = set()
-            for key in _related_keys(related):
-                matches = identity_candidates.get(key, set())
-                if len(matches) == 1:
-                    candidates = set(matches)
-                    break
-                candidates.update(matches)
-            if len(candidates) != 1:
+            target_memory_id, state = resolve_link(related, identity_candidates)
+            if state == "ignored":
+                continue
+            if state != "resolved":
                 unresolved_related += 1
                 continue
-            target_memory_id = next(iter(candidates))
-            target_id = node_id_by_memory[target_memory_id]
+            target_id = node_id_by_memory[str(target_memory_id)]
             if target_id == node_id:
                 continue
             edge_source_id, edge_target_id = sorted((node_id, target_id))
@@ -192,7 +142,9 @@ def build_provider_graph(
         node_id = node_id_by_memory[str(row["memory_id"])]
         source_file = str(row["path"]).replace("\\", "/")
         for target in dict.fromkeys(wikilink_targets([str(row["body"])])):
-            target_memory_id, state = _resolve_link(target, identity_candidates)
+            target_memory_id, state = resolve_link(target, identity_candidates)
+            if state == "ignored":
+                continue
             if state == "unresolved":
                 unresolved_body_links += 1
                 continue

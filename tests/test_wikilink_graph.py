@@ -112,3 +112,50 @@ def test_self_links_are_ignored(tmp_path: Path) -> None:
     summary = _build(tmp_path)
     assert summary["body_links"] == 0
     assert summary["unresolved_body_links"] == 0
+
+
+def test_folder_qualified_link_resolves_duplicate_titles(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    _note(
+        vault,
+        "Projects/Alpha/Notes/Configuration.md",
+        "mem-alpha-config",
+        "Configuration",
+        "Alpha configuration.",
+    )
+    _note(
+        vault,
+        "Projects/Beta/Notes/Configuration.md",
+        "mem-beta-config",
+        "Configuration",
+        "Beta configuration.",
+    )
+    _note(
+        vault,
+        "Projects/Alpha/Alpha.md",
+        "mem-alpha",
+        "Alpha",
+        "See [[Projects/Alpha/Notes/Configuration#Ports]].",
+    )
+
+    summary = _build(tmp_path)
+
+    assert summary["body_links"] == 1
+    assert summary["ambiguous_body_links"] == 0
+
+
+def test_display_label_does_not_replace_a_missing_target(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    _note(vault, "Home.md", "mem-home", "Home", "Home note.")
+    _note(
+        vault,
+        "Source.md",
+        "mem-source",
+        "Source",
+        "See [[Missing/Target|Home]].",
+    )
+
+    summary = _build(tmp_path)
+
+    assert summary["body_links"] == 0
+    assert summary["unresolved_body_links"] == 1

@@ -602,7 +602,7 @@ def test_status_and_ordered_read_include_artifact_state(
     service = MemoryService(artifact_settings)
     status = service.status()
     assert status.artifact_database.available is True
-    assert status.artifact_database.schema_version == 6
+    assert status.artifact_database.schema_version == 7
     assert status.artifact_database.artifacts == 1
 
     reference = artifact_uri(

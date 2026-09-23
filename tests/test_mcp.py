@@ -56,12 +56,16 @@ def test_public_tool_surface_is_small_and_stable(
     assert set(tools) == {
         "memory_recall",
         "memory_artifact_read",
+        "memory_upsert",
         "memory_sync",
         "memory_status",
     }
     assert tools["memory_recall"].annotations.readOnlyHint is True
     assert tools["memory_artifact_read"].annotations.readOnlyHint is True
     assert tools["memory_artifact_read"].annotations.idempotentHint is True
+    assert tools["memory_upsert"].annotations.readOnlyHint is False
+    assert tools["memory_upsert"].annotations.destructiveHint is False
+    assert tools["memory_upsert"].annotations.idempotentHint is True
     assert tools["memory_status"].annotations.readOnlyHint is True
     assert tools["memory_sync"].annotations.readOnlyHint is False
     output_schema = tools["memory_recall"].output_schema
@@ -87,6 +91,7 @@ def test_public_tool_surface_is_small_and_stable(
     assert "derived indexes" in tools["memory_sync"].description
     assert "artifact data changes" in tools["memory_sync"].description
     assert "artifact data changes" in server.instructions
+    assert "memory_upsert" in server.instructions
 
 
 def test_warm_worker_pool_reuses_process(

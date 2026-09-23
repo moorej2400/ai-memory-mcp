@@ -9,6 +9,8 @@ Return to the [project overview](../README.md) for the quick-start procedure.
 - [AI agent setup](agent-new-system-setup.md) gives the complete new-system procedure.
 - [Configuration](configuration.md) describes each configuration group.
 - [Operations](operations.md) gives common operating procedures.
+- [Markdown intake](intake-contract.md) defines the generic record contract.
+- [Vault migrations](migrations.md) gives the recoverable migration procedure.
 
 ## Design and quality
 

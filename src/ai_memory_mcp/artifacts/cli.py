@@ -79,15 +79,24 @@ def _parser() -> argparse.ArgumentParser:
         help="Confirm a current Markdown distillation.",
     )
     distilled.add_argument("--reference", required=True)
-    distilled.add_argument("--memory-id", required=True)
-    distilled.add_argument("--source-id", required=True)
-    distilled.add_argument("--path", required=True)
+    distilled.add_argument("--memory-id")
+    distilled.add_argument("--source-id")
+    distilled.add_argument("--path")
+    distilled.add_argument(
+        "--target",
+        action="append",
+        default=[],
+        help=(
+            "JSON target with memory_id, memory_source_id, and memory_path. "
+            "Repeat this option for multiple notes."
+        ),
+    )
     distilled.add_argument("--event-id", required=True)
     distilled.add_argument("--source-digest", required=True)
 
     no_memory = commands.add_parser(
         "mark-no-durable-memory",
-        help="Confirm that a conversation has no durable content.",
+        help="Confirm that a meeting or conversation has no durable content.",
     )
     no_memory.add_argument("--reference", required=True)
     no_memory.add_argument("--event-id", required=True)
@@ -289,18 +298,46 @@ def _pending(settings: Settings, args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _mark_distilled(settings: Settings, args: argparse.Namespace) -> dict[str, Any]:
-    from .distillation import mark_distilled
+    from .distillation import mark_distilled, mark_distilled_targets
+    from .models import DistillationTarget
 
-    mark_distilled(
-        settings,
-        artifact_uri=args.reference,
-        memory_id=args.memory_id,
-        memory_source_id=args.source_id,
-        memory_path=args.path,
-        event_id=args.event_id,
-        source_digest=args.source_digest,
-    )
-    return {"reference": args.reference, "status": "distilled"}
+    if args.target:
+        if any((args.memory_id, args.source_id, args.path)):
+            raise ValueError(
+                "Use --target or the single-target options, but not both."
+            )
+        targets = [
+            DistillationTarget.model_validate(json.loads(value))
+            for value in args.target
+        ]
+        mark_distilled_targets(
+            settings,
+            artifact_uri=args.reference,
+            targets=targets,
+            event_id=args.event_id,
+            source_digest=args.source_digest,
+        )
+        count = len(targets)
+    else:
+        if not all((args.memory_id, args.source_id, args.path)):
+            raise ValueError(
+                "The single-target options require --memory-id, --source-id, and --path."
+            )
+        mark_distilled(
+            settings,
+            artifact_uri=args.reference,
+            memory_id=args.memory_id,
+            memory_source_id=args.source_id,
+            memory_path=args.path,
+            event_id=args.event_id,
+            source_digest=args.source_digest,
+        )
+        count = 1
+    return {
+        "reference": args.reference,
+        "status": "distilled",
+        "target_count": count,
+    }
 
 
 def _mark_no_memory(settings: Settings, args: argparse.Namespace) -> dict[str, Any]:

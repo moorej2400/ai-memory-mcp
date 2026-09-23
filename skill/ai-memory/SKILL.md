@@ -23,10 +23,12 @@ Read [architecture.md](../../docs/architecture.md) when changing the retrieval s
 
 ## Dedicated AI Memory MCP Routing
 
-When a user asks to save, remember, update, or retrieve AI memory, treat the dedicated **AI Memory MCP** as the canonical system. Use its `memory_recall`, `memory_sync`, and `memory_status` tools together with the configured `AI_MEMORY_WORK_DIR`.
+When a user asks to save, remember, update, or retrieve AI memory, use the dedicated **AI Memory MCP**. Use `memory_recall`, `memory_upsert`, `memory_sync`, and `memory_status` with `AI_MEMORY_WORK_DIR`.
 
 - Do not substitute a Codex internal note, session artifact, or `.codex/memories` extension for a user-requested AI Memory MCP write.
-- Write canonical Markdown only under `AI_MEMORY_WORK_DIR`; then call `memory_sync` and report a sync failure separately from the successful canonical save.
+- Write schema-version-2 Markdown with `memory_upsert` when the tool is available.
+- Call `memory_sync` after the write batch.
+- Report a sync failure separately from a successful canonical write.
 - If the MCP is unavailable, report that limitation instead of silently saving the requested memory somewhere else.
 
 ## Load Configuration
@@ -67,14 +69,14 @@ Use memory as a normal source of context, not only after an explicit memory requ
 Run this workflow at meaningful checkpoints and before the final response of substantive work:
 
 1. **Classify the outcome.** Choose retrieval, durable memory, optional session or handoff, skill candidate, session-only context, or no write.
-2. **Choose the domain.** Select `work` or `personal` metadata before selecting a path.
-3. **Choose one primary scope.** Use repository, ticket, project, area, tool, person, decision, reference, or session-only.
+2. **Choose the domain.** Select the broad privacy or operating boundary before selecting a path.
+3. **Choose the record type.** Use a generic type that states what the record is.
 4. **Recall memory.** Use `memory_recall` across all configured sources with the narrowest safe scope.
 5. **Inspect canonical Markdown.** Read candidates from their reported source before choosing a write action.
 6. **Choose one action.** Update, create, enrich, merge, mark `needs-review`, supersede, route to `custom-skills-master`, retain session-only, or skip with a reason.
-7. **Find the links.** Before you write, identify the existing notes that give context. Use the step 4 recall results.
-8. **Write a small verified batch.** Apply concise Markdown changes that meet the note content rules. Preserve identity, provenance, links, and predecessor state.
-9. **Update navigation surfaces.** Touch only the relevant anchor, map, review queue, conflict, or stale-memory index.
+7. **Find useful relationships.** Add only links that give context, evidence, or navigation.
+8. **Write a small verified batch.** Preserve identity, provenance, useful links, and predecessor state.
+9. **Update views.** Touch only an applicable collection or operational view.
 10. **Refresh once.** After the material batch, publish one coordinated generation and verify each layer.
 11. **Report separate outcomes.** State what was written, merged or superseded, and whether indexing succeeded.
 
@@ -130,26 +132,25 @@ If the answer is only in a source vault, write a new note in the primary vault. 
 
 ## Route Storage
 
-Read [storage-and-schemas.md](references/storage-and-schemas.md) before creating a new scope, anchor, ordinary memory note, session, handoff, or cross-root link.
+Read [storage-and-schemas.md](references/storage-and-schemas.md) before creating a record, collection, view, scope, or link.
 
 Use these routing rules:
 
-- Repository knowledge -> `Repos/<repo-key>/`
-- Ticket knowledge -> `Repos/<repo-key>/Tickets/<ticket-id>/`
-- Cross-repository or non-code project -> `Projects/<project-key>/`
-- Ongoing responsibility -> `Areas/<area>/` in the primary root when its privacy policy permits the write
-- Tool behavior -> `Tools/`
-- Cross-cutting decision -> `Decisions/`; otherwise keep the decision with its primary scope
-- Repeatable procedure -> `custom-skills-master`
+- Use `Notes/` for an independently maintained topic that needs no typed collection.
+- Use `Collections/<name>/Records/` when typed fields or a Base view add value.
+- Use `Collections/Projects/Records/<project>/Notes/` for independent project topics.
+- Use `Collections/Links/Records/` for articles, products, bookmarks, and external resources.
+- Use `custom-skills-master` for repeatable agent procedures.
+- Keep a human procedure as ordinary memory when it does not control agent behavior.
 
-Create repository, ticket, and project folders only when there is a durable record worth retaining. Do not duplicate a cross-scope fact into every linked repository.
+Create each folder only after a durable record needs it. Do not create a standard set of empty collections.
 
 ## Retrieve Memory
 
 For recall requests:
 
-1. Determine work or personal scope and the likely repository, ticket, project, area, person, tool, or decision.
-2. Call `memory_recall` first with source, domain, repository, ticket, project, status, or path scope when known.
+1. Determine the likely domain, collection, record type, and generic scope.
+2. Call `memory_recall` with the narrowest known filters.
 3. Inspect the returned source ID, Markdown path, status, freshness, and provenance.
 4. Prefer an active canonical memory note over legacy session or vault results.
 5. Check `execution` before you interpret `result_kind` in response version 2.
@@ -173,24 +174,32 @@ Put only durable summaries, decisions, actions, open questions, context, and sho
 Preserve manual Markdown outside the managed distillation markers.
 Mark the current event and source digest only after the note passes validation and recall verification.
 
+## Migrate a Vault
+
+Read [migrations.md](references/migrations.md) before you change a legacy vault layout.
+Read each applicable note and design the target structure from its meaning.
+Use the migration CLI only for snapshots, safe moves, operation records, verification, and rollback.
+Snapshot each file before you edit or create it.
+Record each completed operation before you continue.
+Do not infer a destination from the source folder name alone.
+Verify the migration before you finish the vault change.
+
 ## Write and Reconcile Memory
 
 - Give every new durable note a globally unique `memory_id`.
-- Give each note exactly one primary scope and link it to the applicable anchor or index.
+- Give each note a stable identity, domain, record type, status, dates, and provenance.
+- Add `scope_kind` and `scope_id` only when a stable scope improves retrieval.
 - Preserve concise provenance: source session or task, promotion ID when available, verification source, and reason the fact is durable.
 - Reprocessing the same `promotion_id` must update or no-op; it must not create a duplicate claim.
 - Keep filename, frontmatter `title`, and H1 aligned for ordinary notes.
 - Keep `_repo.md`, `_ticket.md`, and `_project.md` as structural anchor exceptions.
 - Use `review_after` for information that is likely to change.
 
-Every new note must connect to the memory graph. An isolated note is very difficult to find again.
-
-- Search for related notes before you write. Use the recall results from the capture workflow.
-- Add a `[[Note Title]]` wikilink in the body for each note that gives useful context.
-- Link to the applicable anchor or index note.
-- Use the exact title of the target note. An unknown title makes a broken link. A title that two notes share makes an ambiguous link. The graph build discards both.
-- Add a wikilink in the other note also when the relation is important in both directions.
-- Do not add a link that gives no context. Three good links are better than ten weak links.
+Search for related notes before you write.
+Add a wikilink when it gives useful context, evidence, or navigation.
+Use a path-qualified target when two notes have the same title.
+Preserve heading anchors and display labels without treating them as target identity.
+Do not add a weak link only to avoid an isolated graph node.
 
 The graph build makes an edge from a body wikilink and from a frontmatter `related` entry. Use `related` for the primary relation. Use body wikilinks for context inside the text.
 
@@ -227,8 +236,9 @@ Treat sessions and handoffs as optional scoped context, not the default destinat
 
 - Search configured legacy session roots before creating a new session record.
 - Do not move or rewrite legacy sessions until their work/personal boundaries and conflict artifacts have been audited.
-- Store each new session or handoff under its relevant scope in `AI_MEMORY_WORK_DIR`.
-- Use `root_scope` metadata to distinguish work and personal records.
+- Promote durable topics from sessions into `Notes/` or an applicable collection.
+- Keep a session or handoff only when it has continuing operational value.
+- Use `domain` metadata to identify the broad boundary.
 - Keep handoffs concise: task, current state, important artifacts, decisions, blockers, and next action.
 - Preserve `session_id:entry_id` when promoting a session entry into durable memory.
 
@@ -286,7 +296,7 @@ Before considering a memory operation complete, check the relevant cases:
 - **Source safety:** Synchronization does not modify retrieval-only vaults.
 - **Conflict:** Contradictory facts remain linked and reviewable until resolved.
 - **Skill boundary:** Repeatable procedures route to `custom-skills-master`.
-- **Links:** Each new note has at least one link to a related note or to its anchor.
+- **Links:** Each new link is valid and gives useful context.
 - **Summary:** Each new note starts with a summary that can stand alone as the answer.
 - **Searchable terms:** Each new note contains the names, aliases, and exact strings a future query will use.
 - **Enrichment:** A note that was difficult to find gets the missing terms, detail, or links.

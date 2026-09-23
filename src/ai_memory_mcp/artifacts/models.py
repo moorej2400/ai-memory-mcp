@@ -265,6 +265,12 @@ class DistillationCandidate(StrictModel):
     status: DistillationStatus = "pending"
 
 
+class DistillationTarget(StrictModel):
+    memory_id: str = Field(min_length=1, max_length=500)
+    memory_source_id: str = Field(pattern=SOURCE_PATTERN.pattern)
+    memory_path: str = Field(min_length=4, max_length=2000)
+
+
 class ArtifactBurstRecord(StrictModel):
     artifact_id: str
     artifact_uri: str

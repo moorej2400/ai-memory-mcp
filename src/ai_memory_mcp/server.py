@@ -16,6 +16,7 @@ from pydantic import Field
 from .artifacts.models import ArtifactReadResponse
 from .config import Settings
 from .models import (
+    MemoryUpsertResponse,
     RecallCoverage,
     RecallResponse,
     RecallResponseV2,
@@ -147,9 +148,9 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         instructions=(
             "Use memory_recall for all memory retrieval. The server selects exact, "
             "search, raw-artifact, neighbor, and relationship behavior. Use "
-            "memory_artifact_read for ordered raw context. Use memory_sync after "
-            "canonical Markdown or artifact data changes. Use memory_status for "
-            "diagnostics."
+            "memory_artifact_read for ordered raw context. Use memory_upsert for "
+            "validated canonical Markdown writes. Use memory_sync after canonical "
+            "Markdown or artifact data changes. Use memory_status for diagnostics."
         ),
         host=settings.host,
         port=settings.port,
@@ -189,8 +190,28 @@ def create_server(settings: Settings | None = None) -> FastMCP:
             ),
         ] = None,
         root_scope: Annotated[
-            Literal["work", "personal"] | None,
-            Field(description="Optional memory domain."),
+            str | None,
+            Field(min_length=1, max_length=100, description="Legacy memory domain filter."),
+        ] = None,
+        domain: Annotated[
+            str | None,
+            Field(min_length=1, max_length=100, description="Optional memory domain."),
+        ] = None,
+        record_type: Annotated[
+            str | None,
+            Field(min_length=1, max_length=100, description="Optional record type."),
+        ] = None,
+        collection: Annotated[
+            str | None,
+            Field(min_length=1, max_length=200, description="Optional collection name."),
+        ] = None,
+        scope_kind: Annotated[
+            str | None,
+            Field(min_length=1, max_length=100, description="Optional generic scope kind."),
+        ] = None,
+        scope_id: Annotated[
+            str | None,
+            Field(min_length=1, max_length=500, description="Optional generic scope identity."),
         ] = None,
         repository: Annotated[
             str | None,
@@ -277,6 +298,11 @@ def create_server(settings: Settings | None = None) -> FastMCP:
             "query": query,
             "source_id": source_id,
             "root_scope": root_scope,
+            "domain": domain,
+            "record_type": record_type,
+            "collection": collection,
+            "scope_kind": scope_kind,
+            "scope_id": scope_id,
             "repository": repository,
             "project": project,
             "ticket": ticket,
@@ -290,6 +316,51 @@ def create_server(settings: Settings | None = None) -> FastMCP:
             "limit": limit,
         }
         return await _execute_recall(settings, arguments, response_version)
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+        structured_output=True,
+    )
+    def memory_upsert(
+        path: Annotated[
+            str,
+            Field(
+                min_length=4,
+                max_length=500,
+                description="Vault-relative path for one canonical Markdown record.",
+            ),
+        ],
+        markdown: Annotated[
+            str,
+            Field(
+                min_length=1,
+                max_length=1_000_000,
+                description="Complete schema-version-2 Markdown record.",
+            ),
+        ],
+        expected_sha256: Annotated[
+            str | None,
+            Field(
+                pattern=r"^[a-f0-9]{64}$",
+                description="Required current digest when the record already exists.",
+            ),
+        ] = None,
+    ) -> MemoryUpsertResponse:
+        """Create or update one validated canonical memory record."""
+        from .capture import upsert_memory
+
+        result = upsert_memory(
+            settings.memory_root,
+            relative_path=path,
+            markdown=markdown,
+            expected_sha256=expected_sha256,
+        )
+        return MemoryUpsertResponse.model_validate(result)
 
     @mcp.tool(
         annotations=ToolAnnotations(

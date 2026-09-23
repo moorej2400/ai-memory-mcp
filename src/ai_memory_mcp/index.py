@@ -27,8 +27,8 @@ from .embedding import fingerprint, resolve_provider
 from .models import MemoryChunk, MemoryDocument, ScopeFilter
 from .text import chunk_document, cosine_sparse, parse_document
 
-# Version 9 pins full-document artifact provenance with each indexed claim.
-SCHEMA_VERSION = 9
+# Version 10 adds generic collection and record metadata.
+SCHEMA_VERSION = 10
 _VECTOR_ITEM = struct.Struct("<He")
 _REPOSITORY_SCOPE_KINDS = frozenset({"repo", "repository"})
 
@@ -67,11 +67,15 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             body TEXT NOT NULL,
             status TEXT NOT NULL,
             root_scope TEXT NOT NULL,
+            memory_schema_version INTEGER NOT NULL,
+            record_type TEXT NOT NULL,
+            collection TEXT NOT NULL,
             scope_kind TEXT NOT NULL,
             scope_id TEXT NOT NULL,
             updated TEXT NOT NULL,
             review_after TEXT NOT NULL,
             related_json TEXT NOT NULL,
+            aliases_json TEXT NOT NULL,
             identifiers_json TEXT NOT NULL,
             projects_json TEXT NOT NULL,
             repos_json TEXT NOT NULL,
@@ -95,6 +99,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_chunks_memory ON chunks(memory_id, ordinal);
         CREATE INDEX IF NOT EXISTS idx_documents_scope
             ON documents(source_id, root_scope, status, scope_kind, scope_id);
+        CREATE INDEX IF NOT EXISTS idx_documents_collection
+            ON documents(source_id, collection, record_type, status);
         CREATE TABLE IF NOT EXISTS document_identity_aliases (
             identity TEXT COLLATE NOCASE NOT NULL,
             memory_id TEXT NOT NULL REFERENCES documents(memory_id) ON DELETE CASCADE,
@@ -150,6 +156,10 @@ def _path_scope_aliases(path: str) -> dict[str, set[str]]:
         "repository": set(),
         "project": set(),
         "ticket": set(),
+        "collection": set(),
+        "record_type": set(),
+        "scope_kind": set(),
+        "scope_id": set(),
     }
     markers = {
         "repos": "repository",
@@ -172,6 +182,14 @@ def _scope_alias_rows(document: MemoryDocument) -> list[tuple[str, str, str]]:
         aliases["repository"].update(_repository_aliases(document.scope_id))
     elif scope_kind in aliases and document.scope_id:
         aliases[scope_kind].add(_normalized_alias(document.scope_id))
+    if document.collection:
+        aliases["collection"].add(_normalized_alias(document.collection))
+    if document.record_type:
+        aliases["record_type"].add(_normalized_alias(document.record_type))
+    if document.scope_kind:
+        aliases["scope_kind"].add(_normalized_alias(document.scope_kind))
+    if document.scope_id:
+        aliases["scope_id"].add(_normalized_alias(document.scope_id))
     for value in document.repos:
         aliases["repository"].update(_repository_aliases(value))
     for kind, values in (
@@ -202,6 +220,7 @@ def _identity_alias_rows(document: MemoryDocument) -> list[tuple[str, str, int]]
         (relative_path, 1),
         (document.title, 2),
         (Path(document.path).stem, 3),
+        *((alias, 3) for alias in document.aliases),
         *((identifier, 4) for identifier in document.identifiers),
     )
     priorities: dict[str, int] = {}
@@ -247,7 +266,8 @@ def _insert_document(
         """
         INSERT INTO documents VALUES (
             :memory_id, :source_id, :path, :title, :body, :status, :root_scope,
-            :scope_kind, :scope_id, :updated, :review_after, :related_json,
+            :schema_version, :record_type, :collection, :scope_kind, :scope_id,
+            :updated, :review_after, :related_json, :aliases_json,
             :identifiers_json, :projects_json, :repos_json, :tools_json,
             :content_hash, :mtime_ns, :artifact_references_json
         )
@@ -255,6 +275,7 @@ def _insert_document(
         {
             **values,
             "related_json": json.dumps(document.related),
+            "aliases_json": json.dumps(document.aliases),
             "identifiers_json": json.dumps(document.identifiers),
             "projects_json": json.dumps(document.projects),
             "repos_json": json.dumps(document.repos),
@@ -486,6 +507,12 @@ def _build_index(
                     "SELECT path, memory_id, content_hash, mtime_ns FROM documents"
                 )
             }
+            current_paths = {
+                f"{source.source_id}/{path.relative_to(source.root).as_posix()}"
+                for source in sources
+                for path in eligible_by_source[source.source_id]
+            }
+            stale_paths = set(existing) - current_paths
             seen: set[str] = set()
             added = changed = unchanged = removed = 0
             parse_errors: list[dict[str, str]] = []
@@ -539,6 +566,15 @@ def _build_index(
                         "WHERE memory_id = ? AND path <> ?",
                         (document.memory_id, source_path),
                     ).fetchone()
+                    moved_from = None
+                    if row and str(row["path"]) in stale_paths:
+                        # A path move keeps memory_id stable. Remove only the
+                        # stale indexed path after the new file parsed safely.
+                        moved_from = str(row["path"])
+                        _remove_document(connection, document.memory_id)
+                        existing.pop(moved_from, None)
+                        stale_paths.discard(moved_from)
+                        row = None
                     if row:
                         parse_errors.append(
                             {
@@ -554,6 +590,8 @@ def _build_index(
                         continue
                     if old:
                         _remove_document(connection, old[0])
+                        changed += 1
+                    elif moved_from is not None:
                         changed += 1
                     else:
                         added += 1
@@ -1005,6 +1043,7 @@ def decode_document(row: sqlite3.Row) -> dict[str, object]:
     result = dict(row)
     for key in (
         "related_json",
+        "aliases_json",
         "identifiers_json",
         "projects_json",
         "repos_json",
@@ -1024,6 +1063,18 @@ def scope_sql(scope: ScopeFilter) -> tuple[str, list[str]]:
     if scope.root_scope:
         clauses.append("d.root_scope = ?")
         parameters.append(scope.root_scope)
+    if scope.record_type:
+        clauses.append("d.record_type = ? COLLATE NOCASE")
+        parameters.append(scope.record_type)
+    if scope.collection:
+        clauses.append("d.collection = ? COLLATE NOCASE")
+        parameters.append(scope.collection)
+    if scope.scope_kind:
+        clauses.append("d.scope_kind = ? COLLATE NOCASE")
+        parameters.append(scope.scope_kind)
+    if scope.scope_id:
+        clauses.append("d.scope_id = ? COLLATE NOCASE")
+        parameters.append(scope.scope_id)
     if scope.status:
         clauses.append("d.status = ?")
         parameters.append(scope.status)

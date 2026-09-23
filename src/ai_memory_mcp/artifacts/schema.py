@@ -15,7 +15,7 @@ from urllib.parse import quote
 from ai_memory_mcp import __version__
 from ai_memory_mcp.config import Settings
 
-ARTIFACT_SCHEMA_VERSION = 6
+ARTIFACT_SCHEMA_VERSION = 7
 NETWORK_FILESYSTEM_TYPES = {
     "9p",
     "afpfs",
@@ -227,6 +227,15 @@ def _migration_version(connection: sqlite3.Connection) -> int:
         "SELECT COALESCE(MAX(version), 0) FROM artifact_schema_migrations"
     ).fetchone()
     return int(row[0])
+
+
+def _migration_history_complete(connection: sqlite3.Connection, version: int) -> bool:
+    if version == 0:
+        return True
+    rows = connection.execute(
+        "SELECT version FROM artifact_schema_migrations ORDER BY version"
+    ).fetchall()
+    return [int(row[0]) for row in rows] == list(range(1, version + 1))
 
 
 MIGRATION_1_STATEMENTS = (
@@ -935,6 +944,8 @@ def migrate_artifact_db(settings: Settings) -> MigrationResult:
     backup_path: Path | None = None
     with connect_artifact_db(path) as connection:
         from_version = _migration_version(connection)
+        if not _migration_history_complete(connection, from_version):
+            raise RuntimeError("The artifact database migration history is incomplete.")
         if from_version > ARTIFACT_SCHEMA_VERSION:
             raise RuntimeError(
                 "The artifact database schema is newer than this application."
@@ -986,6 +997,45 @@ def migrate_artifact_db(settings: Settings) -> MigrationResult:
                 connection.rollback()
                 raise
             applied.append(6)
+        if from_version < 7:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                # One raw artifact can support several independent memory notes.
+                # The legacy columns keep the first target for older readers.
+                connection.execute(
+                    """
+                    CREATE TABLE distillation_targets (
+                        artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+                        memory_source_id TEXT NOT NULL,
+                        memory_id TEXT NOT NULL,
+                        memory_path TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY(
+                            artifact_id, memory_source_id, memory_id, memory_path
+                        )
+                    )
+                    """
+                )
+                connection.execute(
+                    "CREATE INDEX distillation_targets_memory_idx "
+                    "ON distillation_targets(memory_source_id, memory_id)"
+                )
+                connection.execute(
+                    "INSERT INTO distillation_targets(artifact_id, memory_source_id, "
+                    "memory_id, memory_path, created_at) "
+                    "SELECT artifact_id, memory_source_id, memory_id, memory_path, updated_at "
+                    "FROM distillation_state WHERE memory_source_id IS NOT NULL "
+                    "AND memory_id IS NOT NULL AND memory_path IS NOT NULL"
+                )
+                connection.execute(
+                    "INSERT INTO artifact_schema_migrations VALUES (?, ?, ?)",
+                    (7, datetime.now(timezone.utc).isoformat(), __version__),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            applied.append(7)
 
     _private_file(path)
     return MigrationResult(
@@ -1003,7 +1053,8 @@ def require_current_artifact_schema(settings: Settings) -> int:
         raise FileNotFoundError("Artifact database is not available.")
     with connect_artifact_db(path, read_only=True) as connection:
         version = _migration_version(connection)
-    if version != ARTIFACT_SCHEMA_VERSION:
+        complete = _migration_history_complete(connection, version)
+    if version != ARTIFACT_SCHEMA_VERSION or not complete:
         raise RuntimeError(
             "The artifact database schema is not current. "
             "Run `ai-memory-artifact init` before memory_sync."

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ai_memory_mcp.config import Settings
 from ai_memory_mcp.index import MemoryIndex, _eligible_markdown, build_index
+from ai_memory_mcp.models import ScopeFilter
 from ai_memory_mcp.text import parse_document, semantic_vector
 
 
@@ -76,6 +77,39 @@ def test_changed_note_rebuilds_only_one_document(
     assert second["added"] == 0
 
 
+def test_moved_note_keeps_identity_without_a_parse_error(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    source = vault / "People/Example.md"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "---\nmemory_id: mem-example\ntitle: Example\ntype: memory\n"
+        "status: active\ncreated: 2026-01-01\nupdated: 2026-01-01\n"
+        "---\n# Example\n\nA durable topic.\n",
+        encoding="utf-8",
+    )
+    settings = Settings(
+        memory_root=vault,
+        state_dir=vault / ".ai-memory/indexes",
+        graph_path=vault / ".ai-memory/provider-state/graph.json",
+        graphify_mcp_url="",
+        embedding_provider="hashed",
+    )
+    build_index(settings, force=True)
+    destination = vault / "Collections/People/Records/Example.md"
+    destination.parent.mkdir(parents=True)
+    source.replace(destination)
+
+    result = build_index(settings)
+
+    assert result["parse_errors"] == []
+    assert result["changed"] == 1
+    assert result["added"] == 0
+    assert result["removed"] == 0
+    assert MemoryIndex(settings).document("mem-example")["path"].endswith(
+        "Collections/People/Records/Example.md"
+    )
+
+
 def test_index_excludes_internal_data_markdown(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     internal = vault / ".ai-memory" / "migration"
@@ -128,3 +162,61 @@ def test_index_snapshot_integrity(benchmark_settings: Settings) -> None:
     metadata = index.metadata()
     assert metadata["documents"] == "13"
     assert int(metadata["chunks"]) >= 13
+
+
+def test_generic_collection_and_scope_filters(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    records = vault / "Collections/Links/Records"
+    records.mkdir(parents=True)
+    template = """---
+schema_version: 2
+memory_id: {memory_id}
+title: {title}
+type: memory
+record_type: link
+collection: Links
+domain: personal
+scope_kind: topic
+scope_id: research
+status: active
+created: 2026-09-18
+updated: 2026-09-18
+provenance:
+  - manual:test
+---
+# {title}
+
+An independently maintained link record.
+"""
+    (records / "First.md").write_text(
+        template.format(memory_id="mem_first", title="First"), encoding="utf-8"
+    )
+    notes = vault / "Notes"
+    notes.mkdir()
+    (notes / "Other.md").write_text(
+        template.format(memory_id="mem_other", title="Other")
+        .replace("collection: Links", "collection: Notes")
+        .replace("record_type: link", "record_type: note"),
+        encoding="utf-8",
+    )
+    settings = Settings(
+        memory_root=vault,
+        state_dir=vault / ".ai-memory/indexes",
+        graph_path=vault / ".ai-memory/provider-state/graph.json",
+        graphify_mcp_url="",
+        embedding_provider="hashed",
+    )
+    build_index(settings, force=True)
+    index = MemoryIndex(settings)
+
+    identities = index.scoped_identities(
+        ScopeFilter(
+            root_scope="personal",
+            collection="Links",
+            record_type="link",
+            scope_kind="topic",
+            scope_id="research",
+        )
+    )
+    assert "mem_first" in identities
+    assert "mem_other" not in identities

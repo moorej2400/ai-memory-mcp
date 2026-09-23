@@ -77,7 +77,9 @@ Fusion combines those views, and no group receives a rank penalty from list orde
 
 The configured primary vault receives all new records.
 Named additional vaults supply retrieval-only records.
-Each durable record has an identity, scope, status, dates, and provenance.
+Each durable record has an identity, domain, record type, status, dates, and provenance.
+Optional collections provide typed Obsidian Bases views.
+The folder path does not define record meaning.
 
 ### Memory indexer
 
@@ -128,7 +130,7 @@ Each result still cites its canonical anchor record.
 Graphify supplies graph nodes, edges, neighbors, and paths.
 
 The graph build makes an edge from three sources.
-A `primary_scope` value makes a `belongs-to` edge.
+A generic scope value makes a `belongs-to` edge.
 A frontmatter `related` entry makes a `declared-related` edge.
 A body wikilink makes a `body-link` edge.
 The build reports unresolved and ambiguous link counts separately.
@@ -150,7 +152,7 @@ Weighted traversal permits controlled multi-hop evidence inside that scope.
 
 ### MCP facade
 
-The MCP facade gives agents four public tools.
+The MCP facade gives agents five public tools.
 The facade applies scope rules before retrieval.
 The facade returns source paths and retrieval evidence.
 The facade runs recall in a bounded pool of supervised worker processes.
@@ -165,6 +167,7 @@ Process termination closes the worker generation lease and SQLite snapshot.
 |---|---|
 | `memory_recall` | Returns cited Markdown and artifact evidence. |
 | `memory_artifact_read` | Returns ordered raw context for one artifact reference. |
+| `memory_upsert` | Creates or updates one validated schema-version-2 record. |
 | `memory_sync` | Publishes one coordinated derived generation. |
 | `memory_status` | Reports strict health for each required layer. |
 
@@ -175,7 +178,7 @@ Graphify is also stale when its source index is stale.
 
 1. Pin one current generation manifest.
 2. Open one artifact database read snapshot.
-3. Resolve each explicit source and domain scope.
+3. Resolve each explicit source, domain, collection, record type, and generic scope.
 4. Apply each explicit scope filter.
 5. Send the complete query to each applicable provider.
 6. Fuse provider ranks with reciprocal rank fusion.

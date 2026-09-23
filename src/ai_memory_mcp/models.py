@@ -14,12 +14,16 @@ class MemoryDocument:
     title: str
     body: str
     status: str = "active"
-    root_scope: str = "work"
+    root_scope: str = "general"
+    schema_version: int = 1
+    record_type: str = "note"
+    collection: str = ""
     scope_kind: str = "reference"
     scope_id: str = ""
     updated: str = ""
     review_after: str = ""
     related: list[str] = field(default_factory=list)
+    aliases: list[str] = field(default_factory=list)
     identifiers: list[str] = field(default_factory=list)
     projects: list[str] = field(default_factory=list)
     repos: list[str] = field(default_factory=list)
@@ -46,6 +50,10 @@ class MemoryChunk:
 class ScopeFilter:
     source_id: str | None = None
     root_scope: str | None = None
+    record_type: str | None = None
+    collection: str | None = None
+    scope_kind: str | None = None
+    scope_id: str | None = None
     repository: str | None = None
     project: str | None = None
     ticket: str | None = None
@@ -263,6 +271,15 @@ class SyncResponse(StrictOutput):
     errors: list[str] = Field(default_factory=list)
 
 
+class MemoryUpsertResponse(StrictOutput):
+    path: str
+    memory_id: str
+    sha256: str
+    created: bool
+    changed: bool
+    indexed: bool = False
+
+
 class CanonicalMemoryStatus(StrictOutput):
     source_id: str
     path: str
@@ -392,6 +409,15 @@ class RuntimeStatus(StrictOutput):
     mcp_supported: bool
 
 
+class MemoryQualityStatus(StrictOutput):
+    available: bool
+    notes: int = Field(default=0, ge=0)
+    current_schema_notes: int = Field(default=0, ge=0)
+    error_count: int = Field(default=0, ge=0)
+    warning_count: int = Field(default=0, ge=0)
+    issue_counts: dict[str, int] = Field(default_factory=dict)
+
+
 class GenerationStatus(StrictOutput):
     available: bool
     consistent: bool
@@ -419,4 +445,7 @@ class StatusResponse(StrictOutput):
     generation: GenerationStatus
     logging: LoggingStatus
     runtime: RuntimeStatus
+    memory_quality: MemoryQualityStatus = Field(
+        default_factory=lambda: MemoryQualityStatus(available=False)
+    )
     checked_at: str
