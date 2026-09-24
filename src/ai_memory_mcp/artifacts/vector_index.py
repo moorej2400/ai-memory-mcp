@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Iterator
 
 from ai_memory_mcp.audit import file_lock
 from ai_memory_mcp.ann import (
@@ -344,6 +344,31 @@ def _context_neighbor_ids(
     return neighbors
 
 
+def _rows_for_ids(
+    connection: sqlite3.Connection,
+    sql_template: str,
+    ids: Iterable[str],
+) -> Iterator[sqlite3.Row]:
+    unique_ids = sorted(set(ids))
+    if not unique_ids:
+        return
+    # Changed containers can expand to tens of thousands of descendants.
+    # Bound each ID-only query below SQLite's runtime limit and the older 999 cap.
+    batch_size = min(
+        900,
+        connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER),
+    )
+    if batch_size < 1:
+        raise RuntimeError("SQLite does not allow bound query parameters.")
+    for offset in range(0, len(unique_ids), batch_size):
+        batch = unique_ids[offset : offset + batch_size]
+        placeholders = ", ".join("?" for _ in batch)
+        yield from connection.execute(
+            sql_template.format(ids=placeholders),
+            batch,
+        )
+
+
 def _load_records(
     settings: Settings,
     previous_counter: int | None = None,
@@ -378,26 +403,24 @@ def _load_records(
                 }
                 selected_ids = set(changed_ids)
                 selected_ids.update(affected_ids)
-                placeholders = ", ".join("?" for _ in selected_ids)
                 searchable = {
                     str(row["artifact_id"])
-                    for row in connection.execute(
-                        "SELECT artifact_id FROM artifacts WHERE artifact_id IN ("
-                        + placeholders
-                        + ") AND entity IN ('message', 'transcript-cue', 'transcript')",
-                        sorted(selected_ids),
+                    for row in _rows_for_ids(
+                        connection,
+                        "SELECT artifact_id FROM artifacts WHERE artifact_id IN ({ids}) "
+                        "AND entity IN ('message', 'transcript-cue', 'transcript')",
+                        selected_ids,
                     )
                 }
                 # A changed container can alter titles, dates, or visibility for
                 # all contained passages. Expand only this uncommon container case.
-                changed_placeholders = ", ".join("?" for _ in changed_ids)
                 containers = {
                     str(row["artifact_id"])
-                    for row in connection.execute(
-                        "SELECT artifact_id FROM artifacts WHERE artifact_id IN ("
-                        + changed_placeholders
-                        + ") AND entity IN ('conversation', 'meeting')",
-                        sorted(changed_ids),
+                    for row in _rows_for_ids(
+                        connection,
+                        "SELECT artifact_id FROM artifacts WHERE artifact_id IN ({ids}) "
+                        "AND entity IN ('conversation', 'meeting')",
+                        changed_ids,
                     )
                 }
                 for container in containers:
@@ -417,12 +440,12 @@ def _load_records(
                 if changed_ids:
                     searchable.update(
                         str(row[0])
-                        for row in connection.execute(
+                        for row in _rows_for_ids(
+                            connection,
                             "SELECT source_artifact_id FROM artifact_links "
-                            "WHERE target_artifact_id IN ("
-                            + changed_placeholders
-                            + ") AND relation IN ('reply', 'reply-to', 'in-reply-to')",
-                            sorted(changed_ids),
+                            "WHERE target_artifact_id IN ({ids}) "
+                            "AND relation IN ('reply', 'reply-to', 'in-reply-to')",
+                            changed_ids,
                         )
                     )
                 if current_index is not None and current_index.is_file():
@@ -438,16 +461,14 @@ def _load_records(
                             )
                     if changed_uris:
                         with _connect(current_index, read_only=True) as derived:
-                            uri_placeholders = ", ".join("?" for _ in changed_uris)
                             searchable.update(
                                 parse_artifact_uri(str(row[0]))[1]
-                                for row in derived.execute(
+                                for row in _rows_for_ids(
+                                    derived,
                                     "SELECT DISTINCT b.anchor_artifact_uri "
                                     "FROM representation_dependencies AS dependency "
                                     "JOIN bursts AS b USING(burst_id) "
-                                    "WHERE dependency.artifact_uri IN ("
-                                    + uri_placeholders
-                                    + ")",
+                                    "WHERE dependency.artifact_uri IN ({ids})",
                                     changed_uris,
                                 )
                             )
@@ -461,23 +482,22 @@ def _load_records(
                 record_ids.update(neighbor_ids)
                 selected_anchors = {
                     artifact_uri(str(row["entity"]), str(row["artifact_id"]))
-                    for row in connection.execute(
-                        "SELECT artifact_id, entity FROM artifacts WHERE artifact_id IN ("
-                        + ", ".join("?" for _ in searchable)
-                        + ")",
-                        sorted(searchable),
+                    for row in _rows_for_ids(
+                        connection,
+                        "SELECT artifact_id, entity FROM artifacts "
+                        "WHERE artifact_id IN ({ids})",
+                        searchable,
                     )
-                } if searchable else set()
+                }
                 if record_ids:
-                    record_placeholders = ", ".join("?" for _ in record_ids)
                     record_ids.update(
                         str(row[0])
-                        for row in connection.execute(
+                        for row in _rows_for_ids(
+                            connection,
                             "SELECT target_artifact_id FROM artifact_links "
-                            "WHERE source_artifact_id IN ("
-                            + record_placeholders
-                            + ") AND relation IN ('reply', 'reply-to', 'in-reply-to')",
-                            sorted(record_ids),
+                            "WHERE source_artifact_id IN ({ids}) "
+                            "AND relation IN ('reply', 'reply-to', 'in-reply-to')",
+                            record_ids,
                         )
                     )
             else:

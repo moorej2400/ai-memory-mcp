@@ -20,7 +20,7 @@ from ai_memory_mcp.artifacts.models import (
     ParsedArtifactBatch,
 )
 from ai_memory_mcp.artifacts.store import ArtifactStore
-from ai_memory_mcp.artifacts.identity import artifact_id
+from ai_memory_mcp.artifacts.identity import artifact_id, artifact_uri
 from ai_memory_mcp.artifacts.vector_index import (
     build_artifact_vector_index,
     current_artifact_index_path,
@@ -304,6 +304,104 @@ def test_vector_index_groups_only_dirty_parents_after_the_first_build(
 
     assert len(grouped_parents) == 1
     assert len(grouped_parents[0]) == 1
+
+
+def test_incremental_record_load_stays_below_sqlite_bind_limit(
+    artifact_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(artifact_settings)
+    initial_messages = [
+        _event(
+            "message",
+            f"initial-{index}",
+            f"Initial context record {index} contains useful detail.",
+            f"2026-01-02T10:00:{index:02d}Z",
+            parent=("conversation", "bind-limit-parent"),
+        )
+        for index in range(12)
+    ]
+    store.apply_batch(
+        _batch(
+            "bind-limit-initial",
+            [
+                _event(
+                    "conversation",
+                    "bind-limit-parent",
+                    "Initial conversation context.",
+                    "2026-01-02T10:00:00Z",
+                ),
+                *initial_messages,
+            ],
+        )
+    )
+    published = build_artifact_vector_index(artifact_settings)
+    store.apply_batch(
+        _batch(
+            "bind-limit-container-update",
+            [
+                _event(
+                    "conversation",
+                    "bind-limit-parent",
+                    "Updated conversation context.",
+                    "2026-01-02T11:00:00Z",
+                )
+            ],
+        )
+    )
+
+    canonical_connect = vector_index_module.connect_artifact_db
+    index_connect = vector_index_module._connect
+
+    def limited_canonical(*args, **kwargs):
+        connection = canonical_connect(*args, **kwargs)
+        connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 8)
+        return connection
+
+    def limited_index(*args, **kwargs):
+        connection = index_connect(*args, **kwargs)
+        connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 8)
+        return connection
+
+    # A small limit reproduces container fan-out without a large fixture.
+    monkeypatch.setattr(vector_index_module, "connect_artifact_db", limited_canonical)
+    monkeypatch.setattr(vector_index_module, "_connect", limited_index)
+    previous = Path(published.snapshot)
+    _, selected, records = vector_index_module._load_records(
+        artifact_settings,
+        previous_counter=published.change_counter,
+        current_index=previous,
+    )
+    assert selected is not None
+    assert len(selected) == 12
+    assert len(records) == 12
+
+    new_messages = [
+        _event(
+            "message",
+            f"new-{index}",
+            f"New context record {index} contains useful detail.",
+            f"2026-01-02T12:00:{index:02d}Z",
+            parent=("conversation", "bind-limit-parent"),
+        )
+        for index in range(12)
+    ]
+    store.apply_batch(_batch("bind-limit-many-changes", new_messages))
+    _, selected, records = vector_index_module._load_records(
+        artifact_settings,
+        previous_counter=published.change_counter,
+        current_index=previous,
+    )
+    expected_new = {
+        artifact_uri(
+            "message",
+            artifact_id("chat-source", "workspace", "message", f"new-{index}"),
+        )
+        for index in range(12)
+    }
+    assert selected is not None
+    assert expected_new <= selected
+    assert len(records) >= len(expected_new)
 
 
 @pytest.mark.parametrize("position_key", [None, "ordinal", "message_index"])
