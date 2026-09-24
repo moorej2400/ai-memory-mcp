@@ -159,6 +159,10 @@ For recall requests:
 8. Search canonical Markdown directly when the facade is unavailable, stale, ambiguous, or missing expected results.
 9. State when an answer came only from legacy, stale, or unverified memory.
 
+When recall is partial, stale, or lacks needed detail, follow its source references.
+Inspect existing stored material before seeking a fresh copy from the source system.
+Do not treat an index failure as evidence that the stored source is missing.
+
 Do not treat a Graphify node as authority for a write target until the canonical Markdown exists and has been inspected.
 
 Use `memory_artifact_read` to inspect ordered context from an `artifact://` citation.
