@@ -32,9 +32,13 @@ A note that opens frontmatter without a closing fence now has no frontmatter.
 The earlier parser used a later `---` as the fence, for example a table separator.
 That error removed the start of the note from the index.
 
+The index schema version changed from `10` to `11`.
+The first synchronization after an upgrade parses every note again.
+Without this change, an incremental synchronization keeps notes from the earlier parser.
+
 ## Automated tests
 
-All `591` automated tests passed.
+All `605` automated tests passed.
 The suite emits an existing Pydantic lifespan annotation warning.
 
 These test files cover the change:
@@ -76,6 +80,9 @@ Each changed rank, neighbor list, and result order contains that edge.
 | First generation from setup | Passed. Status reported a consistent generation and an available graph. |
 | Upgrade from the earlier release | Passed. The earlier generation stayed valid before the first new synchronization. |
 | Health migration | Passed. The next synchronization wrote the `graph` layer name. |
+| Re-parse after upgrade | Passed. On the real vault copy, the first synchronization parsed all `163` notes again and added the missing edge. |
+| Launcher of another checkout | Passed. The retirement script reported the launcher and kept it. |
+| Graphify Codebase stub without Graphify | Passed. The client installers did not add the stub. |
 | Retirement dry run | Passed. The script reported the listener, the launcher, and the legacy state. It changed nothing. |
 | Retirement with the apply option | Passed. The script stopped the listener and moved the launcher and the state to the archive. |
 | Graphify Codebase | Passed. The wrapper used the kept runtime and built a code graph. |

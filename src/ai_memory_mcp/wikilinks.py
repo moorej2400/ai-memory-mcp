@@ -10,10 +10,11 @@ from typing import Iterable, Mapping
 # spans lines, and a backslash before `[[` makes the brackets literal text.
 WIKILINK_RE = re.compile(r"(?<!\\)\[\[([^\[\]\n|]+?)(?:\\?\|[^\[\]\n]*)?\]\]")
 FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.DOTALL)
+# The earliest of these starts the next region in which link syntax is text.
 # Obsidian `%%` comments and HTML comments are hidden from the rendered note.
-COMMENT_RE = re.compile(r"<!--.*?-->|%%.*?%%", re.DOTALL)
+REGION_START_RE = re.compile(r"<!--|%%|`+|\n")
 BLANK_LINE_RE = re.compile(r"\n[ \t]*\n")
+COMMENT_END = {"<!--": "-->", "%%": "%%"}
 NON_MARKDOWN_SUFFIXES = {
     ".base",
     ".canvas",
@@ -27,58 +28,86 @@ NON_MARKDOWN_SUFFIXES = {
 }
 
 
-def _without_fenced_code(text: str) -> list[str]:
-    """Return the text segments outside fenced code blocks.
+def _fence_end(text: str, start: int) -> int | None:
+    """Return the end of the fenced block that opens at `start`, if one opens.
 
     This follows the CommonMark fence rules that Obsidian uses: a closing fence
     uses the same character and is at least as long as the opening fence. An
     unclosed fence continues to the end of the note.
     """
-    segments: list[str] = []
-    current: list[str] = []
-    fence: str | None = None
-    for line in text.splitlines(keepends=True):
-        stripped = line.rstrip("\r\n")
-        if fence is None:
-            opening = FENCE_OPEN_RE.match(stripped)
-            # A backtick fence cannot have a backtick in its info string.
-            if opening and not (
-                opening.group(1)[0] == "`" and "`" in opening.group(2)
-            ):
-                fence = opening.group(1)
-                segments.append("".join(current))
-                current = []
-                continue
-            current.append(line)
-            continue
-        candidate = stripped.lstrip(" ")
+    line_end = text.find("\n", start)
+    line_end = len(text) if line_end < 0 else line_end + 1
+    opening = FENCE_OPEN_RE.match(text[start:line_end].rstrip("\r\n"))
+    # A backtick fence cannot have a backtick in its info string.
+    if not opening or (opening.group(1)[0] == "`" and "`" in opening.group(2)):
+        return None
+    fence = opening.group(1)
+    position = line_end
+    while position < len(text):
+        next_end = text.find("\n", position)
+        next_end = len(text) if next_end < 0 else next_end + 1
+        line = text[position:next_end].rstrip("\r\n")
+        candidate = line.lstrip(" ")
+        marker = candidate.rstrip()
         if (
-            len(stripped) - len(candidate) <= 3
-            and candidate.rstrip()
-            and set(candidate.rstrip()) == {fence[0]}
-            and len(candidate.rstrip()) >= len(fence)
+            len(line) - len(candidate) <= 3
+            and marker
+            and set(marker) == {fence[0]}
+            and len(marker) >= len(fence)
         ):
-            fence = None
-    if fence is None:
-        segments.append("".join(current))
-    return segments
+            return next_end
+        position = next_end
+    return len(text)
 
 
 def linkable_text(value: str) -> str:
     """Remove the Markdown regions in which link syntax is literal text.
 
     Fenced code, inline code, HTML comments, and Obsidian comments do not create
-    links. An inline code span cannot cross a blank line, so each paragraph is
-    scanned separately; a stray backtick cannot hide links in later paragraphs.
+    links. One left-to-right pass finds these regions, so the region that starts
+    first wins: a fence line inside a comment is comment text, and a comment
+    marker inside code is code text. An inline code span cannot cross a blank
+    line, so a stray backtick cannot hide links in later paragraphs.
     """
     kept: list[str] = []
-    for segment in _without_fenced_code(value):
-        paragraphs = BLANK_LINE_RE.split(segment)
-        segment = "\n\n".join(
-            INLINE_CODE_RE.sub(" ", paragraph) for paragraph in paragraphs
-        )
-        kept.append(COMMENT_RE.sub(" ", segment))
-    return "\n".join(kept)
+    position = 0
+    line_start = True
+    while position < len(value):
+        if line_start:
+            fence_end = _fence_end(value, position)
+            if fence_end is not None:
+                kept.append("\n")
+                position = fence_end
+                continue
+        match = REGION_START_RE.search(value, position)
+        if match is None:
+            kept.append(value[position:])
+            break
+        kept.append(value[position : match.start()])
+        token = match.group()
+        if token == "\n":
+            kept.append(token)
+            position = match.end()
+            line_start = True
+            continue
+        line_start = False
+        if token in COMMENT_END:
+            # An unclosed comment hides the rest of the note.
+            end = value.find(COMMENT_END[token], match.end())
+            position = len(value) if end < 0 else end + len(COMMENT_END[token])
+            kept.append(" ")
+            continue
+        paragraph = BLANK_LINE_RE.search(value, match.end())
+        limit = paragraph.start() if paragraph else len(value)
+        closing = re.compile(rf"(?<!`){token}(?!`)").search(value, match.end(), limit)
+        if closing is None:
+            # An unmatched backtick run is literal text.
+            kept.append(token)
+            position = match.end()
+            continue
+        kept.append(" ")
+        position = closing.end()
+    return "".join(kept)
 
 
 def wikilink_targets(values: Iterable[str]) -> list[str]:

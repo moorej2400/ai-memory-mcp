@@ -28,7 +28,9 @@ from .models import MemoryChunk, MemoryDocument, ScopeFilter
 from .text import chunk_document, cosine_sparse, parse_document
 
 # Version 10 adds generic collection and record metadata.
-SCHEMA_VERSION = 10
+# Version 11 re-parses every note after the frontmatter and link parser fixes.
+# Incremental sync reuses unchanged notes, so only a new version rebuilds them.
+SCHEMA_VERSION = 11
 _VECTOR_ITEM = struct.Struct("<He")
 _REPOSITORY_SCOPE_KINDS = frozenset({"repo", "repository"})
 

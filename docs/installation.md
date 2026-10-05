@@ -87,6 +87,8 @@ The script runs `ai-memory-sync` to publish the first generation.
 The first generation contains the note graph.
 The `--install-clients` option configures all supported clients.
 The option installs repository-linked AI Memory and Graphify Codebase skill stubs.
+The installer adds the Graphify Codebase stub only when the `graphify` command is available.
+The command is available on `PATH` or in `.graphify-runtime`.
 
 Setup does not install Graphify.
 AI Memory does not use Graphify.

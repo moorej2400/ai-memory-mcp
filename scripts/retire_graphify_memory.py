@@ -11,6 +11,7 @@ file, and it never changes the pinned runtime that Graphify Codebase uses.
 from __future__ import annotations
 
 import argparse
+import html
 import os
 import shutil
 import subprocess
@@ -34,14 +35,15 @@ from _common import (  # noqa: E402
 from _processes import find_processes, terminate_tree  # noqa: E402
 
 LAUNCHER_LABEL = "graphify-global-mcp"
-# Only a launcher that starts the AI Memory listener script is retired.
-LAUNCHER_MARKERS = ("start_global_mcp", "start-graphify-global-mcp")
+# The earlier launchers started one of these scripts in `scripts/graphify/`.
+LAUNCHER_SCRIPTS = ("start_global_mcp.py", "start-graphify-global-mcp.ps1")
 
 
 @dataclass(frozen=True)
 class Launcher:
     path: Path
     kind: str
+    owned: bool = True
 
 
 def memory_root() -> Path:
@@ -88,14 +90,47 @@ def launcher_candidates(home: Path) -> list[Launcher]:
     ]
 
 
-def installed_launchers(home: Path) -> list[Launcher]:
+def _launcher_text_forms(text: str) -> set[str]:
+    """Return the launcher text with each format's escapes removed.
+
+    The plist escapes XML entities, the desktop entry doubles `%`, and the
+    systemd and desktop entries escape quotes and backslashes.
+    """
+    unescaped = html.unescape(text).replace("%%", "%")
+    forms = {unescaped, unescaped.replace('\\"', '"').replace("\\\\", "\\")}
+    return {form.casefold() if WINDOWS or MACOS else form for form in forms}
+
+
+def launcher_owner(text: str, repository: Path) -> str | None:
+    """Return `this`, `other`, or None for a launcher's start script.
+
+    Only one launcher file name exists for each user. Another checkout can own
+    it, so the start script path must be inside this repository.
+    """
+    if not any(name in text for name in LAUNCHER_SCRIPTS):
+        return None
+    forms = _launcher_text_forms(text)
+    for root in {repository, repository.resolve()}:
+        for name in LAUNCHER_SCRIPTS:
+            script = root / "scripts" / "graphify" / name
+            for spelling in {str(script), script.as_posix()}:
+                key = spelling.casefold() if WINDOWS or MACOS else spelling
+                if any(key in form for form in forms):
+                    return "this"
+    return "other"
+
+
+def installed_launchers(home: Path, repository: Path) -> list[Launcher]:
     found: list[Launcher] = []
     for launcher in launcher_candidates(home):
         if not launcher.path.is_file():
             continue
         text = launcher.path.read_text(encoding="utf-8", errors="replace")
-        if any(marker in text for marker in LAUNCHER_MARKERS):
-            found.append(launcher)
+        owner = launcher_owner(text, repository)
+        if owner is not None:
+            found.append(
+                Launcher(launcher.path, launcher.kind, owned=owner == "this")
+            )
     return found
 
 
@@ -174,7 +209,7 @@ def main(argv: list[str] | None = None, *, home: Path | None = None) -> int:
     info(f"Graphify retirement ({mode}). Archive: {archive}")
 
     processes = find_processes("graphify-mcp", str(graph))
-    launchers = installed_launchers(home or Path.home())
+    launchers = installed_launchers(home or Path.home(), repository)
     state_present = state.is_dir()
     generation_ready = native_generation_available() if state_present else True
 
@@ -187,6 +222,9 @@ def main(argv: list[str] | None = None, *, home: Path | None = None) -> int:
         info("Listener: none found.")
 
     for launcher in launchers:
+        if not launcher.owned:
+            info(f"Launcher: {launcher.path} (kept). It starts another checkout.")
+            continue
         info(f"Launcher: {launcher.path}")
         if args.apply:
             unregister(launcher)
@@ -218,7 +256,8 @@ def main(argv: list[str] | None = None, *, home: Path | None = None) -> int:
     runtime = repository / ".graphify-runtime"
     if runtime.is_dir():
         info(f"Kept {runtime}. Graphify Codebase can use this runtime.")
-    if not args.apply and (processes or launchers or state_present):
+    owned_launchers = [launcher for launcher in launchers if launcher.owned]
+    if not args.apply and (processes or owned_launchers or state_present):
         info("No change was made. Run again with --apply to retire these items.")
     return 0
 

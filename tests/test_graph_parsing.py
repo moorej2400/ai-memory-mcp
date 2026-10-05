@@ -81,6 +81,25 @@ def test_inline_code_and_comments_do_not_create_links() -> None:
     assert wikilink_targets([body]) == ["Visible Link"]
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "<!-- example\n```\n-->\nSee [[Real Link]].",
+        "%% draft\n~~~\n%%\nSee [[Real Link]].",
+        "<!-- one -->\n```\n<!--\n```\nSee [[Real Link]].",
+        "`<!--` and `%%` then [[Real Link]] `-->`",
+        "```\n%% [[Code Link]]\n```\nSee [[Real Link]]. %% hidden %%",
+    ],
+)
+def test_overlapping_code_and_comment_regions(body: str) -> None:
+    # The region that starts first decides how the other markers are read.
+    assert wikilink_targets([body]) == ["Real Link"]
+
+
+def test_an_unclosed_comment_hides_the_rest_of_the_note() -> None:
+    assert wikilink_targets(["[[Before]] <!-- open\n[[After]]"]) == ["Before"]
+
+
 def test_a_stray_backtick_cannot_hide_a_later_paragraph() -> None:
     body = "A lone ` backtick.\n\nThen [[Later Link]] and a ` tick."
     assert wikilink_targets([body]) == ["Later Link"]
@@ -289,3 +308,54 @@ def test_status_reports_a_structurally_corrupt_graph(tmp_path: Path) -> None:
     assert status.graph.available is False
     assert status.graph.error and "no identifier" in status.graph.error
     assert any("graph component is unavailable" in item for item in recall.warnings)
+
+
+def _legacy_frontmatter(raw: str) -> tuple[dict, str]:
+    """The pre-fix splitter, which matched `---` anywhere in the text."""
+    if not raw.startswith("---"):
+        return {}, raw
+    parts = raw.split("---", 2)
+    if len(parts) != 3:
+        return {}, raw
+    try:
+        metadata = yaml.safe_load(parts[1]) or {}
+    except yaml.YAMLError:
+        metadata = {}
+    return metadata if isinstance(metadata, dict) else {}, parts[2].lstrip()
+
+
+def test_upgrade_reparses_notes_indexed_by_the_earlier_parser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ai_memory_mcp import index as index_module
+    from ai_memory_mcp import text as text_module
+    from ai_memory_mcp.index import MemoryIndex, current_index_path
+
+    vault = tmp_path / "vault"
+    _note(vault, "Target.md", "memory_id: mem-target\ntitle: Target\n", "# Target")
+    # The frontmatter never closes. The table separator is body text.
+    (vault / "Open.md").write_text(
+        "---\n# Open\n\nSee [[Target]].\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n",
+        encoding="utf-8",
+    )
+    settings = Settings(
+        memory_root=vault,
+        state_dir=tmp_path / "state",
+        graph_path=tmp_path / "unused.json",
+        embedding_provider="hashed",
+    )
+    with monkeypatch.context() as earlier:
+        earlier.setattr(text_module, "_frontmatter", _legacy_frontmatter)
+        earlier.setattr(index_module, "SCHEMA_VERSION", 10)
+        build_index(settings, force=False)
+        old = MemoryIndex(settings, path=current_index_path(settings))
+        assert "[[Target]]" not in str(old.document("core/Open.md")["body"])
+
+    # The upgraded release must not reuse the unchanged, mis-parsed note.
+    result = build_index(settings, force=False)
+    assert result["unchanged"] == 0
+    upgraded = MemoryIndex(settings, path=current_index_path(settings))
+    assert "[[Target]]" in str(upgraded.document("core/Open.md")["body"])
+    summary = build_memory_graph(settings, tmp_path / "out")
+    assert summary["body_links"] == 1

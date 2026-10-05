@@ -481,6 +481,7 @@ AI Memory does not use the archived scripts.
    The setup command keeps the existing `.env` file.
    The setup command does not install Graphify.
    The setup command runs `ai-memory-sync` and publishes a native generation.
+   The first synchronization parses every note again, because the index schema changed.
 
 3. If you updated the package without the setup command, run `ai-memory-sync`.
 4. Restart each configured client.
@@ -515,6 +516,8 @@ AI Memory does not use the archived scripts.
 
 With the apply option, the script stops a `graphify-mcp` process that serves the legacy `global-graph.json` file.
 The script unregisters the earlier login launcher and moves the launcher file to the `launchers/` archive directory.
+The script changes a launcher only when the launcher starts a script in this repository.
+The script reports and keeps a launcher that starts another checkout.
 The script moves the legacy Graphify state directory to the `provider-state/` archive directory.
 Both archive directories are under `AI_MEMORY_WORK_DIR/.ai-memory/backups/graphify-retirement/<stamp>/`.
 The script does not delete a file.

@@ -22,17 +22,32 @@ The `scripts/graphify/` directory contains the earlier Graphify pipeline for AI 
 | Earlier item | Current item |
 | --- | --- |
 | Graph refresh | `ai-memory-sync` or the `memory_sync` MCP tool. One generation holds the Markdown index, the artifact index, and the note graph. |
-| Graph validation | Generation publication. It validates the graph structure, the checksum, and the Markdown snapshot before it changes the pointer. |
+| Graph validation | Generation publication validates the graph structure and the Markdown snapshot before it changes the pointer. Recall and status compare the recorded checksum when they load the graph. |
 | Global MCP listener | None. Agents use the `memory_recall` MCP tool. |
 | Retrieval check | `scripts/run_retrieval_eval.py` |
 | Process helpers | `scripts/_processes.py` |
 | Listener and launcher removal | `scripts/retire_graphify_memory.py` |
 
-## Restore an archived script
+## Restore the earlier pipeline
 
-These scripts need the pinned Graphify runtime.
-They import `_common.py` and `_processes.py` from the `scripts/` directory.
+The files in this directory are for reference only.
+They do not run in the current tree.
+They import helpers that `scripts/_common.py` no longer contains.
+`refresh_graph.py` also calls the removed `ai_memory_mcp.provider_graph` module.
 
-1. Install the runtime with `scripts/setup.py --memory-root <path> --with-graphify-codebase`.
-2. Copy the script to `scripts/graphify/` in a local working tree.
-3. Copy `scripts/_processes.py` to `scripts/graphify/` when the script uses it.
+Commit `514fc22` is the last revision that contains the complete pipeline.
+Use that revision in a separate worktree:
+
+1. Open a terminal in the repository root.
+2. Create a worktree at the earlier revision:
+
+   ```bash
+   git worktree add --detach <worktree-path> 514fc22
+   ```
+
+3. Run setup in the worktree. Setup at that revision installs the pinned Graphify runtime.
+4. If `graphify-mcp` does not start, install `mcp<2` into the `.graphify-runtime` environment.
+5. Run the scripts from `<worktree-path>/scripts/graphify/`.
+
+The earlier `graphifyy` release does not pin `mcp`.
+A new installation can get `mcp` 2, which `graphify-mcp` cannot use.

@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .platform_paths import user_app_data_dir, venv_python
+from .platform_paths import user_app_data_dir, venv_executable, venv_python
 
 
 SUPPORTED_CLIENTS = (
@@ -257,12 +257,27 @@ def _install_skill(
     return changed
 
 
+def graphify_codebase_available(repository_root: Path) -> bool:
+    """Report whether the Graphify Codebase skill can find its CLI.
+
+    Its wrapper uses `graphify` on PATH first and then the optional pinned
+    runtime. Setup installs that runtime only on request, so a stub without
+    either one would offer commands that fail.
+    """
+    runtime = venv_executable(repository_root / ".graphify-runtime", "graphify")
+    return bool(shutil.which("graphify")) or runtime.is_file()
+
+
 def _install_skills(
     repository_root: Path,
     destination_root: Path,
 ) -> list[Path]:
     changed: list[Path] = []
     for skill_name in SKILLS:
+        if skill_name == "graphify" and not graphify_codebase_available(
+            repository_root
+        ):
+            continue
         changed.extend(
             _install_skill(
                 repository_root,
@@ -418,6 +433,11 @@ def main() -> None:
     appdata = user_app_data_dir()
     clients = args.clients or list(SUPPORTED_CLIENTS)
     opencode_major = _opencode_major() if "opencode" in clients else None
+    if not graphify_codebase_available(repository_root):
+        print(
+            "graphify skill: skipped. Graphify is not installed. "
+            "Run setup with --with-graphify-codebase to add it."
+        )
 
     for client in clients:
         changed = install_client(

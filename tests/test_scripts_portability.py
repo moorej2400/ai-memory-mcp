@@ -192,11 +192,12 @@ def _legacy_installation(tmp_path: Path, retire, monkeypatch) -> tuple[Path, Pat
     (state / "corpora").mkdir(parents=True)
     (state / "global-graph.json").write_text("{}", encoding="utf-8")
     home = tmp_path / "home"
-    for launcher in retire.launcher_candidates(home):
-        launcher.path.parent.mkdir(parents=True, exist_ok=True)
-        launcher.path.write_text("start_global_mcp.py\n", encoding="utf-8")
     repository = tmp_path / "repo"
     repository.mkdir()
+    script = repository / "scripts" / "graphify" / "start_global_mcp.py"
+    for launcher in retire.launcher_candidates(home):
+        launcher.path.parent.mkdir(parents=True, exist_ok=True)
+        launcher.path.write_text(f"python {script}\n", encoding="utf-8")
     (repository / ".env").write_text(
         'AI_MEMORY_WORK_DIR="x"\nGRAPHIFY_GLOBAL_MCP_URL="y"\n', encoding="utf-8"
     )
@@ -275,7 +276,40 @@ def test_retirement_ignores_an_unrelated_launcher(
     for launcher in retire.launcher_candidates(home):
         launcher.path.write_text("some other program\n", encoding="utf-8")
 
-    assert retire.installed_launchers(home) == []
+    assert retire.installed_launchers(home, tmp_path / "repo") == []
+
+
+def test_retirement_keeps_the_launcher_of_another_checkout(
+    retire, monkeypatch, tmp_path: Path, capsys
+) -> None:
+    root, home = _legacy_installation(tmp_path, retire, monkeypatch)
+    other = tmp_path / "other-checkout" / "scripts" / "graphify" / "start_global_mcp.py"
+    for launcher in retire.launcher_candidates(home):
+        launcher.path.write_text(f"python {other}\n", encoding="utf-8")
+    monkeypatch.setattr(retire, "find_processes", lambda *fragments: [])
+
+    retire.main(["--apply"], home=home)
+
+    assert "It starts another checkout" in capsys.readouterr().out
+    assert all(item.path.is_file() for item in retire.launcher_candidates(home))
+
+
+@pytest.mark.parametrize(
+    ("render", "directory"),
+    [
+        (lambda path: path.replace("&", "&amp;"), "a&b"),
+        (lambda path: path.replace("%", "%%"), "100%"),
+        (lambda path: path.replace("\\", "\\\\").replace('"', '\\"'), 'quote"d'),
+    ],
+)
+def test_retirement_recognizes_escaped_launcher_paths(
+    retire, tmp_path: Path, render, directory: str
+) -> None:
+    repository = tmp_path / directory
+    script = repository / "scripts" / "graphify" / "start_global_mcp.py"
+
+    assert retire.launcher_owner(f"run {render(str(script))}", repository) == "this"
+    assert retire.launcher_owner(f"run {render(str(script))}", tmp_path / "x") == "other"
 
 
 def test_setup_uses_the_installed_artifact_initializer(
@@ -398,3 +432,35 @@ def test_retrieval_eval_has_no_user_specific_default(
     assert evaluation.retrieval_cases() == (("legacy", "x"),)
     monkeypatch.setenv("AI_MEMORY_RETRIEVAL_EVAL_CASES", '[["current", "y"]]')
     assert evaluation.retrieval_cases() == (("current", "y"),)
+
+
+@pytest.mark.parametrize("runtime_installed", [False, True])
+def test_codex_installs_the_graphify_skill_only_when_usable(
+    project_root: Path, monkeypatch, tmp_path: Path, runtime_installed: bool
+) -> None:
+    codex = _load("install_codex", "scripts/install_codex.py", project_root)
+    repository = tmp_path / "repo"
+    (repository / ".venv" / "bin").mkdir(parents=True)
+    (repository / ".venv" / "bin" / "python").write_text("", encoding="utf-8")
+    for name, relative in codex.SKILLS.items():
+        source = repository / relative
+        source.parent.mkdir(parents=True)
+        source.write_text(f"---\nname: {name}\ndescription: Test.\n---\n", encoding="utf-8")
+    (repository / "requirements-graphify.txt").write_text(
+        "graphifyy==0.9.26\n", encoding="utf-8"
+    )
+    if runtime_installed:
+        runtime = repository / ".graphify-runtime" / ("Scripts" if os.name == "nt" else "bin")
+        runtime.mkdir(parents=True)
+        (runtime / ("graphify.exe" if os.name == "nt" else "graphify")).write_text("")
+    monkeypatch.setattr(codex.shutil, "which", lambda name: None)
+    codex_home = tmp_path / "codex"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["install_codex.py", "--repository-root", str(repository), "--codex-home", str(codex_home)],
+    )
+
+    codex.main()
+
+    assert (codex_home / "skills" / "ai-memory" / "SKILL.md").is_file()
+    assert (codex_home / "skills" / "graphify" / "SKILL.md").is_file() is runtime_installed
