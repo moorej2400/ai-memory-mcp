@@ -17,7 +17,6 @@ from _common import (  # noqa: E402
     info,
     repository_root,
     run_main,
-    venv_executable,
     venv_python,
 )
 
@@ -27,14 +26,6 @@ ENV_TEMPLATE = """AI_MEMORY_WORK_DIR="{memory_root}"
 AI_MEMORY_PRIMARY_SOURCE_ID="core"
 AI_MEMORY_RETRIEVAL_SOURCES="{{}}"
 AI_MEMORY_ARTIFACT_BATCH_MAX_BYTES="268435456"
-GRAPHIFY_GLOBAL_MCP_URL="http://127.0.0.1:4324/mcp"
-GRAPHIFY_OPENAI_BASE_URL=""
-GRAPHIFY_OPENAI_API_KEY=""
-GRAPHIFY_OPENAI_MODEL=""
-GRAPHIFY_OPENAI_TOKEN_BUDGET="30000"
-GRAPHIFY_OPENAI_MAX_CONCURRENCY="1"
-GRAPHIFY_OPENAI_API_TIMEOUT="300"
-GRAPHIFY_MAX_RETRIES="1"
 """
 
 
@@ -72,7 +63,7 @@ def _ensure_venv(venv_root: Path, bootstrap: list[str], label: str) -> Path:
     return python
 
 
-def _initialize_artifact_store(application_python: Path, root: Path) -> None:
+def _entry_point(application_python: Path, root: Path, name: str) -> Path:
     # Use the installed entry point so setup verifies the same command that
     # operators and automation use after provisioning.
     executable_suffix = ".exe" if application_python.suffix.casefold() == ".exe" else ""
@@ -81,15 +72,42 @@ def _initialize_artifact_store(application_python: Path, root: Path) -> None:
         if application_python.parent.name.casefold() == "scripts"
         else "bin"
     )
-    artifact_cli = (
-        root
-        / ".venv"
-        / scripts_directory
-        / f"ai-memory-artifact{executable_suffix}"
+    return root / ".venv" / scripts_directory / f"{name}{executable_suffix}"
+
+
+def _initialize_artifact_store(application_python: Path, root: Path) -> None:
+    _run(
+        [str(_entry_point(application_python, root, "ai-memory-artifact")), "init"],
+        "Failed to initialize the artifact database.",
+    )
+
+
+def _publish_first_generation(application_python: Path, root: Path) -> None:
+    # One generation holds the Markdown index, the artifact index, and the
+    # native note graph, so recall has graph relationships after setup.
+    _run(
+        [str(_entry_point(application_python, root, "ai-memory-sync"))],
+        "The initial AI Memory generation failed.",
+    )
+
+
+def _install_graphify_codebase_runtime(root: Path, bootstrap: list[str]) -> None:
+    """Install the optional pinned runtime for the Graphify Codebase skill."""
+    interpreter = _ensure_venv(graphify_runtime_root(root), bootstrap, "Graphify")
+    _run(
+        [str(interpreter), "-m", "pip", "install", "--upgrade", "pip"],
+        "Failed to update pip in the Graphify environment.",
     )
     _run(
-        [str(artifact_cli), "init"],
-        "Failed to initialize the artifact database.",
+        [
+            str(interpreter),
+            "-m",
+            "pip",
+            "install",
+            "-r",
+            str(root / "requirements-graphify.txt"),
+        ],
+        "Failed to install the pinned Graphify runtime.",
     )
 
 
@@ -105,7 +123,18 @@ def main() -> None:
     )
     parser.add_argument("--install-codex", action="store_true")
     parser.add_argument("--install-clients", action="store_true")
-    parser.add_argument("--skip-graphify-runtime", action="store_true")
+    parser.add_argument(
+        "--with-graphify-codebase",
+        action="store_true",
+        help="Also install the pinned runtime for the Graphify Codebase skill.",
+    )
+    # AI Memory no longer installs Graphify, so this earlier flag has no
+    # effect. It stays accepted so existing automation keeps working.
+    parser.add_argument(
+        "--skip-graphify-runtime",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
 
     root = repository_root()
@@ -150,25 +179,8 @@ def main() -> None:
             "Recall uses the hashed fallback."
         )
 
-    if not args.skip_graphify_runtime:
-        graphify_interpreter = _ensure_venv(
-            graphify_runtime_root(root), bootstrap, "Graphify"
-        )
-        _run(
-            [str(graphify_interpreter), "-m", "pip", "install", "--upgrade", "pip"],
-            "Failed to update pip in the Graphify environment.",
-        )
-        _run(
-            [
-                str(graphify_interpreter),
-                "-m",
-                "pip",
-                "install",
-                "-r",
-                str(root / "requirements-graphify.txt"),
-            ],
-            "Failed to install the pinned Graphify runtime.",
-        )
+    if args.with_graphify_codebase:
+        _install_graphify_codebase_runtime(root, bootstrap)
 
     env_path = root / ".env"
     if env_path.is_file():
@@ -186,11 +198,7 @@ def main() -> None:
         info(f"Created local configuration: {env_path}")
 
     _initialize_artifact_store(application_python, root)
-
-    _run(
-        [str(application_python), "-m", "ai_memory_mcp.cli"],
-        "The initial AI Memory index build failed.",
-    )
+    _publish_first_generation(application_python, root)
 
     scripts_dir = Path(__file__).resolve().parent
     if args.install_clients:

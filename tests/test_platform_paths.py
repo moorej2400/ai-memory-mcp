@@ -25,8 +25,8 @@ def test_windows_environment_layout(monkeypatch, tmp_path: Path) -> None:
     assert platform_paths.venv_bin_dir(venv) == venv / "Scripts"
     assert platform_paths.venv_python(venv) == venv / "Scripts" / "python.exe"
     assert (
-        platform_paths.venv_executable(venv, "graphify-mcp")
-        == venv / "Scripts" / "graphify-mcp.exe"
+        platform_paths.venv_executable(venv, "example-tool")
+        == venv / "Scripts" / "example-tool.exe"
     )
     assert platform_paths.venv_site_packages(venv) == [
         venv / "Lib" / "site-packages"
@@ -39,8 +39,8 @@ def test_posix_environment_layout(monkeypatch, tmp_path: Path) -> None:
 
     assert platform_paths.venv_bin_dir(venv) == venv / "bin"
     assert (
-        platform_paths.venv_executable(venv, "graphify-mcp")
-        == venv / "bin" / "graphify-mcp"
+        platform_paths.venv_executable(venv, "example-tool")
+        == venv / "bin" / "example-tool"
     )
 
     # Without the conventional alias the versioned interpreter is used.

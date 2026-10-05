@@ -24,7 +24,7 @@ def _wrappers(project_root: Path) -> list[Path]:
 
 
 def test_wrappers_exist(project_root: Path) -> None:
-    assert len(_wrappers(project_root)) >= 9
+    assert len(_wrappers(project_root)) >= 7
 
 
 def test_join_path_stays_compatible_with_windows_powershell_51(
@@ -59,7 +59,7 @@ def test_wrappers_delegate_to_an_existing_implementation(
             target = wrapper.parent / Path(match.group(1)).name
             assert target.is_file(), f"{wrapper} references missing {target}"
             checked += 1
-    assert checked >= 9
+    assert checked >= 6
 
 
 @pytest.mark.parametrize("pair", [("{", "}"), ("(", ")")])

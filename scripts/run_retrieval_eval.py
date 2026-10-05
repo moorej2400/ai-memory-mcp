@@ -7,17 +7,24 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ai_memory_mcp.config import Settings  # noqa: E402
 from ai_memory_mcp.service import MemoryService  # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import load_environment, repository_root  # noqa: E402
+
+CASES_VARIABLE = "AI_MEMORY_RETRIEVAL_EVAL_CASES"
+# Installations configured before the Graphify removal use this name.
+LEGACY_CASES_VARIABLE = "GRAPHIFY_MEMORY_RETRIEVAL_EVAL_CASES"
 
 
 def retrieval_cases() -> tuple[tuple[str, str], ...]:
-    raw = os.getenv("GRAPHIFY_MEMORY_RETRIEVAL_EVAL_CASES", "").strip()
+    raw = (
+        os.getenv(CASES_VARIABLE, "").strip()
+        or os.getenv(LEGACY_CASES_VARIABLE, "").strip()
+    )
     if not raw:
         return ()
     configured = json.loads(raw)
@@ -44,8 +51,8 @@ def main() -> int:
     cases = retrieval_cases()
     if not cases:
         raise ValueError(
-            "Set GRAPHIFY_MEMORY_RETRIEVAL_EVAL_CASES to real questions and "
-            "expected evidence markers."
+            f"Set {CASES_VARIABLE} to real questions and expected evidence "
+            "markers."
         )
     failures: list[str] = []
     for index, (question, expected) in enumerate(cases, start=1):
@@ -68,6 +75,7 @@ def main() -> int:
         "cases": len(cases),
         "passed": len(cases) - len(failures),
         "pipeline": "memory_recall",
+        "graphAvailable": status.graph.available,
         "generationId": status.generation.generation_id,
         "generationConsistent": status.generation.consistent,
         "failures": failures,

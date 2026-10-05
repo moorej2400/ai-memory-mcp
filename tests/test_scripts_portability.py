@@ -15,10 +15,8 @@ def _load(name: str, relative: str, project_root: Path):
     """Import a script module directly, mirroring how the scripts import it."""
     path = project_root / relative
     scripts_root = str(project_root / "scripts")
-    graphify_root = str(project_root / "scripts" / "graphify")
-    for entry in (scripts_root, graphify_root):
-        if entry not in sys.path:
-            sys.path.insert(0, entry)
+    if scripts_root not in sys.path:
+        sys.path.insert(0, scripts_root)
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -34,7 +32,7 @@ def common(project_root: Path):
 
 @pytest.fixture
 def processes(project_root: Path):
-    return _load("_processes", "scripts/graphify/_processes.py", project_root)
+    return _load("_processes", "scripts/_processes.py", project_root)
 
 
 def test_every_entry_point_has_a_wrapper_for_each_shell(
@@ -45,11 +43,8 @@ def test_every_entry_point_has_a_wrapper_for_each_shell(
         "scripts/setup": "setup",
         "scripts/install-clients": "install_clients",
         "scripts/install-codex": "install_codex",
-        "scripts/graphify/extract-ai-memory": "extract_ai_memory",
-        "scripts/graphify/refresh-ai-memory-graph": "refresh_graph",
-        "scripts/graphify/start-graphify-global-mcp": "start_global_mcp",
-        "scripts/graphify/stop-graphify-global-mcp": "stop_global_mcp",
-        "scripts/graphify/install-graphify-global-mcp-startup": "install_autostart",
+        "scripts/retire-graphify-memory": "retire_graphify_memory",
+        "scripts/run-retrieval-eval": "run_retrieval_eval",
     }
     for stem, implementation in expected.items():
         directory = (project_root / stem).parent
@@ -142,16 +137,145 @@ def test_setup_uses_one_configured_memory_root(project_root: Path) -> None:
     assert "AI_MEMORY_ARTIFACT_BACKUP_DIR=" not in setup.ENV_TEMPLATE
 
 
-def test_graphify_state_defaults_inside_memory_root(
-    common, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_setup_template_has_no_graphify_configuration(project_root: Path) -> None:
+    setup = _load("setup_template", "scripts/setup.py", project_root)
+
+    assert "GRAPHIFY" not in setup.ENV_TEMPLATE
+
+
+def test_setup_installs_the_codebase_runtime_only_on_request(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    setup = _load("setup_flow", "scripts/setup.py", project_root)
+    memory_root = tmp_path / "vault"
+    memory_root.mkdir()
+    repository = tmp_path / "repo"
+    (repository / ".venv" / "bin").mkdir(parents=True)
+    (repository / ".venv" / "bin" / "python").write_text("", encoding="utf-8")
+    (repository / ".env").write_text("", encoding="utf-8")
+    calls: list[list[str]] = []
+    runtime: list[Path] = []
+    monkeypatch.setattr(setup, "repository_root", lambda: repository)
+    monkeypatch.setattr(setup, "_run", lambda command, failure: calls.append(command))
+    monkeypatch.setattr(
+        setup,
+        "_install_graphify_codebase_runtime",
+        lambda root, bootstrap: runtime.append(root),
+    )
+
+    for extra in ([], ["--skip-graphify-runtime"]):
+        monkeypatch.setattr(
+            "sys.argv", ["setup.py", "--memory-root", str(memory_root), *extra]
+        )
+        setup.main()
+    assert runtime == []
+    assert calls[-1] == [str(repository / ".venv" / "bin" / "ai-memory-sync")]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["setup.py", "--memory-root", str(memory_root), "--with-graphify-codebase"],
+    )
+    setup.main()
+    assert runtime == [repository]
+
+
+@pytest.fixture
+def retire(project_root: Path):
+    return _load(
+        "retire_graphify_memory", "scripts/retire_graphify_memory.py", project_root
+    )
+
+
+def _legacy_installation(tmp_path: Path, retire, monkeypatch) -> tuple[Path, Path]:
     root = tmp_path / "vault"
+    state = root / ".ai-memory" / "provider-state" / "graphify"
+    (state / "corpora").mkdir(parents=True)
+    (state / "global-graph.json").write_text("{}", encoding="utf-8")
+    home = tmp_path / "home"
+    for launcher in retire.launcher_candidates(home):
+        launcher.path.parent.mkdir(parents=True, exist_ok=True)
+        launcher.path.write_text("start_global_mcp.py\n", encoding="utf-8")
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    (repository / ".env").write_text(
+        'AI_MEMORY_WORK_DIR="x"\nGRAPHIFY_GLOBAL_MCP_URL="y"\n', encoding="utf-8"
+    )
     monkeypatch.setenv("AI_MEMORY_WORK_DIR", str(root))
     monkeypatch.setenv("AI_MEMORY_GRAPHIFY_STATE_DIR", "")
+    monkeypatch.setattr(retire, "repository_root", lambda: repository)
+    monkeypatch.setattr(retire, "native_generation_available", lambda: True)
+    monkeypatch.setattr(retire, "unregister", lambda launcher: None)
+    return root, home
 
-    assert common.graphify_state_root() == (
-        root / ".ai-memory" / "provider-state" / "graphify"
-    )
+
+def test_retirement_dry_run_changes_nothing(
+    retire, monkeypatch, tmp_path: Path, capsys
+) -> None:
+    root, home = _legacy_installation(tmp_path, retire, monkeypatch)
+    monkeypatch.setattr(retire, "find_processes", lambda *fragments: [])
+
+    retire.main([], home=home)
+
+    output = capsys.readouterr().out
+    assert "No change was made" in output
+    assert "GRAPHIFY_GLOBAL_MCP_URL" in output
+    assert (root / ".ai-memory" / "provider-state" / "graphify").is_dir()
+    assert all(item.path.is_file() for item in retire.launcher_candidates(home))
+    assert not (root / ".ai-memory" / "backups").exists()
+
+
+def test_retirement_archives_the_listener_launcher_and_state(
+    retire, monkeypatch, tmp_path: Path
+) -> None:
+    root, home = _legacy_installation(tmp_path, retire, monkeypatch)
+    graph = root / ".ai-memory" / "provider-state" / "graphify" / "global-graph.json"
+    searched: list[tuple[str, ...]] = []
+    stopped: list[int] = []
+
+    class Listener:
+        pid = 4242
+
+    def find(*fragments: str):
+        searched.append(fragments)
+        return [Listener()]
+
+    monkeypatch.setattr(retire, "find_processes", find)
+    monkeypatch.setattr(retire, "terminate_tree", stopped.append)
+
+    retire.main(["--apply"], home=home)
+
+    assert searched == [("graphify-mcp", str(graph))]
+    assert stopped == [4242]
+    assert not (root / ".ai-memory" / "provider-state" / "graphify").exists()
+    archived = list((root / ".ai-memory" / "backups" / "graphify-retirement").glob("*"))
+    assert len(archived) == 1
+    assert (archived[0] / "provider-state" / "graphify" / "global-graph.json").is_file()
+    for launcher in retire.launcher_candidates(home):
+        assert not launcher.path.exists()
+        assert (archived[0] / "launchers" / launcher.path.name).is_file()
+
+
+def test_retirement_keeps_state_until_a_native_generation_exists(
+    retire, monkeypatch, tmp_path: Path, capsys
+) -> None:
+    root, home = _legacy_installation(tmp_path, retire, monkeypatch)
+    monkeypatch.setattr(retire, "find_processes", lambda *fragments: [])
+    monkeypatch.setattr(retire, "native_generation_available", lambda: False)
+
+    retire.main(["--apply"], home=home)
+
+    assert (root / ".ai-memory" / "provider-state" / "graphify").is_dir()
+    assert "Run ai-memory-sync first" in capsys.readouterr().out
+
+
+def test_retirement_ignores_an_unrelated_launcher(
+    retire, monkeypatch, tmp_path: Path
+) -> None:
+    root, home = _legacy_installation(tmp_path, retire, monkeypatch)
+    for launcher in retire.launcher_candidates(home):
+        launcher.path.write_text("some other program\n", encoding="utf-8")
+
+    assert retire.installed_launchers(home) == []
 
 
 def test_setup_uses_the_installed_artifact_initializer(
@@ -193,36 +317,6 @@ def test_posix_wrappers_accept_a_python3_only_environment(
         assert '.venv/bin/python3' in text, wrapper
 
 
-def test_desktop_entry_exec_quotes_reserved_characters(
-    project_root: Path,
-) -> None:
-    autostart = _load(
-        "install_autostart", "scripts/graphify/install_autostart.py", project_root
-    )
-    rendered = autostart._desktop_exec(
-        ["/opt/my apps/python", "/srv/a b/start.py", "plain"]
-    )
-
-    # A path containing a space must survive as one argument.
-    assert '"/opt/my apps/python"' in rendered
-    assert '"/srv/a b/start.py"' in rendered
-    assert rendered.endswith("plain")
-
-    # Every character the specification reserves forces quoting, because a
-    # directory name is free to contain any of them.
-    for reserved in ("'", "#", "&", ";", "(", ")", "~", "|", "*", "?", "<", ">"):
-        single = autostart._desktop_exec([f"/srv/a{reserved}b/start.py"])
-        assert single.startswith('"') and single.endswith('"'), reserved
-
-    # A literal percent must be doubled so it is not read as a field code.
-    assert autostart._desktop_exec(["/srv/100%/x"]).count("%%") == 1
-
-    # Inside quotes only these four take a backslash.
-    escaped = autostart._desktop_exec(['/srv/a b/"q"$v`t\\z'])
-    assert '\\"' in escaped and "\\$" in escaped
-    assert "\\`" in escaped and "\\\\" in escaped
-
-
 def test_standalone_scripts_use_filesystem_identity_for_paths(
     common, tmp_path: Path
 ) -> None:
@@ -244,25 +338,6 @@ def test_standalone_scripts_use_filesystem_identity_for_paths(
     # Whether case collides is the volume's decision, not the OS name's.
     lowered = tmp_path / "memory"
     assert (common.path_key(target) == common.path_key(lowered)) == lowered.exists()
-
-
-def test_systemd_is_rejected_without_a_working_user_manager(
-    project_root: Path, monkeypatch
-) -> None:
-    """An installed systemctl with no running user manager must fall back."""
-    autostart = _load(
-        "install_autostart", "scripts/graphify/install_autostart.py", project_root
-    )
-
-    class Failed:
-        returncode = 1
-        stdout = ""
-        stderr = "Failed to connect to bus"
-
-    monkeypatch.setattr(autostart.shutil, "which", lambda name: "/usr/bin/systemctl")
-    monkeypatch.setattr(autostart.subprocess, "run", lambda *a, **k: Failed())
-
-    assert autostart._systemd_user_manager_available() is False
 
 
 def test_graphify_codebase_prefers_path_like_main(
@@ -298,134 +373,6 @@ def test_port_probe_detects_a_live_listener(processes) -> None:
     assert processes.port_is_serving("127.0.0.1", port) is False
 
 
-def test_refresh_writes_a_transcript_including_the_failure(
-    project_root: Path, tmp_path: Path
-) -> None:
-    """A failed refresh must leave a transcript explaining why it failed."""
-    import subprocess
-
-    environment = dict(os.environ)
-    environment["AI_MEMORY_GRAPHIFY_STATE_DIR"] = str(tmp_path)
-    environment["AI_MEMORY_GRAPHIFY_PYTHON"] = str(tmp_path / "absent" / "python")
-
-    result = subprocess.run(
-        [sys.executable, str(project_root / "scripts" / "graphify" / "refresh_graph.py")],
-        capture_output=True,
-        text=True,
-        env=environment,
-        timeout=120,
-    )
-
-    assert result.returncode != 0
-    transcripts = list((tmp_path / "logs" / "ai-memory-refresh").glob("*.log"))
-    assert transcripts, "refresh produced no transcript"
-    body = transcripts[0].read_text(encoding="utf-8")
-    assert "started." in body
-    assert "FAILED:" in body
-
-
-def test_refresh_accepts_progress_before_json(project_root: Path) -> None:
-    refresh = _load(
-        "refresh_graph_json",
-        "scripts/graphify/refresh_graph.py",
-        project_root,
-    )
-
-    assert refresh.json_summary(
-        "Fetching files: 100%\n{\n  \"documents\": 12\n}\n"
-    ) == {"documents": 12}
-
-
-def test_graph_health_parser_requires_a_node_count(project_root: Path) -> None:
-    validator = _load(
-        "validate_graph_stats",
-        "scripts/graphify/validate-ai-memory-graph.py",
-        project_root,
-    )
-
-    assert validator.graph_stats_node_count("Nodes: 141\nEdges: 94\n") == 141
-    with pytest.raises(ValueError, match="invalid graph statistics"):
-        validator.graph_stats_node_count("Edges: 94\n")
-
-
-def test_graph_retrieval_eval_has_no_user_specific_default(
-    project_root: Path,
-) -> None:
-    source = (
-        project_root / "scripts" / "graphify" / "run-ai-memory-retrieval-eval.py"
-    ).read_text(encoding="utf-8")
-
-    assert "DEFAULT_CASES" not in source
-    assert "return ()" in source
-
-
-def test_refresh_lock_prevents_a_concurrent_publication(
-    project_root: Path, tmp_path: Path
-) -> None:
-    """Two refreshes must never publish at once.
-
-    The lock is taken in a separate process because the Windows primitive does
-    not conflict with itself inside one process.
-    """
-    import subprocess
-    import textwrap
-
-    lock = tmp_path / "refresh.lock"
-    preamble = (
-        "import sys, pathlib\n"
-        f"sys.path.insert(0, {str(project_root / 'scripts')!r})\n"
-        f"sys.path.insert(0, {str(project_root / 'scripts' / 'graphify')!r})\n"
-        "from refresh_graph import exclusive_lock\n"
-    )
-    holder = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            preamble
-            + textwrap.dedent(
-                f"""
-                import time
-                with exclusive_lock(pathlib.Path({str(lock)!r})):
-                    print("held", flush=True)
-                    time.sleep(5)
-                """
-            ),
-        ],
-        stdout=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        assert holder.stdout is not None
-        assert holder.stdout.readline().strip() == "held"
-
-        contender = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                preamble
-                + textwrap.dedent(
-                    f"""
-                    from _common import ScriptError
-                    try:
-                        with exclusive_lock(pathlib.Path({str(lock)!r})):
-                            print("acquired")
-                    except ScriptError as error:
-                        print(f"blocked: {{error}}")
-                    """
-                ),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        assert "blocked: An AI-Memory Graphify refresh is already running." in (
-            contender.stdout
-        ), contender.stdout + contender.stderr
-    finally:
-        holder.kill()
-        holder.wait()
-
-
 def test_wait_for_port_gives_up_when_the_child_exits(processes) -> None:
     import subprocess
 
@@ -435,3 +382,19 @@ def test_wait_for_port_gives_up_when_the_child_exits(processes) -> None:
         assert processes.wait_for_port("127.0.0.1", 9, 30, child) is False
     finally:
         child.wait()
+
+
+def test_retrieval_eval_has_no_user_specific_default(
+    project_root: Path, monkeypatch
+) -> None:
+    evaluation = _load(
+        "run_retrieval_eval", "scripts/run_retrieval_eval.py", project_root
+    )
+    monkeypatch.delenv("AI_MEMORY_RETRIEVAL_EVAL_CASES", raising=False)
+    monkeypatch.delenv("GRAPHIFY_MEMORY_RETRIEVAL_EVAL_CASES", raising=False)
+    assert evaluation.retrieval_cases() == ()
+
+    monkeypatch.setenv("GRAPHIFY_MEMORY_RETRIEVAL_EVAL_CASES", '[["legacy", "x"]]')
+    assert evaluation.retrieval_cases() == (("legacy", "x"),)
+    monkeypatch.setenv("AI_MEMORY_RETRIEVAL_EVAL_CASES", '[["current", "y"]]')
+    assert evaluation.retrieval_cases() == (("current", "y"),)

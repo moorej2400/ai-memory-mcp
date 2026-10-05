@@ -3,8 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-import subprocess
-import sys
 from pathlib import Path
 
 from ai_memory_mcp.config import MemorySource, Settings
@@ -172,75 +170,6 @@ def test_settings_load_named_retrieval_sources(
     ] == ["archive", "reference"]
 
 
-def test_graph_merge_prefixes_each_memory_source(
-    project_root: Path,
-    tmp_path: Path,
-) -> None:
-    source_arguments: list[str] = []
-    for source_id in ("core", "archive"):
-        output = tmp_path / source_id / "graphify-out"
-        output.mkdir(parents=True)
-        (output / "graph.json").write_text(
-            json.dumps(
-                {
-                    "nodes": [
-                        {
-                            "id": "shared",
-                            "label": source_id,
-                            "source_file": "Notes/Shared.md",
-                        }
-                    ],
-                    "links": [],
-                }
-            ),
-            encoding="utf-8",
-        )
-        (output / "manifest.json").write_text(
-            json.dumps({"Notes/Shared.md": {"sha256": source_id}}),
-            encoding="utf-8",
-        )
-        source_arguments.extend(
-            ("--source", f"{source_id}={output / 'graph.json'}")
-        )
-
-    merged = tmp_path / "merged"
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(
-                project_root
-                / "scripts"
-                / "graphify"
-                / "merge-memory-source-graphs.py"
-            ),
-            *source_arguments,
-            "--output-dir",
-            str(merged),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    graph = json.loads((merged / "graph.json").read_text(encoding="utf-8"))
-    manifest = json.loads(
-        (merged / "manifest.json").read_text(encoding="utf-8")
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert {node["id"] for node in graph["nodes"]} == {
-        "core::shared",
-        "archive::shared",
-    }
-    assert {node["source_file"] for node in graph["nodes"]} == {
-        "core/Notes/Shared.md",
-        "archive/Notes/Shared.md",
-    }
-    assert set(manifest) == {
-        "core/Notes/Shared.md",
-        "archive/Notes/Shared.md",
-    }
-
-
 def test_changed_memory_id_collision_preserves_last_valid_record(
     tmp_path: Path,
 ) -> None:
@@ -290,17 +219,6 @@ def test_changed_memory_id_collision_preserves_last_valid_record(
         ("mem-first", "core/Notes/First.md"),
         ("mem-second", "core/Notes/Second.md"),
     ]
-
-
-def test_graphify_extraction_excludes_restricted_directories(
-    project_root: Path,
-) -> None:
-    script = (
-        project_root / "scripts" / "graphify" / "extract_ai_memory.py"
-    ).read_text(encoding="utf-8")
-
-    assert '"**/Restricted/**"' in script
-    assert '"**/.trash/**"' in script
 
 
 def test_scope_filters_treat_like_metacharacters_as_literals(

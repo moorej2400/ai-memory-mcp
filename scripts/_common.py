@@ -20,8 +20,6 @@ EXECUTABLE_SUFFIX = ".exe" if WINDOWS else ""
 
 SOURCE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 
-DEFAULT_MCP_URL = "http://127.0.0.1:4324/mcp"
-
 
 class ScriptError(RuntimeError):
     """A failure that should be reported without a traceback."""
@@ -52,25 +50,11 @@ def app_python(root: Path | None = None) -> Path:
 
 
 def graphify_runtime_root(root: Path | None = None) -> Path:
+    """Return the optional pinned runtime that Graphify Codebase can use.
+
+    AI Memory does not use this runtime.
+    """
     return (root or repository_root()) / ".graphify-runtime"
-
-
-def graphify_python(root: Path | None = None) -> Path:
-    configured = os.environ.get("AI_MEMORY_GRAPHIFY_PYTHON", "").strip()
-    if configured:
-        return Path(configured)
-    return venv_python(graphify_runtime_root(root))
-
-
-def graphify_executable(root: Path | None = None) -> Path:
-    return venv_executable(graphify_runtime_root(root), "graphify")
-
-
-def graphify_mcp_executable(root: Path | None = None) -> Path:
-    configured = os.environ.get("AI_MEMORY_GRAPHIFY_MCP_EXE", "").strip()
-    if configured:
-        return Path(configured)
-    return venv_executable(graphify_runtime_root(root), "graphify-mcp")
 
 
 def load_environment(root: Path | None = None) -> None:
@@ -101,26 +85,6 @@ def expand_path(value: str) -> Path:
     return Path(os.path.expandvars(value)).expanduser()
 
 
-def graphify_state_root() -> Path:
-    configured = os.environ.get("AI_MEMORY_GRAPHIFY_STATE_DIR", "").strip()
-    if configured:
-        return expand_path(configured)
-    memory_root = (
-        os.environ.get("AI_MEMORY_WORK_DIR", "").strip()
-        or os.environ.get("AI_MEMORY_DIR", "").strip()
-    )
-    if memory_root:
-        return (
-            expand_path(memory_root)
-            / ".ai-memory"
-            / "provider-state"
-            / "graphify"
-        )
-    # Pre-configuration commands keep the legacy fallback until a memory root
-    # exists; configured installations use the vault-local data layout above.
-    return Path.home() / ".graphify"
-
-
 def path_key(path: Path) -> str:
     """Return a key that is equal for two paths naming the same directory.
 
@@ -137,10 +101,6 @@ def path_key(path: Path) -> str:
         text = str(resolved)
         return text.casefold() if (WINDOWS or MACOS) else text
     return f"id:{status.st_dev}:{status.st_ino}"
-
-
-def mcp_url() -> str:
-    return os.environ.get("GRAPHIFY_GLOBAL_MCP_URL", "").strip() or DEFAULT_MCP_URL
 
 
 @dataclass(frozen=True)

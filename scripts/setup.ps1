@@ -11,6 +11,8 @@ param(
   [Parameter(Mandatory = $true)][string]$MemoryRoot,
   [switch]$InstallCodex,
   [switch]$InstallClients,
+  [switch]$WithGraphifyCodebase,
+  # Accepted for existing automation. AI Memory no longer installs Graphify.
   [switch]$SkipGraphifyRuntime
 )
 
@@ -20,6 +22,6 @@ $ErrorActionPreference = 'Stop'
 $arguments = @('--memory-root', $MemoryRoot)
 if ($InstallCodex) { $arguments += '--install-codex' }
 if ($InstallClients) { $arguments += '--install-clients' }
-if ($SkipGraphifyRuntime) { $arguments += '--skip-graphify-runtime' }
+if ($WithGraphifyCodebase) { $arguments += '--with-graphify-codebase' }
 
 Invoke-AiMemoryPythonScript -Script (Join-Path $PSScriptRoot 'setup.py') -Arguments $arguments
