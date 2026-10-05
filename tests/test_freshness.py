@@ -37,7 +37,6 @@ def _engine(tmp_path: Path) -> RetrievalEngine:
         memory_root=tmp_path / "vault",
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
     )
     build_index(settings, force=True)

@@ -23,7 +23,6 @@ def benchmark_settings(project_root: Path) -> Settings:
         memory_root=benchmark / "fixtures" / "vault",
         state_dir=benchmark / "runs" / f"pytest-state-{stamp}",
         graph_path=benchmark / "fixtures" / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
         artifact_db=(
             benchmark / "runs" / f"pytest-artifacts-{stamp}.sqlite3"
@@ -48,7 +47,6 @@ def artifact_settings(tmp_path: Path) -> Settings:
         memory_root=memory_root,
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
         artifact_db=tmp_path / "artifact-state" / "artifacts.sqlite3",
         artifact_objects_dir=tmp_path / "artifact-state" / "objects",

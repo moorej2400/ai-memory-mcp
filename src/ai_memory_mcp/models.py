@@ -349,18 +349,9 @@ class ArtifactVectorStatus(StrictOutput):
     last_failure_at: str | None = None
 
 
-class GraphifyRuntimeStatus(StrictOutput):
-    consistent: bool
-    expected: str
-    package: str | None = None
-    cli: str | None = None
-    python: str
-    mcp_executable: str
-    scripts_dir: str
-    errors: list[str] = Field(default_factory=list)
+class GraphStatus(StrictOutput):
+    """Health of the native note graph in the active generation."""
 
-
-class GraphifyStatus(StrictOutput):
     available: bool
     stale: bool
     path: str
@@ -373,8 +364,8 @@ class GraphifyStatus(StrictOutput):
     generation_id: str | None = None
     last_success_at: str | None = None
     last_failure_at: str | None = None
+    error: str | None = None
     provider_role: Literal["internal-graph-signal"]
-    runtime: GraphifyRuntimeStatus
 
 
 class LogStreamStatus(StrictOutput):
@@ -441,7 +432,7 @@ class StatusResponse(StrictOutput):
     index: IndexStatus
     artifact_database: ArtifactDatabaseStatus
     artifact_vector: ArtifactVectorStatus
-    graphify: GraphifyStatus
+    graph: GraphStatus
     generation: GenerationStatus
     logging: LoggingStatus
     runtime: RuntimeStatus

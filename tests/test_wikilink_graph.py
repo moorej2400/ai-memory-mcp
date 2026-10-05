@@ -5,7 +5,7 @@ from pathlib import Path
 
 from ai_memory_mcp.config import Settings
 from ai_memory_mcp.index import build_index
-from ai_memory_mcp.provider_graph import build_provider_graph
+from ai_memory_mcp.graph_builder import build_memory_graph
 
 
 def _note(
@@ -31,11 +31,10 @@ def _build(tmp_path: Path) -> dict:
         memory_root=tmp_path / "vault",
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "out" / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
     )
     build_index(settings, force=True)
-    return build_provider_graph(settings, tmp_path / "out")
+    return build_memory_graph(settings, tmp_path / "out")
 
 
 def _links(tmp_path: Path) -> list[dict]:

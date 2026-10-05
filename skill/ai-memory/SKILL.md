@@ -19,7 +19,7 @@ Read [architecture.md](../../docs/architecture.md) when changing the retrieval s
 - Use judgment to determine future value. Do not limit memory capture to predefined categories or examples.
 - Search before creating. Prefer updating, merging, or superseding a precise existing note over creating a parallel note.
 - Never permanently delete memory or skill content. Preserve prior truth through `superseded`, `archived`, or recoverable trash only when the user explicitly requests removal.
-- Keep memory writes and Graphify indexing as separate verified outcomes.
+- Keep memory writes and index synchronization as separate verified outcomes.
 
 ## Dedicated AI Memory MCP Routing
 
@@ -42,10 +42,9 @@ shell access is available. Resolve configuration in this order:
 4. Use `AI_MEMORY_PERSONAL_DIR` as the optional `personal` retrieval-only source.
 5. Use legacy `AI_MEMORY_DIR` only as a primary-vault fallback.
 6. Use `AI_CUSTOM_SKILLS_DIR` for canonical executable custom skills.
-7. Use `GRAPHIFY_MEMORY_REFRESH_SCRIPT` for the routine narrow refresh.
-8. Use `GRAPHIFY_MEMORY_EXTRACT_SCRIPT` only for an explicitly chosen extraction-only maintenance action.
-9. Use `GRAPHIFY_GLOBAL_MCP_URL` to verify Graphify availability after refresh.
-10. Use the configured Graphify backend values only for full extraction.
+
+AI Memory does not read `GRAPHIFY_*` values.
+`memory_sync` builds the note graph, so no separate graph refresh exists.
 
 Write new memories only under `AI_MEMORY_WORK_DIR`. Never write to an additional retrieval source.
 Use `AI_MEMORY_WORK_DIR/.ai-memory/` for raw data, backups, indexes, provider state, migration data, and logs.
@@ -163,7 +162,7 @@ When recall is partial, stale, or lacks needed detail, follow its source referen
 Inspect existing stored material before seeking a fresh copy from the source system.
 Do not treat an index failure as evidence that the stored source is missing.
 
-Do not treat a Graphify node as authority for a write target until the canonical Markdown exists and has been inspected.
+Do not treat a graph node as authority for a write target until the canonical Markdown exists and has been inspected.
 
 Use `memory_artifact_read` to inspect ordered context from an `artifact://` citation.
 Use `supporting_artifact_uris` to inspect source passages for a distilled memory.
@@ -205,7 +204,7 @@ Use a path-qualified target when two notes have the same title.
 Preserve heading anchors and display labels without treating them as target identity.
 Do not add a weak link only to avoid an isolated graph node.
 
-The graph build makes an edge from a body wikilink and from a frontmatter `related` entry. Use `related` for the primary relation. Use body wikilinks for context inside the text.
+The graph build makes an edge from a body wikilink and from a frontmatter `related` entry. Use `related` for the primary relation. Use body wikilinks for context inside the text. A wikilink inside code or a comment does not make an edge.
 
 When new verified information conflicts with active memory:
 
@@ -266,12 +265,10 @@ After one or more material memory writes:
 
 1. Call `memory_sync` after a Markdown batch or raw artifact change.
 2. Confirm that synchronization reads all configured sources without writing to them.
-3. Confirm that Markdown vectors, artifact vectors, and Graphify use one generation ID.
-4. Run the Graphify maintenance script only for isolated maintenance.
-5. Do not run the global or all-corpora extractor for routine memory writes.
-6. Call `memory_status` and verify every required layer.
-7. Confirm that each configured memory source is registered.
-8. If refresh fails, report `saved, not indexed` and keep all canonical data unchanged.
+3. Confirm that Markdown vectors, artifact vectors, and the note graph use one generation ID.
+4. Call `memory_status` and verify every required layer, including `graph`.
+5. Confirm that each configured memory source is registered.
+6. If refresh fails, report `saved, not indexed` and keep all canonical data unchanged.
 
 Pure retrievals, no-op deduplication, and non-material timestamp-only changes do not require refresh.
 

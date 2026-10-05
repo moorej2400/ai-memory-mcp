@@ -14,10 +14,8 @@ Copy `.env.example` when you create the configuration manually.
 | `AI_MEMORY_RETRIEVAL_SOURCES` | Maps retrieval-only source IDs to vault directories. |
 | `AI_MEMORY_PERSONAL_DIR` | Sets the optional `personal` retrieval-only source. |
 | `AI_MEMORY_MCP_STATE_DIR` | Sets the derived AI Memory index directory. |
-| `AI_MEMORY_GRAPH_PATH` | Sets the AI Memory Graphify graph file. |
-| `AI_MEMORY_GRAPHIFY_STATE_DIR` | Sets the Graphify state directory. |
-| `AI_MEMORY_GRAPHIFY_PYTHON` | Overrides the pinned Graphify interpreter. |
-| `AI_MEMORY_GRAPHIFY_MCP_EXE` | Overrides the pinned Graphify MCP executable. |
+| `AI_MEMORY_GRAPH_PATH` | Sets the legacy graph file. AI Memory reads this file only when no generation exists. |
+| `AI_MEMORY_GRAPHIFY_STATE_DIR` | Sets the legacy Graphify state directory. The default legacy graph file is in this directory. |
 | `AI_MEMORY_LOG_DIR` | Sets the local index and retrieval log directory. |
 | `AI_MEMORY_ARTIFACT_DB` | Sets the canonical raw artifact database file. |
 | `AI_MEMORY_ARTIFACT_OBJECTS_DIR` | Sets the attachment object directory. |
@@ -54,10 +52,12 @@ AI_MEMORY_RETRIEVAL_SOURCES='{"archive":"C:/memory/archive","reference":"D:/memo
 Source IDs must start with a letter.
 Use only lowercase letters, numbers, and hyphens.
 
-The two Graphify override variables are normally unset. The setup script
-provisions `.graphify-runtime` using the layout of the host platform, and the
-project resolves the interpreter and executables from it automatically. Set
-them only to point at a Graphify installed somewhere else.
+`AI_MEMORY_GRAPH_PATH` and `AI_MEMORY_GRAPHIFY_STATE_DIR` are legacy read fallbacks.
+AI Memory builds the note graph in each coordinated generation.
+AI Memory reads the legacy graph file only when no coordinated generation exists.
+The default legacy graph file is `.ai-memory/provider-state/graphify/corpora/ai-memory/graphify-out/graph.json`.
+AI Memory does not write this file.
+The [retirement script](operations.md#upgrade-an-installation-that-used-graphify) uses `AI_MEMORY_GRAPHIFY_STATE_DIR` to find the legacy state.
 
 The server writes no Markdown files.
 The AI Memory skill writes new records only under `AI_MEMORY_WORK_DIR`.
@@ -71,30 +71,44 @@ The system retains the active derived generation and one verified previous gener
 An active recall lease can temporarily retain an additional generation.
 Generation retention never removes canonical artifacts or required attachment objects.
 
-## Graphify
+## Retrieval evaluation
 
 | Variable | Function |
 |---|---|
-| `GRAPHIFY_MEMORY_REFRESH_SCRIPT` | Names the full-refresh script an agent should run. |
-| `GRAPHIFY_MEMORY_EXTRACT_SCRIPT` | Names the extraction script an agent should run. |
-| `GRAPHIFY_GLOBAL_MCP_URL` | Sets the Graphify MCP endpoint. |
-| `GRAPHIFY_OPENAI_BASE_URL` | Sets an optional compatible API endpoint. |
-| `GRAPHIFY_OPENAI_API_KEY` | Sets the optional extraction credential. |
-| `GRAPHIFY_OPENAI_MODEL` | Sets the optional extraction model. |
-| `GRAPHIFY_OPENAI_TOKEN_BUDGET` | Sets the extraction token limit. |
-| `GRAPHIFY_OPENAI_MAX_CONCURRENCY` | Sets the extraction concurrency limit. |
-| `GRAPHIFY_OPENAI_API_TIMEOUT` | Sets the extraction timeout. |
-| `GRAPHIFY_MAX_RETRIES` | Sets the extraction retry limit. |
-| `GRAPHIFY_MEMORY_RETRIEVAL_EVAL_CASES` | Sets required local retrieval evaluation cases as JSON pairs. |
+| `AI_MEMORY_RETRIEVAL_EVAL_CASES` | Sets the local retrieval evaluation cases as a JSON list of pairs. |
 
-The normal index refresh does not need an extraction API.
-A full Graphify refresh can need the optional API values.
+Each pair contains one question and one expected evidence marker.
+The [retrieval evaluation](operations.md#run-the-retrieval-evaluation) requires at least one pair.
 
-These two script variables are read by the agent that follows the AI Memory
-skill, not by the server. Point them at an entry point the host platform can
-run: the `.ps1` wrapper on Windows, the `.sh` wrapper on macOS and Linux, or
-the `.py` implementation on any platform. Leave them unset to use the
-repository-owned scripts.
+```dotenv
+AI_MEMORY_RETRIEVAL_EVAL_CASES='[["<question>","<expected-marker>"]]'
+```
+
+The evaluation also reads `GRAPHIFY_MEMORY_RETRIEVAL_EVAL_CASES` when `AI_MEMORY_RETRIEVAL_EVAL_CASES` has no value.
+Earlier releases used this legacy name.
+
+## Removed variables
+
+AI Memory does not read these variables:
+
+- `GRAPHIFY_GLOBAL_MCP_URL`
+- `GRAPHIFY_OPENAI_BASE_URL`
+- `GRAPHIFY_OPENAI_API_KEY`
+- `GRAPHIFY_OPENAI_MODEL`
+- `GRAPHIFY_OPENAI_TOKEN_BUDGET`
+- `GRAPHIFY_OPENAI_MAX_CONCURRENCY`
+- `GRAPHIFY_OPENAI_API_TIMEOUT`
+- `GRAPHIFY_MAX_RETRIES`
+- `GRAPHIFY_MEMORY_REFRESH_SCRIPT`
+- `GRAPHIFY_MEMORY_EXTRACT_SCRIPT`
+- `AI_MEMORY_GRAPHIFY_PYTHON`
+- `AI_MEMORY_GRAPHIFY_MCP_EXE`
+
+An existing `.env` file can contain these variables from an earlier release.
+Remove each variable that no other tool uses.
+
+The setup command installs `.graphify-runtime` only with `--with-graphify-codebase` or `-WithGraphifyCodebase`.
+Only the independent Graphify Codebase skill uses this runtime.
 
 ## MCP server
 

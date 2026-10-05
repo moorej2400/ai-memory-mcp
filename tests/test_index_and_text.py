@@ -62,7 +62,6 @@ def test_changed_note_rebuilds_only_one_document(
         memory_root=vault,
         state_dir=run_root / "state",
         graph_path=project_root / "benchmarks" / "fixtures" / "graph.json",
-        graphify_mcp_url="",
     )
     first = build_index(settings, force=True)
     target = vault / "Projects" / "Orion.md"
@@ -91,7 +90,6 @@ def test_moved_note_keeps_identity_without_a_parse_error(tmp_path: Path) -> None
         memory_root=vault,
         state_dir=vault / ".ai-memory/indexes",
         graph_path=vault / ".ai-memory/provider-state/graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
     )
     build_index(settings, force=True)
@@ -122,7 +120,6 @@ def test_index_excludes_internal_data_markdown(tmp_path: Path) -> None:
         memory_root=vault,
         state_dir=vault / ".ai-memory" / "indexes",
         graph_path=vault / ".ai-memory" / "provider-state" / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
     )
 
@@ -203,7 +200,6 @@ An independently maintained link record.
         memory_root=vault,
         state_dir=vault / ".ai-memory/indexes",
         graph_path=vault / ".ai-memory/provider-state/graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
     )
     build_index(settings, force=True)

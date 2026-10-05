@@ -15,9 +15,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     ScriptError,
     app_python,
+    graphify_runtime_root,
     info,
     repository_root,
     run_main,
+    venv_executable,
 )
 
 SKILLS = {
@@ -35,6 +37,12 @@ TOOL_PATTERN = re.compile(
 SYNC_APPROVAL_BLOCK = """[mcp_servers.ai-memory.tools.memory_sync]
 approval_mode = "approve"
 """
+
+
+def graphify_codebase_available(root: Path) -> bool:
+    """Mirror `ai_memory_mcp.client_install.graphify_codebase_available`."""
+    runtime = venv_executable(graphify_runtime_root(root), "graphify")
+    return bool(shutil.which("graphify")) or runtime.is_file()
 
 
 def _timestamp() -> str:
@@ -156,6 +164,12 @@ def main() -> None:
         info(f"Registered the repository-owned MCP in {config_path}")
 
     for name in SKILLS:
+        if name == "graphify" and not graphify_codebase_available(root):
+            info(
+                "Skipped the graphify skill. Graphify is not installed. "
+                "Run setup with --with-graphify-codebase to add it."
+            )
+            continue
         _install_skill(root, codex_home, name)
 
     info("Restart Codex to load the updated MCP command and skill sources.")

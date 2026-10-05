@@ -11,7 +11,13 @@ from typing import Any
 from .artifacts.schema import ClosingSQLiteConnection
 from .config import Settings
 from .index import current_index_path
-from .wikilinks import identity_keys, resolve_link, wikilink_targets
+from .memory_graph import GRAPH_SNAPSHOT_FORMAT
+from .wikilinks import (
+    identity_keys,
+    related_link_targets,
+    resolve_link,
+    wikilink_targets,
+)
 
 
 def _values(raw: str) -> list[str]:
@@ -19,7 +25,7 @@ def _values(raw: str) -> list[str]:
     return [str(item) for item in value] if isinstance(value, list) else []
 
 
-def build_provider_graph(
+def build_memory_graph(
     settings: Settings,
     output_dir: Path,
     *,
@@ -28,7 +34,7 @@ def build_provider_graph(
     index_path = index_path or current_index_path(settings)
     if index_path is None:
         raise FileNotFoundError(
-            "Memory index is not available. Run memory_sync before Graphify refresh."
+            "Memory index is not available. Run memory_sync before the graph build."
         )
     with sqlite3.connect(
         f"file:{index_path.as_posix()}?mode=ro",
@@ -104,7 +110,7 @@ def build_provider_graph(
                     }
                 )
 
-        for related in _values(row["related_json"]):
+        for related in related_link_targets(_values(row["related_json"])):
             target_memory_id, state = resolve_link(related, identity_candidates)
             if state == "ignored":
                 continue
@@ -189,7 +195,8 @@ def build_provider_graph(
         "directed": False,
         "multigraph": False,
         "graph": {
-            "provider": "graphify-compatible",
+            "provider": "ai-memory",
+            "format": GRAPH_SNAPSHOT_FORMAT,
             "build_mode": "deterministic-memory-index",
             "index_snapshot": index_path.name,
             "built_at": built_at,
@@ -233,11 +240,11 @@ def build_provider_graph(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Build the Graphify provider graph from the AI Memory index."
+        description="Build the AI Memory note graph from the Markdown index."
     )
     parser.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args()
-    summary = build_provider_graph(Settings.from_env(), args.output_dir)
+    summary = build_memory_graph(Settings.from_env(), args.output_dir)
     print(json.dumps(summary, indent=2))
     return 0
 

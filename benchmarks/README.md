@@ -8,7 +8,7 @@ these cases. The runner refuses to execute if any contract file drifts.
 
 The suite covers exact identifiers, paths, error strings, paraphrases,
 multi-hop relationships, active versus superseded facts, scope isolation,
-citations, missing answers, and Graphify-backed neighbors.
+citations, missing answers, and graph neighbors.
 
 The [mixed real-world benchmark](real-world/README.md) generates larger Markdown and artifact workloads.
 It measures the complete recall pipeline with neutral synthetic data.

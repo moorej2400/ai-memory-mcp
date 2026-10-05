@@ -372,7 +372,6 @@ def run_benchmark(
         memory_root=memory_root,
         state_dir=run_dir / "state",
         graph_path=run_dir / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
         artifact_db=run_dir / "artifacts.sqlite3",
         artifact_objects_dir=run_dir / "objects",

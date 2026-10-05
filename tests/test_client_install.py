@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from shutil import which as shutil_which
 
 import pytest
 
@@ -45,7 +46,22 @@ def portable_repository(tmp_path: Path) -> Path:
         "---\nname: graphify\ndescription: Test Graphify skill.\n---\n",
         encoding="utf-8",
     )
+    # The optional runtime makes the Graphify Codebase skill usable.
+    runtime = venv_bin_dir(repository / ".graphify-runtime")
+    runtime.mkdir(parents=True)
+    (runtime / ("graphify.exe" if WINDOWS else "graphify")).write_text("", encoding="utf-8")
     return repository
+
+
+@pytest.fixture(autouse=True)
+def no_graphify_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ai_memory_mcp.client_install as client_install
+
+    monkeypatch.setattr(
+        client_install.shutil,
+        "which",
+        lambda name: None if name == "graphify" else shutil_which(name),
+    )
 
 
 @pytest.mark.parametrize(
@@ -225,3 +241,23 @@ def test_jsonc_parser_keeps_comment_markers_inside_strings() -> None:
         )
     )
     assert parsed == {"url": "https://example.test/a//b", "items": [1]}
+
+
+def test_graphify_skill_needs_an_installed_graphify(
+    tmp_path: Path,
+    portable_repository: Path,
+) -> None:
+    import shutil
+
+    shutil.rmtree(portable_repository / ".graphify-runtime")
+    home = tmp_path / "home"
+
+    changed = install_client(
+        "agent-skills",
+        portable_repository,
+        home,
+        home / "AppData" / "Roaming",
+    )
+
+    assert changed == [home / ".agents" / "skills" / "ai-memory" / "SKILL.md"]
+    assert not (home / ".agents" / "skills" / "graphify").exists()

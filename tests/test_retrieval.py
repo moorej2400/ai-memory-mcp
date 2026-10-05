@@ -141,7 +141,6 @@ The log collector receives the sample API standard output stream.
         memory_root=vault,
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
     )
     build_index(settings, force=True)
@@ -221,7 +220,6 @@ updated: 2026-08-25
         memory_root=tmp_path / "vault",
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
     )
     build_index(settings, force=True)
@@ -365,7 +363,6 @@ def test_candidate_limits_count_documents_not_repeated_chunks(
         memory_root=vault,
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
     )
     build_index(settings, force=True)

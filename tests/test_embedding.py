@@ -55,7 +55,6 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
         memory_root=vault,
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
         **overrides,
     )

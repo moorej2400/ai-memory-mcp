@@ -14,7 +14,7 @@ from .artifacts.models import ArtifactSearchHit
 
 from .config import Settings
 from .embedding import EmbeddingProvider, EmbeddingUnavailable, resolve_provider
-from .graphify import GraphifyAdapter
+from .memory_graph import MemoryGraph
 from .generation import current_graph_path
 from .index import MemoryIndex, scope_sql
 from .models import EvidencePacket, ScopeFilter, SearchHit
@@ -404,7 +404,7 @@ class RetrievalEngine:
                 f"Semantic retrieval disabled: {exc}. "
                 "Install the provider or run memory_sync to rebuild."
             )
-        self.graph = GraphifyAdapter(
+        self.graph = MemoryGraph(
             graph_path or current_graph_path(settings),
             primary_source_id=settings.primary_source_id,
             source_ids=tuple(
@@ -692,7 +692,7 @@ class RetrievalEngine:
                 hit.score += 0.025
                 hit.reasons.append("lexical-semantic agreement")
             if "graph" in hit.ranks:
-                hit.reasons.append("Graphify relationship signal")
+                hit.reasons.append("graph relationship signal")
             content_query = query_tokens - STOPWORDS
             content_overlap = len(content_query & set(tokenize(searchable)))
             hit.signals["query_coverage"] = (
@@ -826,7 +826,7 @@ class RetrievalEngine:
         graph = self._graph(
             query, planned_scope, lexical[:20] + semantic[:20], candidate_limit
         )
-        provider_latency_ms["graphify"] = round(
+        provider_latency_ms["graph"] = round(
             (time.perf_counter() - provider_started) * 1000,
             3,
         )
@@ -927,7 +927,7 @@ class RetrievalEngine:
             results=hits,
             plan={
                 "scope": asdict(planned_scope),
-                "retrievers": ["lexical", "semantic", "graphify"],
+                "retrievers": ["lexical", "semantic", "graph"],
                 "fusion": f"RRF(k={self.settings.rrf_k})",
                 "rerank": True,
                 "context_expansion": True,
@@ -943,7 +943,7 @@ class RetrievalEngine:
                 "index_snapshot": self.index.path.name,
                 "generation_id": self.generation_id,
                 "semantic_search": semantic_details,
-                "graphify": self.graph.health(),
+                "graph": self.graph.health(),
             },
         )
 

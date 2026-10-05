@@ -19,6 +19,7 @@ Return to the [project overview](../README.md) for the quick-start procedure.
 - [Development](development.md) gives the development and test procedures.
 - [Validation](validation-report.md) gives the current validation evidence.
 - [Retrieval reliability validation](retrieval-reliability-validation.md) gives the scale and quality evidence.
+- [Native graph validation](native-graph-validation.md) gives the evidence for the Graphify removal.
 - [Writing standard](writing-standard.md) gives the documentation rules.
 
 ## Agent integration

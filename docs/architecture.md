@@ -6,8 +6,12 @@ This work excludes sentence-derived criterion filtering.
 
 ## Decision
 
-AI Memory MCP uses Graphify as an internal graph provider.
-The system does not expose Graphify as its permanent public interface.
+AI Memory MCP builds its note graph natively in each retrieval generation.
+AI Memory does not use the external Graphify package.
+The [archived Graphify memory pipeline](../archive/graphify-memory-pipeline/README.md) records the earlier design.
+
+The Graphify Codebase skill in `graphify-codebase/` is independent from AI Memory.
+That skill does not supply data to AI Memory retrieval.
 
 Agents use the stable AI Memory MCP tools.
 The MCP server owns scope, ranking, freshness, evidence, health, and refresh control.
@@ -125,30 +129,82 @@ Timestamp-free transcript passages use provider order or stable source order.
 Reply-aware representations include the explicit reply target before nearby messages.
 Each result still cites its canonical anchor record.
 
-### Graphify provider
+### Note graph
 
-Graphify supplies graph nodes, edges, neighbors, and paths.
+The note graph supplies graph nodes, edges, neighbors, and paths.
+`src/ai_memory_mcp/graph_builder.py` builds the graph with `build_memory_graph`.
+`src/ai_memory_mcp/memory_graph.py` uses `MemoryGraph` to rank notes, find neighbors, and find paths.
+
+Each `memory_sync` builds the graph from the Markdown index snapshot of the same generation.
+The build covers all configured memory sources.
+The build does not use an external tool or an external API.
+
+The graph contains one node for each indexed note.
+The graph also contains one scope node for each `scope_kind` and `scope_id` pair.
 
 The graph build makes an edge from three sources.
 A generic scope value makes a `belongs-to` edge.
 A frontmatter `related` entry makes a `declared-related` edge.
 A body wikilink makes a `body-link` edge.
-The build reports unresolved and ambiguous link counts separately.
-The repository pins Graphify 0.9.26 in an isolated environment.
+The build does not add a `body-link` edge when a `declared-related` edge already connects the two notes.
+For body links, the build reports unresolved and ambiguous counts separately.
+For `related` entries, one count includes unresolved and ambiguous targets.
 
-The routine refresh builds a Graphify-compatible graph from the current SQLite index.
-This build covers all configured memory sources without an extraction API.
+Each edge has the `DECLARED` confidence.
+The graph does not contain inferred or semantic relationships.
 
-The graph contains one node for each indexed document.
-The graph also contains declared relationships and shared-scope relationships.
+#### Link parsing
 
-Semantic Graphify extraction remains an optional maintenance operation.
-It does not control routine memory availability.
+The wikilink parser ignores fenced code blocks, inline code, HTML comments, and Obsidian `%% %%` comments.
+The parser uses the CommonMark fence rules for fenced code blocks.
+The parser reads a `[[Note\|Label]]` link in a table.
+The parser ignores an escaped `\[[...]]` link.
+A link cannot continue across two lines.
+Intake link validation uses the same parser.
 
-The provider adapter hides Graphify file formats from MCP clients.
-The adapter keeps Graphify replaceable.
+A `related` entry can be a quoted `"[[Note]]"` link.
+A `related` entry can also be an unquoted `- [[Note]]` YAML item.
+YAML reads the unquoted item as a nested list, and the parser changes it back into a link.
+One `related` entry can contain more than one link.
+A `related` entry can also be a plain note name.
+
+A frontmatter fence must be a complete line.
+A `---` line opens the frontmatter.
+A `---` line or a `...` line closes the frontmatter.
+
+#### Snapshot format
+
+The graph snapshot uses NetworkX node-link JSON with `nodes` and `links` keys.
+The reader also accepts the older `edges` key.
+The metadata contains `provider: "ai-memory"`, `format: "ai-memory-graph@1"`, and `build_mode: "deterministic-memory-index"`.
+The metadata also contains `index_snapshot`, `built_at`, and `memory_sources`.
+
+`parse_graph_snapshot` validates each snapshot before traversal.
+The function rejects a payload that is not a JSON object or that has no node list.
+The function rejects a node without an identifier and a duplicate node identifier.
+The function rejects an edge without two endpoints and an edge to a missing node.
+Each rejection raises `GraphSnapshotError`, which is a `ValueError`.
+
+`memory_status` reports a malformed graph as unavailable and gives the cause in `graph.error`.
+Recall keeps the lexical and semantic results and gives a warning.
+
+#### Traversal
+
+Graph ranking starts from seed notes.
+Label-token overlap with the query selects seed notes.
+The lexical and semantic results also supply seed notes.
+A bounded best-first expansion then follows the edges from each seed note.
+`AI_MEMORY_MCP_GRAPH_DEPTH` sets the expansion depth, with a default of 2 and a maximum of 4.
+Each step multiplies the score by the edge confidence weight and by a 0.45 decay.
+
+Neighbor lookup uses breadth-first search.
+Path lookup uses breadth-first search with a maximum depth of 6.
+
 Graph traversal applies all requested scopes before it follows an edge.
+Traversal never visits a note node outside the allowed paths, and never uses that node as an intermediate node.
+A scope node has no source note, so a scope node can connect two allowed notes.
 Weighted traversal permits controlled multi-hop evidence inside that scope.
+The MCP tools do not expose the graph snapshot format.
 
 ### MCP facade
 
@@ -172,7 +228,8 @@ Process termination closes the worker generation lease and SQLite snapshot.
 | `memory_status` | Reports strict health for each required layer. |
 
 `memory_status` marks the index as stale when canonical Markdown differs from the published snapshot.
-Graphify is also stale when its source index is stale.
+`memory_status` reports the note graph in the `graph` field.
+The graph is stale when it does not match the published generation or the current Markdown index snapshot.
 
 ## Query procedure
 
@@ -201,13 +258,20 @@ The service does not infer ticket, person, date, decision, or exclusion filters 
 2. Stage the Markdown vector snapshot.
 3. Read artifact changes from the committed journal.
 4. Rebuild changed source segments and bounded dependent context.
-5. Stage the Graphify snapshot from the Markdown snapshot.
+5. Build the note graph from the staged Markdown snapshot.
 6. Validate all staged components.
 7. Publish one generation manifest atomically.
-8. Run a retrieval health check.
+8. Record the generation health.
 9. Retain the active and verified previous generations.
 
+Before the pointer changes, publication validates the graph structure and the Markdown snapshot name.
+The manifest records the graph sha256 checksum, byte count, node count, and edge count.
+Retention compares each retained graph with these recorded values.
+The manifest and health files name the layers `markdown`, `artifact_vector`, and `graph`.
+Older generations name the graph layer `graphify`, and readers accept both names.
+
 The update keeps the previous generation after any component failure.
+The `memory_sync` MCP tool and the `ai-memory-sync` console command run this procedure.
 An ordinary Markdown change uses `memory_sync`.
 An artifact data change also uses `memory_sync`.
 Each recall keeps one generation lease until retrieval finishes.
@@ -215,11 +279,13 @@ Retention removes only derived snapshots that no active lease uses.
 
 ## Provider boundary
 
-The MCP contract must not depend on Graphify response formats.
-The graph provider can change without an MCP tool change.
+The MCP contract must not depend on the graph snapshot format.
+The note graph can change without an MCP tool change.
 
-Replace Graphify only if its adapter cannot meet a required contract.
-Examples include unsafe updates, unstable serialization, or insufficient provenance.
+The note graph does not need an external graph engine.
+The setup procedure installs the pinned Graphify runtime only with `--with-graphify-codebase`.
+Only the independent Graphify Codebase skill uses that runtime.
+`scripts/retire_graphify_memory.py` retires the earlier Graphify listener, launcher, and state on an upgraded installation.
 
 ## Performance rules
 
@@ -232,17 +298,17 @@ Examples include unsafe updates, unstable serialization, or insufficient provena
 - Load context for all results in one database query.
 - Keep normal recall responses compact.
 - Process only changed Markdown files during normal refreshes.
-- Keep full graph clustering as a maintenance task.
+- Build the note graph from the indexed Markdown snapshot, not from the Markdown files.
 - Update only changed Markdown chunks and affected artifact representations.
 - Use ANN candidates before exact vector reranking for large corpora.
 - Use exact vector search when ANN support is unavailable.
 - Store semantic vectors in a compact binary form.
 - Combine adjacent short sections before indexing chat exports.
-- Load Graphify candidate documents in one index query.
+- Load graph candidate documents in one index query.
 
 ## Reliability rules
 
-- Pin one Graphify version.
+- Validate each graph snapshot before traversal.
 - Pin every recall to one coordinated generation.
 - Keep one artifact database read snapshot for each recall.
 - Keep the CLI, library, MCP server, and health data consistent.
@@ -279,8 +345,8 @@ A `no_answer` status still returns ranked best-effort evidence.
 A warning marks that evidence as leads that require verification.
 
 The MCP does not expose provider diagnostics in normal recall results.
-The MCP does not expose full Graphify rebuilds.
-Use the Graphify maintenance script for a full rebuild.
+Each `memory_sync` rebuilds the complete note graph.
+The note graph does not need a separate maintenance rebuild.
 
 Each recall result contains `status`, `intent`, `evidence`, `citations`, `relationships`, and `warnings`.
 
@@ -289,4 +355,3 @@ Each recall result contains `status`, `intent`, `evidence`, `citations`, `relati
 - [Cerebras knowledge base design](https://www.cerebras.ai/blog/how-we-built-our-knowledge-base)
 - [Anthropic contextual retrieval](https://www.anthropic.com/engineering/contextual-retrieval)
 - [Microsoft GraphRAG query modes](https://microsoft.github.io/graphrag/query/overview/)
-- [Graphify releases](https://github.com/Graphify-Labs/graphify/releases)

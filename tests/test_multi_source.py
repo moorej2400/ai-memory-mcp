@@ -3,12 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-import subprocess
-import sys
 from pathlib import Path
 
 from ai_memory_mcp.config import MemorySource, Settings
-from ai_memory_mcp.graphify import GraphifyAdapter
+from ai_memory_mcp.memory_graph import MemoryGraph
 from ai_memory_mcp.index import MemoryIndex, build_index, current_index_path
 from ai_memory_mcp.models import ScopeFilter
 from ai_memory_mcp.retrieval import RetrievalEngine
@@ -70,7 +68,6 @@ def test_recall_searches_primary_and_retrieval_only_sources(
         memory_root=core,
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
         retrieval_sources=(
             MemorySource(source_id="archive", root=archive),
         ),
@@ -98,7 +95,6 @@ def test_status_marks_only_the_primary_source_writable(tmp_path: Path) -> None:
         memory_root=core,
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
         retrieval_sources=(
             MemorySource(source_id="archive", root=archive),
         ),
@@ -128,7 +124,6 @@ def test_index_detects_markdown_changes_after_publication(
         memory_root=core,
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
     )
     result = build_index(settings, force=True)
@@ -175,75 +170,6 @@ def test_settings_load_named_retrieval_sources(
     ] == ["archive", "reference"]
 
 
-def test_graph_merge_prefixes_each_memory_source(
-    project_root: Path,
-    tmp_path: Path,
-) -> None:
-    source_arguments: list[str] = []
-    for source_id in ("core", "archive"):
-        output = tmp_path / source_id / "graphify-out"
-        output.mkdir(parents=True)
-        (output / "graph.json").write_text(
-            json.dumps(
-                {
-                    "nodes": [
-                        {
-                            "id": "shared",
-                            "label": source_id,
-                            "source_file": "Notes/Shared.md",
-                        }
-                    ],
-                    "links": [],
-                }
-            ),
-            encoding="utf-8",
-        )
-        (output / "manifest.json").write_text(
-            json.dumps({"Notes/Shared.md": {"sha256": source_id}}),
-            encoding="utf-8",
-        )
-        source_arguments.extend(
-            ("--source", f"{source_id}={output / 'graph.json'}")
-        )
-
-    merged = tmp_path / "merged"
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(
-                project_root
-                / "scripts"
-                / "graphify"
-                / "merge-memory-source-graphs.py"
-            ),
-            *source_arguments,
-            "--output-dir",
-            str(merged),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    graph = json.loads((merged / "graph.json").read_text(encoding="utf-8"))
-    manifest = json.loads(
-        (merged / "manifest.json").read_text(encoding="utf-8")
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert {node["id"] for node in graph["nodes"]} == {
-        "core::shared",
-        "archive::shared",
-    }
-    assert {node["source_file"] for node in graph["nodes"]} == {
-        "core/Notes/Shared.md",
-        "archive/Notes/Shared.md",
-    }
-    assert set(manifest) == {
-        "core/Notes/Shared.md",
-        "archive/Notes/Shared.md",
-    }
-
-
 def test_changed_memory_id_collision_preserves_last_valid_record(
     tmp_path: Path,
 ) -> None:
@@ -269,7 +195,6 @@ def test_changed_memory_id_collision_preserves_last_valid_record(
         memory_root=core,
         state_dir=state,
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
     )
     build_index(settings, force=True)
     _write_memory(
@@ -294,17 +219,6 @@ def test_changed_memory_id_collision_preserves_last_valid_record(
         ("mem-first", "core/Notes/First.md"),
         ("mem-second", "core/Notes/Second.md"),
     ]
-
-
-def test_graphify_extraction_excludes_restricted_directories(
-    project_root: Path,
-) -> None:
-    script = (
-        project_root / "scripts" / "graphify" / "extract_ai_memory.py"
-    ).read_text(encoding="utf-8")
-
-    assert '"**/Restricted/**"' in script
-    assert '"**/.trash/**"' in script
 
 
 def test_scope_filters_treat_like_metacharacters_as_literals(
@@ -343,7 +257,6 @@ def test_scope_filters_treat_like_metacharacters_as_literals(
         memory_root=core,
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
     )
     build_index(settings, force=True)
@@ -432,7 +345,6 @@ def test_graph_traversal_cannot_cross_a_scoped_source(tmp_path: Path) -> None:
         memory_root=core,
         state_dir=tmp_path / "state",
         graph_path=graph_path,
-        graphify_mcp_url="",
         retrieval_sources=(
             MemorySource(source_id="archive", root=archive),
         ),
@@ -472,7 +384,7 @@ def test_weighted_multi_hop_decay_applies_once_per_edge(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    adapter = GraphifyAdapter(graph_path, source_ids=("core",))
+    adapter = MemoryGraph(graph_path, source_ids=("core",))
 
     ranked = adapter.rank("", ["core/A.md"], limit=4, max_depth=2)
 
@@ -507,7 +419,7 @@ def test_weighted_traversal_replaces_a_weaker_path_found_first(
         ),
         encoding="utf-8",
     )
-    adapter = GraphifyAdapter(graph_path, source_ids=("core",))
+    adapter = MemoryGraph(graph_path, source_ids=("core",))
 
     ranked = adapter.rank("", ["core/A.md"], limit=6, max_depth=3)
 

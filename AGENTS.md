@@ -13,7 +13,7 @@ They also apply to `graphify-codebase/` and all future subdirectories.
 - Use neutral names and identifiers in documentation, tests, and benchmark fixtures.
 - Keep Markdown as the authority for distilled durable memory.
 - Keep the artifact SQLite database as the authority for raw artifacts.
-- Treat Markdown search SQLite, artifact burst indexes, and Graphify data as derived data.
+- Treat Markdown search SQLite, artifact burst indexes, and note graph snapshots as derived data.
 
 ## Public repository privacy
 

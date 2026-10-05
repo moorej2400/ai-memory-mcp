@@ -88,6 +88,23 @@ def current_graph_path(settings: Settings) -> Path:
     return generation_component_path(settings, "graph_snapshot") or settings.graph_path
 
 
+GRAPH_LAYER = "graph"
+# Generations published before the Graphify removal name the graph layer
+# `graphify`. Their manifests are immutable, so readers accept both names.
+LEGACY_GRAPH_LAYER = "graphify"
+
+
+def graph_layer(layers: object) -> dict[str, Any] | None:
+    """Return the graph metrics from a manifest or health `layers` object."""
+    if not isinstance(layers, dict):
+        return None
+    for name in (GRAPH_LAYER, LEGACY_GRAPH_LAYER):
+        value = layers.get(name)
+        if isinstance(value, dict):
+            return value
+    return None
+
+
 def generation_health(settings: Settings) -> dict[str, Any]:
     return _read_json(settings.generation_health_path) or {}
 
@@ -294,16 +311,17 @@ def _artifact_metrics(path: Path) -> dict[str, Any]:
 
 
 def _graph_metrics(path: Path, markdown_snapshot: str) -> dict[str, Any]:
+    from .memory_graph import GraphSnapshotError, parse_graph_snapshot
+
     payload = _read_json(path)
     if payload is None:
         raise RuntimeError("The generated graph is not valid JSON.")
-    metadata = payload.get("graph")
-    if not isinstance(metadata, dict) or metadata.get("index_snapshot") != markdown_snapshot:
+    try:
+        metadata, nodes, links = parse_graph_snapshot(payload)
+    except GraphSnapshotError as exc:
+        raise RuntimeError(f"The generated graph has an invalid structure: {exc}") from exc
+    if metadata.get("index_snapshot") != markdown_snapshot:
         raise RuntimeError("The graph does not identify the Markdown snapshot.")
-    nodes = payload.get("nodes")
-    links = payload.get("links", payload.get("edges"))
-    if not isinstance(nodes, list) or not isinstance(links, list):
-        raise RuntimeError("The generated graph has an invalid structure.")
     return {
         "path": path.name,
         "bytes": path.stat().st_size,
@@ -385,10 +403,7 @@ def _valid_generation_components(
         _sqlite_metrics(markdown, "SELECT count(*) FROM chunks")
         _artifact_metrics(artifact)
         graph_metrics = _graph_metrics(graph, markdown.name)
-        layers = manifest.get("layers")
-        expected_graph = (
-            layers.get("graphify") if isinstance(layers, dict) else None
-        )
+        expected_graph = graph_layer(manifest.get("layers"))
         if not isinstance(expected_graph, dict):
             return False
         with sqlite3.connect(
@@ -541,7 +556,7 @@ def refresh_generation(settings: Settings) -> dict[str, Any]:
     )
     from .artifacts.schema import require_current_artifact_schema
     from .index import build_index, current_index_path
-    from .provider_graph import build_provider_graph
+    from .graph_builder import build_memory_graph
 
     settings.state_dir.mkdir(parents=True, exist_ok=True)
     started_at = _utc_now()
@@ -632,14 +647,14 @@ def refresh_generation(settings: Settings) -> dict[str, Any]:
                 }
             )
 
-            layer = "graphify"
+            layer = GRAPH_LAYER
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
             generation_id = f"{stamp}-{os.getpid()}"
             temporary_dir = settings.state_dir / f".generation-{generation_id}.partial"
             temporary_dir.mkdir()
             owned_paths.add(temporary_dir)
             graph_started = time.perf_counter()
-            build_provider_graph(
+            build_memory_graph(
                 settings,
                 temporary_dir,
                 index_path=markdown_path,
@@ -673,7 +688,7 @@ def refresh_generation(settings: Settings) -> dict[str, Any]:
                 "layers": {
                     "markdown": markdown_metrics,
                     "artifact_vector": artifact_metrics,
-                    "graphify": graph_metrics,
+                    GRAPH_LAYER: graph_metrics,
                 },
             }
             manifest_path = settings.state_dir / f"generation-{generation_id}.json"
@@ -725,6 +740,11 @@ def refresh_generation(settings: Settings) -> dict[str, Any]:
                 int(completed["storage_bytes"]) - previous_storage
             )
             prior_layer_health = dict(health.get("layers", {}))
+            if LEGACY_GRAPH_LAYER in prior_layer_health:
+                # Carry the graph history to the new layer name once. The next
+                # health file then holds only the layers this release writes.
+                legacy = prior_layer_health.pop(LEGACY_GRAPH_LAYER)
+                prior_layer_health.setdefault(GRAPH_LAYER, legacy)
             next_layer_health: dict[str, Any] = {}
             for layer_name, metrics in manifest["layers"].items():
                 previous_layer = dict(prior_layer_health.get(layer_name, {}))

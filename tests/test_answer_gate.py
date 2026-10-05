@@ -57,7 +57,6 @@ def _service(tmp_path: Path, provider: str) -> MemoryService:
         memory_root=vault,
         state_dir=tmp_path / f"state-{provider}",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
         embedding_provider=provider,
     )
     build_index(settings, force=True)
