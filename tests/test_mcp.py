@@ -348,7 +348,6 @@ def test_timeout_archives_the_dead_worker_generation_lease(tmp_path: Path) -> No
         memory_root=tmp_path / "vault",
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
     )
     settings.state_dir.mkdir(parents=True)
     lease = settings.state_dir / ".generation-lease-example-321-deadbeef.json"

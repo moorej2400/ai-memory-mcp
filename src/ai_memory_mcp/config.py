@@ -119,8 +119,9 @@ def _retrieval_sources() -> tuple[MemorySource, ...]:
 class Settings:
     memory_root: Path
     state_dir: Path
+    # Read only when no coordinated generation exists. Releases before the
+    # Graphify removal published the graph at this path.
     graph_path: Path
-    graphify_mcp_url: str
     primary_source_id: str = "core"
     retrieval_sources: tuple[MemorySource, ...] = ()
     host: str = "127.0.0.1"
@@ -162,13 +163,15 @@ class Settings:
         state = _configured_path(
             "AI_MEMORY_MCP_STATE_DIR", data_root / "indexes"
         )
-        graphify_state = _configured_path(
+        # The legacy state directory keeps an upgraded installation readable
+        # until its first memory_sync publishes a native generation.
+        legacy_graph_state = _configured_path(
             "AI_MEMORY_GRAPHIFY_STATE_DIR",
             data_root / "provider-state" / "graphify",
         )
         graph = _configured_path(
             "AI_MEMORY_GRAPH_PATH",
-            graphify_state
+            legacy_graph_state
             / "corpora"
             / "ai-memory"
             / "graphify-out"
@@ -230,9 +233,6 @@ class Settings:
             memory_root=root,
             state_dir=state,
             graph_path=graph,
-            graphify_mcp_url=os.getenv(
-                "GRAPHIFY_GLOBAL_MCP_URL", "http://127.0.0.1:4324/mcp"
-            ),
             primary_source_id=_source_id(
                 os.getenv("AI_MEMORY_PRIMARY_SOURCE_ID", "core")
             ),

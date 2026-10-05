@@ -434,7 +434,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         structured_output=True,
     )
     def memory_status() -> StatusResponse:
-        """Report source, index, Graphify, and runtime status."""
+        """Report source, index, graph, and runtime status."""
         return service.status()
 
     return mcp

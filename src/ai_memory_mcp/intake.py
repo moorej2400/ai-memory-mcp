@@ -9,7 +9,13 @@ from typing import Any, Iterable
 
 import yaml
 
-from .wikilinks import identity_keys, resolve_link, wikilink_targets
+from .frontmatter import split_frontmatter
+from .wikilinks import (
+    identity_keys,
+    related_values,
+    resolve_link,
+    wikilink_targets,
+)
 
 
 CURRENT_MEMORY_SCHEMA_VERSION = 2
@@ -38,16 +44,16 @@ class InspectedNote:
 def parse_markdown(raw: str) -> tuple[dict[str, Any], str, str | None]:
     if not raw.startswith("---"):
         return {}, raw, "The note has no YAML frontmatter."
-    parts = raw.split("---", 2)
-    if len(parts) != 3:
+    header, body = split_frontmatter(raw)
+    if header is None:
         return {}, raw, "The YAML frontmatter is incomplete."
     try:
-        metadata = yaml.safe_load(parts[1]) or {}
+        metadata = yaml.safe_load(header) or {}
     except yaml.YAMLError as exc:
-        return {}, parts[2].lstrip(), f"The YAML frontmatter is invalid: {exc}"
+        return {}, body, f"The YAML frontmatter is invalid: {exc}"
     if not isinstance(metadata, dict):
-        return {}, parts[2].lstrip(), "The YAML frontmatter must be a mapping."
-    return metadata, parts[2].lstrip(), None
+        return {}, body, "The YAML frontmatter must be a mapping."
+    return metadata, body, None
 
 
 def _valid_date(value: Any) -> bool:
@@ -181,9 +187,7 @@ def inspect_vault(root: Path, *, require_current: bool = False) -> dict[str, Any
 
     for note in notes:
         values: list[str] = [note.body]
-        related = note.metadata.get("related")
-        if isinstance(related, list):
-            values.extend(str(item) for item in related)
+        values.extend(related_values(note.metadata.get("related")))
         for target in dict.fromkeys(wikilink_targets(values)):
             _, state = resolve_link(target, candidates)
             if state not in {"resolved", "ignored"}:

@@ -69,7 +69,6 @@ def _benchmark_settings(root: Path, state_dir: Path) -> Settings:
         memory_root=root / "fixtures" / "vault",
         state_dir=state_dir,
         graph_path=root / "fixtures" / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
         artifact_db=state_dir / "artifacts.sqlite3",
         artifact_objects_dir=state_dir / "artifact-objects",
@@ -245,8 +244,8 @@ def run_benchmark(
             "markdown_chunks": status_before.index.chunks,
             "artifact_records": status_before.artifact_database.active_artifacts,
             "artifact_bursts": status_before.artifact_vector.bursts,
-            "graph_nodes": status_before.graphify.nodes,
-            "graph_edges": status_before.graphify.edges,
+            "graph_nodes": status_before.graph.nodes,
+            "graph_edges": status_before.graph.edges,
         },
         "tag_pass_rate": {
             tag: statistics.mean(values) for tag, values in sorted(tag_stats.items())

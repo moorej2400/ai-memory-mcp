@@ -5,7 +5,15 @@ from pathlib import PurePosixPath
 from typing import Iterable, Mapping
 
 
-WIKILINK_RE = re.compile(r"\[\[([^]|]+)(?:\|[^]]+)?]]")
+# A target stops at the first pipe. Obsidian escapes that pipe as `\|` inside
+# tables, so the lazy target must not keep the escape backslash. A link never
+# spans lines, and a backslash before `[[` makes the brackets literal text.
+WIKILINK_RE = re.compile(r"(?<!\\)\[\[([^\[\]\n|]+?)(?:\\?\|[^\[\]\n]*)?\]\]")
+FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.DOTALL)
+# Obsidian `%%` comments and HTML comments are hidden from the rendered note.
+COMMENT_RE = re.compile(r"<!--.*?-->|%%.*?%%", re.DOTALL)
+BLANK_LINE_RE = re.compile(r"\n[ \t]*\n")
 NON_MARKDOWN_SUFFIXES = {
     ".base",
     ".canvas",
@@ -19,11 +27,116 @@ NON_MARKDOWN_SUFFIXES = {
 }
 
 
+def _without_fenced_code(text: str) -> list[str]:
+    """Return the text segments outside fenced code blocks.
+
+    This follows the CommonMark fence rules that Obsidian uses: a closing fence
+    uses the same character and is at least as long as the opening fence. An
+    unclosed fence continues to the end of the note.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    fence: str | None = None
+    for line in text.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        if fence is None:
+            opening = FENCE_OPEN_RE.match(stripped)
+            # A backtick fence cannot have a backtick in its info string.
+            if opening and not (
+                opening.group(1)[0] == "`" and "`" in opening.group(2)
+            ):
+                fence = opening.group(1)
+                segments.append("".join(current))
+                current = []
+                continue
+            current.append(line)
+            continue
+        candidate = stripped.lstrip(" ")
+        if (
+            len(stripped) - len(candidate) <= 3
+            and candidate.rstrip()
+            and set(candidate.rstrip()) == {fence[0]}
+            and len(candidate.rstrip()) >= len(fence)
+        ):
+            fence = None
+    if fence is None:
+        segments.append("".join(current))
+    return segments
+
+
+def linkable_text(value: str) -> str:
+    """Remove the Markdown regions in which link syntax is literal text.
+
+    Fenced code, inline code, HTML comments, and Obsidian comments do not create
+    links. An inline code span cannot cross a blank line, so each paragraph is
+    scanned separately; a stray backtick cannot hide links in later paragraphs.
+    """
+    kept: list[str] = []
+    for segment in _without_fenced_code(value):
+        paragraphs = BLANK_LINE_RE.split(segment)
+        segment = "\n\n".join(
+            INLINE_CODE_RE.sub(" ", paragraph) for paragraph in paragraphs
+        )
+        kept.append(COMMENT_RE.sub(" ", segment))
+    return "\n".join(kept)
+
+
 def wikilink_targets(values: Iterable[str]) -> list[str]:
     targets: list[str] = []
     for value in values:
-        targets.extend(match.group(1) for match in WIKILINK_RE.finditer(value))
-    return targets
+        targets.extend(
+            match.group(1).strip()
+            for match in WIKILINK_RE.finditer(linkable_text(value))
+        )
+    return [target for target in targets if target]
+
+
+def _is_scalar(value: object) -> bool:
+    return value is not None and not isinstance(value, (list, dict))
+
+
+def related_values(value: object) -> list[str]:
+    """Return the `related` frontmatter entries as link strings.
+
+    YAML reads an unquoted `[[Note]]` as a sequence nested in a sequence. That
+    form must become the link `[[Note]]` again, not the text `['Note']`.
+    """
+    if value is None:
+        return []
+    items = value if isinstance(value, list) else [value]
+    results: list[str] = []
+    for item in items:
+        if isinstance(item, list):
+            # `related: [[A]]` gives the item ["A"]. A block item `- [[A]]` adds
+            # one more level and gives [["A"]].
+            groups = item if item and all(isinstance(part, list) for part in item) else [item]
+            for group in groups:
+                if group and all(_is_scalar(part) for part in group):
+                    # `[[Decisions, 2026]]` is one title that contains a comma.
+                    results.append(f"[[{', '.join(str(part) for part in group)}]]")
+            continue
+        if not _is_scalar(item):
+            continue
+        text = str(item).strip()
+        if text:
+            results.append(text)
+    return results
+
+
+def related_link_targets(values: Iterable[str]) -> list[str]:
+    """Return one link target for each note that a `related` entry names.
+
+    An entry can hold several wikilinks. An entry without wikilink syntax is a
+    plain note name, path, or alias.
+    """
+    targets: list[str] = []
+    for value in values:
+        links = wikilink_targets([value])
+        if links:
+            targets.extend(links)
+        elif value.strip():
+            targets.append(value.strip())
+    return list(dict.fromkeys(targets))
 
 
 def normalized_link_target(value: str) -> str:

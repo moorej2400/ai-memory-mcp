@@ -50,7 +50,6 @@ def _settings(tmp_path: Path) -> Settings:
         memory_root=vault,
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "legacy-graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
         artifact_db=tmp_path / "raw" / "artifacts.sqlite3",
         artifact_objects_dir=tmp_path / "raw" / "objects",
@@ -147,7 +146,7 @@ def test_sync_publishes_one_consistent_generation(tmp_path: Path) -> None:
     assert status.generation.consistent is True
     assert status.index.generation_id == generation["generation_id"]
     assert status.artifact_vector.stale is False
-    assert status.graphify.stale is False
+    assert status.graph.stale is False
 
 
 def test_sync_rejects_an_outdated_artifact_schema_before_indexing(
@@ -221,7 +220,7 @@ def test_failed_layer_keeps_the_previous_generation(
         raise RuntimeError("synthetic graph failure")
 
     monkeypatch.setattr(
-        "ai_memory_mcp.provider_graph.build_provider_graph",
+        "ai_memory_mcp.graph_builder.build_memory_graph",
         fail_graph,
     )
     failed = service.sync()
@@ -229,9 +228,9 @@ def test_failed_layer_keeps_the_previous_generation(
     assert failed.ok is False
     assert settings.generation_pointer_path.read_bytes() == pointer_before
     health = json.loads(settings.generation_health_path.read_text(encoding="utf-8"))
-    assert health["last_failure"]["layer"] == "graphify"
-    assert health["layers"]["graphify"]["last_success"]["at"]
-    assert health["layers"]["graphify"]["last_failure"]["at"]
+    assert health["last_failure"]["layer"] == "graph"
+    assert health["layers"]["graph"]["last_success"]["at"]
+    assert health["layers"]["graph"]["last_failure"]["at"]
     assert "storage_growth_bytes" in health["layers"]["markdown"]["last_success"]
     assert "synthetic graph failure" not in json.dumps(health)
     assert service.status().ok is False
@@ -401,7 +400,7 @@ def test_status_reports_corrupt_generation_components_without_raising(
 
     assert status.ok is False
     assert status.index.available is False
-    assert status.graphify.available is False
+    assert status.graph.available is False
 
 
 def test_status_rejects_graph_content_that_does_not_match_manifest(
@@ -422,7 +421,7 @@ def test_status_rejects_graph_content_that_does_not_match_manifest(
     recall = service.recall("coordinated generation")
 
     assert status.ok is False
-    assert status.graphify.stale is True
+    assert status.graph.stale is True
     assert any("graph component is unavailable" in item for item in recall.warnings)
 
 
@@ -452,8 +451,8 @@ def test_sync_replaces_a_corrupt_generation_without_a_last_good(
     assert repaired.ok is True
     assert current is not None
     assert current["generation_id"] != first_generation["generation_id"]
-    assert status.graphify.available is True
-    assert status.graphify.stale is False
+    assert status.graph.available is True
+    assert status.graph.stale is False
     assert status.generation.verified_generations == 1
     assert status.generation.last_good_available is False
 
@@ -465,7 +464,6 @@ def test_empty_graph_is_a_valid_available_generation(tmp_path: Path) -> None:
         memory_root=memory_root,
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
         artifact_db=tmp_path / "artifacts.sqlite3",
         artifact_objects_dir=tmp_path / "objects",
@@ -478,8 +476,8 @@ def test_empty_graph_is_a_valid_available_generation(tmp_path: Path) -> None:
 
     assert service.sync().ok is True
     status = service.status()
-    assert status.graphify.available is True
-    assert status.graphify.nodes == 0
+    assert status.graph.available is True
+    assert status.graph.nodes == 0
     assert status.ok is True
 
 
@@ -538,7 +536,7 @@ def test_recall_does_not_fall_back_when_generation_components_are_missing(
     )
     assert service.engine.graph.graph_path != settings.graph_path
     assert status.ok is False
-    assert status.graphify.available is False
+    assert status.graph.available is False
     assert status.artifact_vector.available is False
 
 
@@ -643,3 +641,77 @@ def test_retention_skips_a_locked_obsolete_file_without_rolling_back(
     assert current["generation_id"] == current_id
     assert locked.is_file()
     assert result["removal_errors"] == 1
+
+
+def _rename_graph_layer(path: Path, old: str, new: str) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["layers"][new] = payload["layers"].pop(old)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_generation_from_the_graphify_release_stays_valid(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    service = MemoryService(settings)
+    assert service.sync().ok is True
+    generation = load_current_generation(settings)
+    assert generation is not None
+    # Releases before the Graphify removal wrote the graph layer as `graphify`.
+    _rename_graph_layer(Path(generation["manifest_path"]), "graph", "graphify")
+    _rename_graph_layer(settings.generation_health_path, "graph", "graphify")
+    upgraded = MemoryService(settings)
+
+    status = upgraded.status()
+    recall = upgraded.recall("coordinated generation")
+
+    assert status.ok is True
+    assert status.graph.available is True
+    assert status.graph.stale is False
+    assert not any("graph component" in item for item in recall.warnings)
+
+    assert upgraded.sync().ok is True
+    health = json.loads(settings.generation_health_path.read_text(encoding="utf-8"))
+    assert set(health["layers"]) == {"markdown", "artifact_vector", "graph"}
+    retained = load_current_generation(settings)
+    assert retained is not None
+    assert retained["generation_id"] != generation["generation_id"]
+    # The legacy manifest passes retention validation as the last good copy.
+    assert Path(generation["manifest_path"]).is_file()
+
+
+def test_legacy_graph_layer_failure_is_still_reported(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    service = MemoryService(settings)
+    assert service.sync().ok is True
+    health = json.loads(settings.generation_health_path.read_text(encoding="utf-8"))
+    health["layers"]["graphify"] = {
+        "last_failure": {"at": "2999-01-01T00:00:00+00:00", "layer": "graphify"}
+    }
+    settings.generation_health_path.write_text(json.dumps(health), encoding="utf-8")
+
+    assert service.status().graph.last_failure_at == "2999-01-01T00:00:00+00:00"
+
+
+def test_sync_command_reports_failure_with_exit_status(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from ai_memory_mcp import cli
+
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls: settings))
+    monkeypatch.setattr("sys.argv", ["ai-memory-sync"])
+
+    cli.sync_main()
+    published = json.loads(capsys.readouterr().out)
+    assert published["ok"] is True
+    assert published["graph_snapshot"].startswith("graph-")
+
+    def fail_graph(*args, **kwargs):
+        raise RuntimeError("synthetic graph failure")
+
+    monkeypatch.setattr("ai_memory_mcp.graph_builder.build_memory_graph", fail_graph)
+    with pytest.raises(SystemExit) as exited:
+        cli.sync_main()
+    assert exited.value.code == 1
+    assert json.loads(capsys.readouterr().out)["ok"] is False

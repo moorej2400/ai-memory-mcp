@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from ai_memory_mcp.config import MemorySource, Settings
-from ai_memory_mcp.graphify import GraphifyAdapter
+from ai_memory_mcp.memory_graph import MemoryGraph
 from ai_memory_mcp.index import MemoryIndex, build_index, current_index_path
 from ai_memory_mcp.models import ScopeFilter
 from ai_memory_mcp.retrieval import RetrievalEngine
@@ -70,7 +70,6 @@ def test_recall_searches_primary_and_retrieval_only_sources(
         memory_root=core,
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
         retrieval_sources=(
             MemorySource(source_id="archive", root=archive),
         ),
@@ -98,7 +97,6 @@ def test_status_marks_only_the_primary_source_writable(tmp_path: Path) -> None:
         memory_root=core,
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
         retrieval_sources=(
             MemorySource(source_id="archive", root=archive),
         ),
@@ -128,7 +126,6 @@ def test_index_detects_markdown_changes_after_publication(
         memory_root=core,
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
     )
     result = build_index(settings, force=True)
@@ -269,7 +266,6 @@ def test_changed_memory_id_collision_preserves_last_valid_record(
         memory_root=core,
         state_dir=state,
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
     )
     build_index(settings, force=True)
     _write_memory(
@@ -343,7 +339,6 @@ def test_scope_filters_treat_like_metacharacters_as_literals(
         memory_root=core,
         state_dir=tmp_path / "state",
         graph_path=tmp_path / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
     )
     build_index(settings, force=True)
@@ -432,7 +427,6 @@ def test_graph_traversal_cannot_cross_a_scoped_source(tmp_path: Path) -> None:
         memory_root=core,
         state_dir=tmp_path / "state",
         graph_path=graph_path,
-        graphify_mcp_url="",
         retrieval_sources=(
             MemorySource(source_id="archive", root=archive),
         ),
@@ -472,7 +466,7 @@ def test_weighted_multi_hop_decay_applies_once_per_edge(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    adapter = GraphifyAdapter(graph_path, source_ids=("core",))
+    adapter = MemoryGraph(graph_path, source_ids=("core",))
 
     ranked = adapter.rank("", ["core/A.md"], limit=4, max_depth=2)
 
@@ -507,7 +501,7 @@ def test_weighted_traversal_replaces_a_weaker_path_found_first(
         ),
         encoding="utf-8",
     )
-    adapter = GraphifyAdapter(graph_path, source_ids=("core",))
+    adapter = MemoryGraph(graph_path, source_ids=("core",))
 
     ranked = adapter.rank("", ["core/A.md"], limit=6, max_depth=3)
 

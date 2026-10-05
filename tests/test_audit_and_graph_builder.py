@@ -9,7 +9,7 @@ from pathlib import Path
 from ai_memory_mcp.audit import file_lock
 from ai_memory_mcp.config import Settings
 from ai_memory_mcp.index import build_index
-from ai_memory_mcp.provider_graph import build_provider_graph
+from ai_memory_mcp.graph_builder import build_memory_graph
 from ai_memory_mcp.service import MemoryService
 
 
@@ -46,7 +46,7 @@ def test_retrieval_audit_records_query_result_and_performance(
     assert set(record["diagnostics"]["provider_latency_ms"]) == {
         "lexical",
         "semantic",
-        "graphify",
+        "graph",
         "fusion",
         "rerank",
         "context",
@@ -112,12 +112,12 @@ def test_index_waits_for_concurrent_publisher(
     assert records[-1]["lock_wait_ms"] >= 250
 
 
-def test_provider_graph_covers_the_current_index(
+def test_memory_graph_covers_the_current_index(
     benchmark_settings: Settings,
     tmp_path: Path,
 ) -> None:
     output_dir = tmp_path / "graphify-out"
-    summary = build_provider_graph(benchmark_settings, output_dir)
+    summary = build_memory_graph(benchmark_settings, output_dir)
     graph = json.loads(
         (output_dir / "graph.json").read_text(encoding="utf-8")
     )

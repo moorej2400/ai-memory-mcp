@@ -9,8 +9,65 @@ from typing import Any
 from .text import tokenize
 
 
-class GraphifyAdapter:
-    """Expose only provider-neutral graph operations to the retrieval engine."""
+GRAPH_SNAPSHOT_FORMAT = "ai-memory-graph@1"
+
+
+class GraphSnapshotError(ValueError):
+    """A graph snapshot that does not have the node-link structure."""
+
+
+def parse_graph_snapshot(payload: object) -> tuple[
+    dict[str, Any],
+    dict[str, dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    """Validate one node-link graph snapshot and return its parts.
+
+    The format is the NetworkX node-link JSON that earlier releases also read,
+    so existing snapshots stay valid. A malformed snapshot must fail here as a
+    `ValueError`; status and recall then report the graph as unavailable instead
+    of failing with a `KeyError` or `TypeError` deep in traversal.
+    """
+    if not isinstance(payload, dict):
+        raise GraphSnapshotError("The graph snapshot must contain one JSON object.")
+    metadata = payload.get("graph", {})
+    if not isinstance(metadata, dict):
+        raise GraphSnapshotError("The graph metadata must be a JSON object.")
+    raw_nodes = payload.get("nodes")
+    if not isinstance(raw_nodes, list):
+        raise GraphSnapshotError("The graph snapshot must contain a node list.")
+    # Older snapshots name the edge list `edges` instead of `links`.
+    raw_links = payload.get("links", payload.get("edges", []))
+    if not isinstance(raw_links, list):
+        raise GraphSnapshotError("The graph snapshot must contain an edge list.")
+    nodes: dict[str, dict[str, Any]] = {}
+    for position, node in enumerate(raw_nodes):
+        if not isinstance(node, dict):
+            raise GraphSnapshotError(f"Graph node {position} is not a JSON object.")
+        node_id = node.get("id")
+        if not isinstance(node_id, (str, int)) or isinstance(node_id, bool) or str(node_id) == "":
+            raise GraphSnapshotError(f"Graph node {position} has no identifier.")
+        if str(node_id) in nodes:
+            raise GraphSnapshotError(f"Graph node identifier {node_id!r} is not unique.")
+        nodes[str(node_id)] = node
+    links: list[dict[str, Any]] = []
+    for position, edge in enumerate(raw_links):
+        if not isinstance(edge, dict):
+            raise GraphSnapshotError(f"Graph edge {position} is not a JSON object.")
+        for endpoint in ("source", "target"):
+            value = edge.get(endpoint)
+            if not isinstance(value, (str, int)) or isinstance(value, bool):
+                raise GraphSnapshotError(f"Graph edge {position} has no {endpoint}.")
+            if str(value) not in nodes:
+                raise GraphSnapshotError(
+                    f"Graph edge {position} names a missing {endpoint} node."
+                )
+        links.append(edge)
+    return metadata, nodes, links
+
+
+class MemoryGraph:
+    """Rank, expand, and connect memory notes through the derived note graph."""
 
     def __init__(
         self,
@@ -52,11 +109,9 @@ class GraphifyAdapter:
         if stamp == self._stamp:
             return
         payload = json.loads(self.graph_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("The graph snapshot must contain one JSON object.")
-        metadata = payload.get("graph", {})
-        self.metadata = metadata if isinstance(metadata, dict) else {}
-        self.nodes = {str(node["id"]): node for node in payload.get("nodes", [])}
+        metadata, nodes, links = parse_graph_snapshot(payload)
+        self.metadata = metadata
+        self.nodes = nodes
         self.adjacency = defaultdict(list)
         self.source_nodes = defaultdict(set)
         for node_id, node in self.nodes.items():
@@ -65,12 +120,11 @@ class GraphifyAdapter:
             if source:
                 node["source_file"] = canonical_source
                 self.source_nodes[source].add(node_id)
-        for edge in payload.get("links", payload.get("edges", [])):
-            source = str(edge.get("source", ""))
-            target = str(edge.get("target", ""))
-            if source in self.nodes and target in self.nodes:
-                self.adjacency[source].append((target, edge))
-                self.adjacency[target].append((source, edge))
+        for edge in links:
+            source = str(edge["source"])
+            target = str(edge["target"])
+            self.adjacency[source].append((target, edge))
+            self.adjacency[target].append((source, edge))
         self._stamp = stamp
         self._available = True
 

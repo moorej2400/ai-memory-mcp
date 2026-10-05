@@ -15,7 +15,7 @@ import pytest
 
 from ai_memory_mcp.artifacts.schema import migrate_artifact_db
 from ai_memory_mcp.config import Settings
-from ai_memory_mcp.graphify import GraphifyAdapter as MemoryGraph
+from ai_memory_mcp.memory_graph import MemoryGraph
 from ai_memory_mcp.service import MemoryService
 
 DEMO = "core/Repos/demo/Tickets/DEMO-777/_ticket.md"
@@ -33,7 +33,6 @@ def synced(tmp_path_factory, project_root: Path) -> tuple[MemoryService, Path]:
         memory_root=root / "vault",
         state_dir=root / "state",
         graph_path=root / "legacy" / "graph.json",
-        graphify_mcp_url="",
         embedding_provider="hashed",
         audit_logging_enabled=False,
         log_dir=root / "logs",

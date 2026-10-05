@@ -9,7 +9,9 @@ from typing import Any, Iterable
 
 import yaml
 
+from .frontmatter import split_frontmatter
 from .models import MemoryChunk, MemoryDocument
+from .wikilinks import related_values
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/#@+-]*")
 IDENTIFIER_RE = re.compile(
@@ -18,7 +20,6 @@ IDENTIFIER_RE = re.compile(
     re.IGNORECASE,
 )
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
-from .wikilinks import wikilink_targets
 TARGET_CHUNK_CHARS = 1800
 MAX_CHUNK_CHARS = 5000
 MAX_FTS_TERMS = 24
@@ -115,16 +116,14 @@ def _as_strings(value: Any) -> list[str]:
 
 
 def _frontmatter(raw: str) -> tuple[dict[str, Any], str]:
-    if not raw.startswith("---"):
-        return {}, raw
-    parts = raw.split("---", 2)
-    if len(parts) != 3:
+    header, body = split_frontmatter(raw)
+    if header is None:
         return {}, raw
     try:
-        metadata = yaml.safe_load(parts[1]) or {}
+        metadata = yaml.safe_load(header) or {}
     except yaml.YAMLError:
         metadata = {}
-    return metadata if isinstance(metadata, dict) else {}, parts[2].lstrip()
+    return metadata if isinstance(metadata, dict) else {}, body
 
 
 def parse_document(path: Path, root: Path, source_id: str = "core") -> MemoryDocument:
@@ -137,7 +136,7 @@ def parse_document(path: Path, root: Path, source_id: str = "core") -> MemoryDoc
     primary = metadata.get("primary_scope") or {}
     if not isinstance(primary, dict):
         primary = {}
-    related = _as_strings(metadata.get("related"))
+    related = related_values(metadata.get("related"))
     scope_kind = str(metadata.get("scope_kind") or primary.get("kind") or "reference")
     scope_id = str(metadata.get("scope_id") or primary.get("id") or "")
     identifiers = query_identifiers(raw)

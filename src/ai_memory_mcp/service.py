@@ -27,9 +27,12 @@ from .artifacts.search import ArtifactSearch
 from .audit import append_event, logging_status
 from .query_log import current_trace, log_library_query, query_stage, trace_progress
 from .config import Settings
-from .graphify import GraphifyAdapter
+from .memory_graph import MemoryGraph
 from .generation import (
     current_graph_path,
+    GRAPH_LAYER,
+    LEGACY_GRAPH_LAYER,
+    graph_layer,
     generation_health,
     lease_current_generation,
     load_current_generation,
@@ -43,8 +46,7 @@ from .models import (
     ArtifactDatabaseStatus,
     ArtifactVectorStatus,
     GenerationStatus,
-    GraphifyRuntimeStatus,
-    GraphifyStatus,
+    GraphStatus,
     IndexStatus,
     LoggingStatus,
     MemoryQualityStatus,
@@ -59,12 +61,6 @@ from .models import (
     StatusResponse,
     SyncIndexResult,
     SyncResponse,
-)
-from .platform_paths import (
-    venv_bin_dir,
-    venv_executable,
-    venv_python,
-    venv_site_packages,
 )
 from .retrieval import (
     RAW_ARTIFACT_WARNING,
@@ -129,8 +125,7 @@ class MemoryService:
         graph_path: Path,
         graph_health: dict[str, Any],
     ) -> bool:
-        layers = generation.get("layers")
-        expected = layers.get("graphify") if isinstance(layers, dict) else None
+        expected = graph_layer(generation.get("layers"))
         if not isinstance(expected, dict):
             return False
         digest = hashlib.sha256()
@@ -193,7 +188,7 @@ class MemoryService:
             return self._engine
         if graph_path is not None:
             try:
-                graph_health = GraphifyAdapter(
+                graph_health = MemoryGraph(
                     graph_path,
                     primary_source_id=self.settings.primary_source_id,
                     source_ids=tuple(
@@ -937,7 +932,7 @@ class MemoryService:
                         response,
                         {
                             "route": "exact",
-                            "graphify": self.engine.graph.health(),
+                            "graph": self.engine.graph.health(),
                             "generation_id": pinned.generation_id,
                         },
                     )
@@ -962,7 +957,7 @@ class MemoryService:
                         {
                             "route": "relationship",
                             "mentioned_documents": len(mentioned),
-                            "graphify": self.engine.graph.health(),
+                            "graph": self.engine.graph.health(),
                             "generation_id": pinned.generation_id,
                         },
                     )
@@ -1328,9 +1323,15 @@ class MemoryService:
         layer_health = health_state.get("layers", {})
         retention_health = last_success.get("retention", {})
 
-        def layer_failure_at(name: str) -> str | None:
-            failure = layer_health.get(name, {}).get("last_failure", {})
-            return str(failure.get("at")) if failure.get("at") else None
+        def layer_failure_at(*names: str) -> str | None:
+            # A layer can keep its pre-rename health entry until next success.
+            failures = [
+                str(failure["at"])
+                for name in names
+                if (failure := layer_health.get(name, {}).get("last_failure", {}))
+                and failure.get("at")
+            ]
+            return max(failures) if failures else None
 
         unresolved_failure = bool(
             last_failure_at
@@ -1399,7 +1400,7 @@ class MemoryService:
         if graph_path is None:
             graph_path = self.settings.state_dir / ".missing-generation-graph"
         try:
-            graph_health = GraphifyAdapter(
+            graph_health = MemoryGraph(
                 graph_path,
                 primary_source_id=self.settings.primary_source_id,
                 source_ids=tuple(
@@ -1407,7 +1408,10 @@ class MemoryService:
                     for source in self.settings.retrieval_sources
                 ),
             ).health()
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            graph_error: str | None = None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            # A corrupt snapshot is a graph failure, not a status failure.
+            graph_error = f"{type(exc).__name__}: {exc}"
             graph_health = {
                 "available": False,
                 "path": str(graph_path),
@@ -1587,7 +1591,7 @@ class MemoryService:
             index=index_status,
             artifact_database=artifact_status,
             artifact_vector=artifact_vector_status,
-            graphify=GraphifyStatus(
+            graph=GraphStatus(
                 available=bool(graph_health["available"]),
                 stale=graph_stale,
                 path=str(graph_health["path"]),
@@ -1599,9 +1603,9 @@ class MemoryService:
                 index_snapshot=graph_index_snapshot,
                 generation_id=generation_id,
                 last_success_at=last_success_at,
-                last_failure_at=layer_failure_at("graphify"),
+                last_failure_at=layer_failure_at(GRAPH_LAYER, LEGACY_GRAPH_LAYER),
+                error=graph_error,
                 provider_role="internal-graph-signal",
-                runtime=self._graphify_runtime(),
             ),
             generation=GenerationStatus(
                 available=generation is not None,
@@ -1956,57 +1960,4 @@ class MemoryService:
             []
             if self.engine.graph.health()["available"]
             else ["Graph relationships are not available."]
-        )
-
-    def _graphify_runtime(self) -> GraphifyRuntimeStatus:
-        project_root = Path(__file__).resolve().parents[2]
-        runtime_root = project_root / ".graphify-runtime"
-        scripts = venv_bin_dir(runtime_root)
-        python = venv_python(runtime_root)
-        executable = venv_executable(runtime_root, "graphify")
-        mcp_executable = venv_executable(runtime_root, "graphify-mcp")
-        expected = "0.9.26"
-        package_version: str | None = None
-        cli_version: str | None = None
-        errors: list[str] = []
-        if python.exists():
-            site_packages = venv_site_packages(runtime_root)
-            package_version = next(
-                (
-                    distribution.version
-                    for distribution in importlib.metadata.distributions(
-                        path=[str(path) for path in site_packages]
-                    )
-                    if distribution.metadata.get("Name", "").casefold()
-                    == "graphifyy"
-                ),
-                None,
-            )
-            if package_version is None:
-                errors.append("pinned Python cannot resolve graphifyy metadata")
-        else:
-            errors.append("pinned Python is missing")
-        if executable.exists():
-            # The console shim and distribution share this isolated venv, so
-            # metadata gives the CLI version without spawning another process.
-            cli_version = package_version
-        else:
-            errors.append("pinned Graphify CLI is missing")
-        if not mcp_executable.exists():
-            errors.append("pinned Graphify MCP executable is missing")
-        consistent = (
-            package_version == expected
-            and cli_version == expected
-            and mcp_executable.exists()
-            and not errors
-        )
-        return GraphifyRuntimeStatus(
-            consistent=consistent,
-            expected=expected,
-            package=package_version,
-            cli=cli_version,
-            python=str(python),
-            mcp_executable=str(mcp_executable),
-            scripts_dir=str(scripts),
-            errors=errors,
         )
