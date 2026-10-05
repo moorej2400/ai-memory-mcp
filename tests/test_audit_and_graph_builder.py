@@ -116,7 +116,7 @@ def test_memory_graph_covers_the_current_index(
     benchmark_settings: Settings,
     tmp_path: Path,
 ) -> None:
-    output_dir = tmp_path / "graphify-out"
+    output_dir = tmp_path / "graph-out"
     summary = build_memory_graph(benchmark_settings, output_dir)
     graph = json.loads(
         (output_dir / "graph.json").read_text(encoding="utf-8")

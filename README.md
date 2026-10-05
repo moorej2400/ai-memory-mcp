@@ -42,7 +42,7 @@ flowchart TB
         direction LR
         MdIndex["Markdown index<br/>FTS5 and vectors"]
         ArtIndex["Artifact index<br/>raw FTS and source representations"]
-        Graph["Graphify graph<br/>nodes and paths"]
+        Graph["Note graph<br/>links, neighbors, and paths"]
     end
 
     subgraph Canonical["Canonical stores"]
@@ -81,7 +81,7 @@ AI Memory owns validation, storage, search, and citations.
 | Artifact search | Supplies raw candidates from a full-text index. |
 | Artifact semantic index | Supplies complete source segments and bounded reply context. |
 | Local semantic index | Supplies paraphrase candidates with Model2Vec embeddings or a hashed fallback. |
-| Graphify adapter | Supplies relationships, neighbors, and paths behind a replaceable boundary. |
+| Note graph | Builds note relationships from declared links and supplies neighbors and paths. |
 | Retrieval engine | Applies scope, RRF fusion, reranking, and context expansion. |
 | MCP facade | Supplies the stable public tools and evidence packets. |
 | Canonical skill | Gives agents the memory workflow and safety rules. |
@@ -133,13 +133,13 @@ flowchart TB
     Sync --> Stage["Build staged indexes"]
     Stage --> Md["Stage Markdown vectors"]
     Stage --> Art["Stage artifact vectors"]
-    Stage --> Graph["Stage Graphify"]
+    Stage --> Graph["Stage note graph"]
     Md --> Validate{"Validate all layers"}
     Art --> Validate
     Graph --> Validate
     Validate -->|pass| Publish["Publish one generation pointer"]
     Validate -->|fail| Keep["Keep the previous generation"]
-    Publish --> Health["Run health and retrieval checks"]
+    Publish --> Health["Record generation health"]
 ```
 
 Each recall pins one published generation and one artifact database read snapshot.
@@ -157,6 +157,7 @@ A failed refresh never changes either canonical store.
 |---|---|
 | `ai-memory-mcp` | Runs the MCP server. |
 | `ai-memory-index` | Builds the derived Markdown index. |
+| `ai-memory-sync` | Publishes one generation with the Markdown index, the artifact index, and the note graph. |
 | `ai-memory-artifact` | Manages the canonical artifact database. |
 | `ai-memory-benchmark` | Runs the frozen retrieval benchmark. |
 | `ai-memory-real-world-benchmark` | Runs the mixed synthetic workload benchmark. |
@@ -177,7 +178,8 @@ The MCP facade never exposes an artifact write operation.
 
 ## Reliability and performance
 
-- The repository pins Graphify 0.9.26 in an isolated environment.
+- The note graph uses only declared links. It does not infer relationships.
+- A graph snapshot must pass structure and checksum checks before recall uses it.
 - Scope filters run before provider ranking.
 - RRF combines independent provider rankings.
 - Bounded reranking limits query work.
@@ -228,6 +230,10 @@ Python implementation, so either shell produces the same result.
 
 Restart each configured client after the setup procedure is complete.
 
+Setup does not install Graphify.
+AI Memory builds its note graph without external tools.
+To upgrade an installation that used Graphify, read the [operations guide](docs/operations.md).
+
 For more setup information, read the [installation guide](docs/installation.md).
 For agent setup, read the [AI agent setup guide](docs/agent-new-system-setup.md).
 
@@ -237,9 +243,10 @@ For agent setup, read the [AI agent setup guide](docs/agent-new-system-setup.md)
 |---|---|
 | `src/ai_memory_mcp/` | MCP server, retrieval engine, indexer, and adapters |
 | `src/ai_memory_mcp/artifacts/` | Artifact schema, intake, search, bursts, and backup |
-| `scripts/` | Setup, client installation, and Graphify operations |
+| `scripts/` | Setup, client installation, retrieval checks, and upgrade tools |
 | `skill/ai-memory/` | Canonical AI Memory skill |
 | `graphify-codebase/` | Independent codebase-indexing skill and wrapper |
+| `archive/` | Recoverable copies of files that the project no longer uses |
 | `tests/` | Automated behavior and portability tests |
 | `benchmarks/` | Frozen retrieval contract and fixtures |
 | `docs/` | Architecture, setup, operations, and validation guides |

@@ -72,6 +72,20 @@ See the [mixed real-world benchmark guide](../benchmarks/real-world/README.md).
 | `scripts/` | Setup and operations scripts |
 | `skill/ai-memory/` | Canonical agent skill |
 | `docs/` | User and developer documentation |
+| `archive/` | Recoverable files that the project no longer uses |
+
+## Note graph tests
+
+The note graph has three test files.
+
+| Test file | Coverage |
+|---|---|
+| `tests/test_graph_baseline.py` | Ranking, neighbors, paths, scope isolation, and graph-assisted recall on the benchmark vault |
+| `tests/test_graph_parsing.py` | Link parsing, frontmatter fences, snapshot validation, and corruption status |
+| `tests/test_wikilink_graph.py` | Edge creation, link resolution, and unresolved link counts |
+
+The baseline test values come from the release before the Graphify removal.
+Change a baseline value only when a change to graph ranking is intentional.
 
 ## Platform support
 
@@ -96,7 +110,7 @@ compatibility — most importantly that `Join-Path` is never given three
 arguments, which is valid only from PowerShell 6 and is a parse error on the
 5.1 that Windows ships by default.
 
-Process control and port checks live in `scripts/graphify/_processes.py` and use
+Process control and port checks live in `scripts/_processes.py` and use
 only the standard library plus the process listing tool each platform ships, so
 no third-party dependency is required.
 
@@ -107,7 +121,8 @@ branching at the call site.
 ## Change requirements
 
 Read `AGENTS.md` before you change the project.
-Keep Graphify behind the provider boundary.
+Keep the note graph as derived data inside each generation.
+Do not add an external graph runtime to AI Memory.
 Keep Markdown as the write authority.
 Preserve the last satisfactory derived state during refresh work.
 Add tests when a behavior changes.

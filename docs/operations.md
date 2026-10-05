@@ -12,9 +12,24 @@ and Linux.
 ## Update the coordinated generation
 
 Use `memory_sync` after canonical Markdown or raw artifact data changes.
-The tool stages Markdown vectors, artifact vectors, and Graphify together.
+The tool stages the Markdown index, the artifact index, and the note graph together.
+AI Memory builds the note graph from the Markdown index without an external service.
 The tool validates every component before it changes the generation pointer.
 The previous generation stays active when one component fails.
+
+Use the `ai-memory-sync` command when no MCP client is available:
+
+```powershell
+.\.venv\Scripts\ai-memory-sync.exe
+```
+
+```bash
+./.venv/bin/ai-memory-sync
+```
+
+The command publishes the same generation as `memory_sync`.
+The command prints the sync result as JSON.
+The command exits with status 1 when publication fails.
 
 Use `ai-memory-index` only for isolated Markdown index maintenance:
 
@@ -365,50 +380,55 @@ Restart each configured client after the command finishes.
 ## Manage derived generation retention
 
 Use `memory_sync` after canonical Markdown or artifact data changes.
-The tool publishes one generation for Markdown, artifact vectors, and Graphify.
+The tool publishes one generation for Markdown, artifact vectors, and the note graph.
 The system keeps the active generation and one verified previous generation.
 An active recall lease prevents removal of its pinned generation.
 Retention removes only old derived snapshots after pointer and integrity checks.
 Retention never removes raw artifacts, revisions, tombstones, or required attachment objects.
 
-## Refresh Graphify for maintenance
+## Recover from a damaged graph
 
-Use the maintenance script only for isolated Graphify maintenance.
-The script uses staging and validation.
-The script keeps the last satisfactory graph if validation fails.
-The script builds the provider graph from the current SQLite index.
-This procedure does not require an extraction API.
-Set `GRAPHIFY_MEMORY_RETRIEVAL_EVAL_CASES` before you run the script.
+AI Memory validates the graph snapshot each time it reads the snapshot.
+A snapshot is not valid when, for example, it has no node list or a duplicate node `id`.
+An edge to a missing node also makes the snapshot not valid.
+
+When the snapshot is not valid, `memory_status` reports `false` for `ok` and for `graph.available`.
+The `graph.error` field then contains the validation error.
+Recall continues with lexical and semantic results.
+The recall response contains the warning `The graph component is unavailable.`
+
+To publish a new valid graph, do these steps:
+
+1. Call `memory_status` and read `graph.error`.
+2. Call `memory_sync`, or run the `ai-memory-sync` command.
+3. Call `memory_status` again.
+4. Make sure that `graph.available` is `true`.
+
+If publication fails, the previous generation stays active.
+Read the sync result and the generation log for the failed component.
+
+## Run the retrieval evaluation
+
+The retrieval evaluation sends real questions through the `memory_recall` pipeline.
+Each case contains one question and one expected evidence marker.
+
 Use real questions and expected evidence markers from the configured vault.
+Set `AI_MEMORY_RETRIEVAL_EVAL_CASES` before you run the script.
+The [configuration guide](configuration.md#retrieval-evaluation) gives the value format.
 
-Run this script for Graphify maintenance:
+Run the retrieval evaluation:
 
 ```powershell
-.\scripts\graphify\refresh-ai-memory-graph.ps1
+.\scripts\run-retrieval-eval.ps1
 ```
 
 ```bash
-./scripts/graphify/refresh-ai-memory-graph.sh
+./scripts/run-retrieval-eval.sh
 ```
 
-Use semantic extraction only for optional maintenance analysis:
-
-```powershell
-.\scripts\graphify\refresh-ai-memory-graph.ps1 -SemanticExtraction
-```
-
-```bash
-./scripts/graphify/refresh-ai-memory-graph.sh --semantic-extraction
-```
-
-Only one refresh can publish at a time.
-The script uses an advisory file lock for each run.
-The script reports an error if another refresh holds the lock.
-
-Every run writes a transcript to
-`<graphify-state>/logs/ai-memory-refresh/ai-memory-refresh-<run-id>.log`.
-The transcript records each step and its output.
-The transcript also records failures and rollback operations.
+The script prints a JSON summary.
+The summary contains the `passed`, `generationConsistent`, and `graphAvailable` fields.
+The script exits with status 1 when a case does not return its marker.
 
 ## Review local logs
 
@@ -429,76 +449,97 @@ Read these files under `AI_MEMORY_LOG_DIR`:
 The default directory is `AI_MEMORY_WORK_DIR\.ai-memory\logs`.
 The logger moves a full active log to a timestamped local archive.
 
-Graphify refresh events use a separate local directory.
-Read these files under `AI_MEMORY_GRAPHIFY_STATE_DIR\logs\ai-memory-refresh`.
-
 The standard audit logs do not contain raw artifact text or sensitive queries.
 The optional [private query log](query-logging.md) contains full query arguments and returned values.
 Do not copy these logs into the repository.
 
-## Control the Graphify MCP service
+## Upgrade an installation that used Graphify
 
-Start the local Graphify service:
+Earlier releases installed the external Graphify package.
+These releases published the note graph to a Graphify MCP service on port 4324.
+A login launcher started that service.
+AI Memory does not use Graphify, the service, or the launcher.
+The earlier scripts are in the [Graphify pipeline archive](../archive/graphify-memory-pipeline/README.md).
+AI Memory does not use the archived scripts.
 
-```powershell
-.\scripts\graphify\start-graphify-global-mcp.ps1
-```
+1. Get the current release of the repository:
 
-```bash
-./scripts/graphify/start-graphify-global-mcp.sh
-```
+   ```bash
+   git pull
+   ```
 
-The service is started detached, so it keeps running after the launcher exits.
-The launcher waits for the port to accept connections before it reports success.
+2. Run the setup command with the memory root that `AI_MEMORY_WORK_DIR` sets:
 
-The launcher first stops any previous Graphify MCP bound to the same port. If
-something else still holds that port it refuses to start, rather than reporting
-success against a listener it does not own. Stop the other program, or point
-`GRAPHIFY_GLOBAL_MCP_URL` at a free port.
+   ```powershell
+   .\scripts\setup.ps1 -MemoryRoot <memory-root>
+   ```
 
-Stop the local Graphify service:
+   ```bash
+   ./scripts/setup.sh --memory-root <memory-root>
+   ```
 
-```powershell
-.\scripts\graphify\stop-graphify-global-mcp.ps1
-```
+   The setup command keeps the existing `.env` file.
+   The setup command does not install Graphify.
+   The setup command runs `ai-memory-sync` and publishes a native generation.
 
-```bash
-./scripts/graphify/stop-graphify-global-mcp.sh
-```
+3. If you updated the package without the setup command, run `ai-memory-sync`.
+4. Restart each configured client.
+5. Call `memory_status` from an MCP client.
+6. Make sure that `generation.consistent` and `graph.available` are `true`.
+7. Run the retirement script without the apply option:
 
-The stop procedure signals the process tree, then escalates only if a process
-does not exit. It never targets this script or the shell that launched it.
+   ```powershell
+   .\scripts\retire-graphify-memory.ps1
+   ```
 
-## Install the login launcher
+   ```bash
+   ./scripts/retire-graphify-memory.sh
+   ```
 
-```powershell
-.\scripts\graphify\install-graphify-global-mcp-startup.ps1
-```
+   The script reports each earlier Graphify item.
+   The script makes no change in this mode.
 
-```bash
-./scripts/graphify/install-graphify-global-mcp-startup.sh
-```
+8. Examine the report.
+9. Run the retirement script with the apply option:
 
-The installer selects the startup mechanism of the host platform:
+   ```powershell
+   .\scripts\retire-graphify-memory.ps1 -Apply
+   ```
+
+   ```bash
+   ./scripts/retire-graphify-memory.sh --apply
+   ```
+
+10. If the script keeps the legacy state, run `ai-memory-sync` and do step 9 again.
+11. If the report lists `GRAPHIFY_*` keys in `.env`, remove the keys that no other tool uses.
+
+With the apply option, the script stops a `graphify-mcp` process that serves the legacy `global-graph.json` file.
+The script unregisters the earlier login launcher and moves the launcher file to the `launchers/` archive directory.
+The script moves the legacy Graphify state directory to the `provider-state/` archive directory.
+Both archive directories are under `AI_MEMORY_WORK_DIR/.ai-memory/backups/graphify-retirement/<stamp>/`.
+The script does not delete a file.
+
+The script looks for the earlier login launcher at these locations:
 
 | Platform | Mechanism | Location |
 | --- | --- | --- |
-| Windows | Startup folder script | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup` |
+| Windows | Startup folder script | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\graphify-global-mcp-start.vbs` |
 | macOS | launchd LaunchAgent | `~/Library/LaunchAgents/com.graphify-global-mcp.plist` |
-| Linux with a systemd user manager | systemd user unit | `~/.config/systemd/user/graphify-global-mcp.service` |
-| Linux otherwise | XDG autostart entry | `~/.config/autostart/graphify-global-mcp.desktop` |
+| Linux | systemd user unit | `~/.config/systemd/user/graphify-global-mcp.service` |
+| Linux | XDG autostart entry | `~/.config/autostart/graphify-global-mcp.desktop` |
 
-The Linux installer queries the systemd user manager rather than only checking
-that `systemctl` exists, because containers and some sessions ship the binary
-without a working user manager. It falls back to the XDG entry in that case.
+The script keeps the legacy state when no native generation exists.
+Recall reads the legacy graph until a native generation exists.
 
-The installer preserves the previous launcher in a timestamped backup under
-`AI_MEMORY_WORK_DIR/.ai-memory/provider-state/graphify/backups/startup`.
+The script does not change `.env`.
+The script does not change `.graphify-runtime`.
+The independent Graphify Codebase skill can use that runtime.
 
 ## Check health
 
 Call `memory_status` from an MCP client.
-Check the primary source, retrieval sources, index, graph, package, and MCP fields.
+Check the `canonical_memory_root`, `retrieval_sources`, `index`, `generation`, `graph`, and `runtime` fields.
+The `graph` field reports the native note graph of the active generation.
 
 A saved Markdown file can exist before its derived indexes change.
 Report the Markdown and index results as separate results.

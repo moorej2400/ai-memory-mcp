@@ -53,11 +53,12 @@ thin wrappers, so the same behaviour is available from any shell:
 | Provision | `scripts\setup.ps1` | `scripts/setup.sh` | `scripts/setup.py` |
 | Install clients | `scripts\install-clients.ps1` | `scripts/install-clients.sh` | `scripts/install_clients.py` |
 | Install Codex | `scripts\install-codex.ps1` | `scripts/install-codex.sh` | `scripts/install_codex.py` |
-| Extract corpus | `scripts\graphify\extract-ai-memory.ps1` | `scripts/graphify/extract-ai-memory.sh` | `scripts/graphify/extract_ai_memory.py` |
-| Refresh graph | `scripts\graphify\refresh-ai-memory-graph.ps1` | `scripts/graphify/refresh-ai-memory-graph.sh` | `scripts/graphify/refresh_graph.py` |
-| Start MCP | `scripts\graphify\start-graphify-global-mcp.ps1` | `scripts/graphify/start-graphify-global-mcp.sh` | `scripts/graphify/start_global_mcp.py` |
-| Stop MCP | `scripts\graphify\stop-graphify-global-mcp.ps1` | `scripts/graphify/stop-graphify-global-mcp.sh` | `scripts/graphify/stop_global_mcp.py` |
-| Install autostart | `scripts\graphify\install-graphify-global-mcp-startup.ps1` | `scripts/graphify/install-graphify-global-mcp-startup.sh` | `scripts/graphify/install_autostart.py` |
+| Check live retrieval | `scripts\run-retrieval-eval.ps1` | `scripts/run-retrieval-eval.sh` | `scripts/run_retrieval_eval.py` |
+| Retire Graphify services | `scripts\retire-graphify-memory.ps1` | `scripts/retire-graphify-memory.sh` | `scripts/retire_graphify_memory.py` |
+
+The `ai-memory-sync` command publishes a new generation.
+The generation contains the Markdown index, the artifact index, and the note graph.
+Setup installs the command in the `.venv` environment.
 
 The PowerShell wrappers keep their original parameter style, such as
 `-MemoryRoot`. The POSIX wrappers and the Python implementations use the
@@ -69,7 +70,8 @@ equivalent long options, such as `--memory-root`.
 2. Add a JSON object to `AI_MEMORY_RETRIEVAL_SOURCES`.
 3. Give each vault a stable source ID.
 4. Run `memory_sync`.
-5. Run the Graphify maintenance script when graph relationships must change.
+
+The synchronization also rebuilds the note graph for every vault.
 
 The setup keeps `AI_MEMORY_WORK_DIR` as the only writable vault.
 The additional vaults remain retrieval-only sources.
@@ -77,16 +79,24 @@ The additional vaults remain retrieval-only sources.
 ## Setup results
 
 The setup script creates `.venv` for the MCP server.
-The script creates `.graphify-runtime` for Graphify 0.9.26.
 The script installs the project in editable mode.
 The script creates `.env` if the file does not exist.
 The script creates internal data under `AI_MEMORY_WORK_DIR/.ai-memory/`.
 The script initializes the canonical artifact database.
-The script builds the first derived index.
+The script runs `ai-memory-sync` to publish the first generation.
+The first generation contains the note graph.
 The `--install-clients` option configures all supported clients.
-The option installs repository-linked AI Memory and Graphify skill stubs.
+The option installs repository-linked AI Memory and Graphify Codebase skill stubs.
 
-Both environments use the layout of the host platform. Windows uses
+Setup does not install Graphify.
+AI Memory does not use Graphify.
+
+The `--with-graphify-codebase` option creates `.graphify-runtime` with the version in `requirements-graphify.txt`.
+Only the independent Graphify Codebase skill uses this runtime.
+In PowerShell, use the `-WithGraphifyCodebase` switch.
+Setup accepts the earlier `--skip-graphify-runtime` option, but the option has no effect.
+
+Each environment uses the layout of the host platform. Windows uses
 `Scripts\python.exe`, and macOS and Linux use `bin/python`. The client
 configurations record whichever interpreter the platform created.
 
@@ -139,7 +149,7 @@ installations.
 ./scripts/setup.sh --memory-root ~/AI-Memory
 ```
 
-The setup procedure creates the environments and indexes without changing a client configuration.
+The setup procedure creates the environment and the first generation without changing a client configuration.
 
 ## Related information
 

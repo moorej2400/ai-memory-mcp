@@ -21,7 +21,7 @@ Existing caller-supplied scope arguments, source permissions, and redaction chec
 - Search indexes, context representations, summaries, and graph data remain derived data.
 - Source identity, permissions, redactions, and provenance apply to every retrieval path.
 - Local retrieval remains the default. No external model or link-fetching service becomes a requirement.
-- Graphify remains an internal retrieval provider, not the source of truth.
+- The note graph remains an internal retrieval signal, not the source of truth.
 - A model change requires a compatible derived index and measured improvement.
 
 ## Implemented reliability changes
