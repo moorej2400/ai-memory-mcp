@@ -1,223 +1,195 @@
 # AI Memory MCP
 
-AI Memory MCP gives agents one stable interface for durable memory.
-The server combines exact, lexical, semantic, and graph results into cited evidence.
+**Long-term memory for AI agents. Searchable, cited, and stored as plain Markdown.**
 
-## Two canonical stores
+AI Memory MCP is a local server that gives AI agents a durable memory.
+Agents save what they learn as Markdown notes.
+Later, four search methods work together to find the right note again.
+Every answer cites its source.
 
-The system keeps two classes of data, and each class has one authority.
+[Why](#why-ai-memory-mcp) · [How it works](#how-it-works) · [Organization](#a-vault-that-organizes-itself) · [Quick start](#quick-start) · [Go deeper](#go-deeper)
 
-| Data class | Authority | Contents |
+## Why AI Memory MCP
+
+- **Answers with proof.** Each result carries a source path or an `artifact://` citation. The skill tells agents to read the source before they state a fact.
+- **Search that finds the note.** Exact, keyword, meaning, and graph search run together. One ranking picks the best result.
+- **Local and private.** The embedding model runs on your machine. Search needs no external API. Your notes are plain Markdown files that you own.
+- **Safe by design.** Markdown and one SQLite database hold the truth. Search indexes rebuild from them. A failed refresh keeps the last good index. Agents retire old facts with `superseded` status instead of deletion.
+- **One memory for every agent.** Setup configures Codex, Claude Code, Claude Desktop, GitHub Copilot CLI, OpenCode, and Visual Studio Code. The server runs on Windows, macOS, and Linux.
+- **Chats and meetings included.** The artifact database keeps raw conversations and transcripts. Agents distill them into notes that cite the raw source. Incremental indexing keeps large histories fast.
+
+## How it works
+
+Each search method is strong where the others are weak.
+AI Memory MCP runs them together and merges the results.
+
+### Five memory systems, one ranked answer
+
+```mermaid
+flowchart LR
+    Q(["Agent question"])
+
+    subgraph Notes["Markdown notes"]
+        direction TB
+        E["Exact<br/>IDs, paths, error text"]
+        K["Keyword<br/>SQLite FTS5"]
+        S["Meaning<br/>vector embeddings"]
+        G["Graph<br/>links between notes"]
+    end
+
+    H["Raw history<br/>chats and meetings"]
+    F["Fuse and rank"]
+    A(["Cited answer"])
+
+    Q --> E & K & S & G & H
+    E & K & S & G & H --> F
+    F --> A
+```
+
+| Method | Finds | Built with |
 |---|---|---|
-| Distilled memory | Markdown vaults | Summaries, decisions, resolutions, and durable facts |
-| Raw artifacts | Artifact database | Chats, meetings, transcripts, revisions, and tombstones |
+| Exact | Identifiers, paths, filenames, and error text | SQLite FTS5 with exact-match priority |
+| Keyword | Notes that share the words of the query | SQLite FTS5 |
+| Meaning | Paraphrases and related ideas | Local Model2Vec vector embeddings, with a hashed fallback |
+| Graph | Notes that connect to the best matches | Wikilinks, `related` fields, and shared scopes |
+| Raw history | Messages, meetings, and transcripts | A full-text index and source-segment vectors |
 
-The primary Markdown vault is the only Markdown write authority.
-Additional Markdown vaults are retrieval-only sources.
-A provider adapter supplies raw artifacts through validated batches.
+The first four methods search your notes.
+The fifth method searches the raw conversations and meetings.
 
-Each authority stays inside its own class.
-A Markdown file never becomes authoritative for a transcript.
-The artifact database never becomes authoritative for an agent summary.
+### How results are ranked
 
-All retrieval indexes are derived data.
-The system rebuilds each index from its own canonical store.
+Reciprocal rank fusion (RRF) merges the ranked list from each method.
+Small, bounded adjustments then set the final order.
 
-AI Memory keeps internal data under `AI_MEMORY_WORK_DIR/.ai-memory/`.
-The hidden directory keeps raw data, backups, indexes, state, and logs separate from Markdown notes.
+| Step | Effect |
+|---|---|
+| Scope filters | Run first, so notes outside the requested scope never compete. |
+| Fusion | Each method keeps its own rank list, so no method loses weight through list order. |
+| Exact bonuses | An identifier, an exact phrase, or a title match raises a result. |
+| Agreement | A result that both keyword and meaning search found gets a bonus. |
+| Freshness | A recent `updated` date breaks near-ties. An overdue `review_after` date lowers a note. |
 
-Read the [architecture guide](docs/architecture.md) for the complete design rules.
-Read the [retrieval reliability validation](docs/retrieval-reliability-validation.md) for quality and capacity evidence.
+Raw history never receives an age penalty.
 
-## System architecture
+### Where the truth lives
 
 ```mermaid
-flowchart TB
-    Clients["MCP clients<br/>Claude, Codex, Copilot, VS Code, OpenCode"]
-    Facade["MCP facade<br/>five public tools"]
-    Service["MemoryService<br/>policy and orchestration"]
-    Engine["RetrievalEngine<br/>scope, fusion, and reranking"]
-
-    subgraph Derived["Derived indexes"]
-        direction LR
-        MdIndex["Markdown index<br/>FTS5 and vectors"]
-        ArtIndex["Artifact index<br/>raw FTS and source representations"]
-        Graph["Note graph<br/>links, neighbors, and paths"]
-    end
-
-    subgraph Canonical["Canonical stores"]
-        direction LR
-        Vaults["Markdown vaults"]
-        Store["Artifact database"]
-    end
-
-    Provider["Provider adapter<br/>outside this repository"]
-
-    Clients --> Facade
-    Facade --> Service
-    Service --> Engine
-    Engine --> MdIndex
-    Engine --> ArtIndex
-    Engine --> Graph
-    Vaults --> MdIndex
-    Vaults --> Graph
-    Store --> ArtIndex
-    Provider --> Store
-    Store -. agent distillation .-> Vaults
+flowchart LR
+    Vault["Markdown vault<br/>distilled notes"] -->|build| Index
+    Raw["Artifact database<br/>raw chats and meetings"] -->|build| Index
+    Index[("Search indexes<br/>derived and rebuildable")] --> Engine["Retrieval engine"]
+    Engine --> Tools["5 MCP tools"]
+    Tools --> Agents["AI agents"]
 ```
 
-The provider adapter owns authentication, paging, and remote cursors.
-AI Memory owns validation, storage, search, and citations.
+- **The Markdown vault** holds distilled notes. The primary vault is the only write target. Extra vaults are retrieval-only.
+- **The artifact database** holds raw conversations and transcripts. Only the `ai-memory-artifact` command writes to it.
+- **The search indexes** are derived data. `memory_sync` builds all of them as one generation, and each recall reads one generation.
 
-## Main components
+If any layer fails validation, recall keeps the previous generation.
+Read the [architecture guide](docs/architecture.md) for the complete design.
 
-| Component | Responsibility |
-|---|---|
-| Primary Markdown vault | Stores all new distilled records. |
-| Retrieval-only vaults | Supply extra records without receiving writes. |
-| Artifact database | Stores each raw message and transcript cue as one record. |
-| Object storage | Holds attachment bytes by content hash, outside SQLite. |
-| Memory indexer | Validates records and publishes versioned SQLite snapshots. |
-| Artifact search | Supplies raw candidates from a full-text index. |
-| Artifact semantic index | Supplies complete source segments and bounded reply context. |
-| Local semantic index | Supplies paraphrase candidates with Model2Vec embeddings or a hashed fallback. |
-| Note graph | Builds note relationships from declared links and supplies neighbors and paths. |
-| Retrieval engine | Applies scope, RRF fusion, reranking, and context expansion. |
-| MCP facade | Supplies the stable public tools and evidence packets. |
-| Canonical skill | Gives agents the memory workflow and safety rules. |
+## A vault that organizes itself
 
-## Query architecture
-
-`memory_recall` is the only recall tool.
-The service selects exact, search, neighbor, or relationship behavior.
-The retrieval engine combines all provider work internally.
+Agents file each memory, and the server checks that every note follows one structure.
+The agent decides where a note goes.
+The server rejects a write that breaks the rules.
 
 ```mermaid
-flowchart TB
-    Query["memory_recall<br/>query and scope"]
-    Scope["Apply scope filters"]
-    Md["Markdown retrieval<br/>lexical, semantic, graph"]
-    Art["Artifact retrieval<br/>raw text and source representations"]
-    Fuse["Fuse with RRF<br/>one rank sequence for each producer"]
-    Rank["Rerank and expand context"]
-    Result["Versioned result<br/>with citations and coverage"]
-
-    Query --> Scope
-    Scope --> Md
-    Scope --> Art
-    Md --> Fuse
-    Art --> Fuse
-    Fuse --> Rank
-    Rank --> Result
+flowchart LR
+    A["Search<br/>for an existing note"] --> B["Choose<br/>update, supersede, or create"]
+    B --> C["Write<br/>a validated note"]
+    C --> D["Link<br/>related notes"]
+    D --> E["Sync<br/>publish the indexes"]
 ```
 
-The engine applies scope before it ranks each provider result.
-Each producer owns its own rank sequence, so no producer loses weight through list order.
-Exact identifiers receive bounded bonuses during reranking.
+| Step | What happens |
+|---|---|
+| Search | The agent looks for a precise existing note before it writes. This prevents duplicates. |
+| Choose | The agent updates a note, supersedes an old fact, or creates a note. A conflict gets `needs-review`. |
+| Write | `memory_upsert` checks the schema, the path, and the unique `memory_id`. It then writes the file atomically. |
+| Link | `related` fields and body wikilinks become graph edges. Code blocks and comments make no edge. |
+| Sync | `memory_sync` publishes new indexes. The next recall can find the note. |
 
-Response version 2 separates execution state from result kind.
-It returns useful ranked raw candidates without an exact-phrase requirement.
-Raw historical evidence receives no automatic age penalty.
-Clients must read citations before they make factual claims.
+### What the vault looks like
 
-Use `memory_artifact_read` to read ordered source context around an `artifact://` citation.
-
-## Refresh architecture
-
-`memory_sync` publishes one coordinated derived generation after a canonical change.
-
-```mermaid
-flowchart TB
-    MdChange["Markdown change"] --> Sync["memory_sync"]
-    ArtChange["Artifact batch ingest"] --> Sync
-    Sync --> Stage["Build staged indexes"]
-    Stage --> Md["Stage Markdown vectors"]
-    Stage --> Art["Stage artifact vectors"]
-    Stage --> Graph["Stage note graph"]
-    Md --> Validate{"Validate all layers"}
-    Art --> Validate
-    Graph --> Validate
-    Validate -->|pass| Publish["Publish one generation pointer"]
-    Validate -->|fail| Keep["Keep the previous generation"]
-    Publish --> Health["Record generation health"]
+```text
+AI-Memory/
+├── Home.md                  starter dashboard
+├── Notes/                   one note for each independent topic
+├── Collections/
+│   └── Projects/
+│       ├── Projects.base    Obsidian table view
+│       └── Records/         typed notes
+├── Views/                   Action Dashboard, Review Queue, Memory Health
+└── Archive/                 inactive notes that stay recoverable
 ```
 
-Each recall pins one published generation and one artifact database read snapshot.
-The recall never combines components from different generations.
+A folder appears only when a note needs it.
+The folder path never defines the meaning of a note.
+The `record_type`, `domain`, and scope fields define the meaning.
 
-The system retains the active generation and one verified previous generation.
-Retention removes only derived snapshots.
-Retention never removes canonical artifacts or required object files.
+<details>
+<summary>See a note</summary>
 
-A failed refresh never changes either canonical store.
+```markdown
+---
+schema_version: 2
+memory_id: mem-deployment-process
+title: Deployment process
+type: memory
+record_type: note
+domain: work
+status: active
+created: 2026-10-14
+updated: 2026-10-14
+review_after: 2027-04-14
+aliases:
+  - release steps
+related:
+  - "[[Production configuration]]"
+provenance:
+  - source: manual
+    reference: task:example-1
+    verified: 2026-10-14
+---
+# Deployment process
 
-## Command-line tools
+The service deploys from the `main` branch through the release pipeline. A deploy needs one reviewer approval.
 
-| Command | Function |
-|---|---|
-| `ai-memory-mcp` | Runs the MCP server. |
-| `ai-memory-index` | Builds the derived Markdown index. |
-| `ai-memory-sync` | Publishes one generation with the Markdown index, the artifact index, and the note graph. |
-| `ai-memory-artifact` | Manages the canonical artifact database. |
-| `ai-memory-benchmark` | Runs the frozen retrieval benchmark. |
-| `ai-memory-real-world-benchmark` | Runs the mixed synthetic workload benchmark. |
+## Steps
 
-`ai-memory-artifact` is the only write path for raw artifacts.
-It supplies `ingest`, `search`, `read`, `pending`, `backup`, `check`, and `restore`.
-The MCP facade never exposes an artifact write operation.
+1. Merge the approved pull request.
+2. Wait for the pipeline to publish the build.
+3. Check the health endpoint at `/healthz`.
 
-## MCP tools
+See [[Production configuration]] for the settings that the pipeline applies.
+```
 
-| Tool | Function |
-|---|---|
-| `memory_recall` | Returns cited Markdown and artifact evidence. |
-| `memory_artifact_read` | Returns ordered raw context for one artifact reference. |
-| `memory_upsert` | Creates or updates one validated canonical record. |
-| `memory_sync` | Publishes one coordinated generation after a canonical change. |
-| `memory_status` | Reports strict health for every required layer. |
+</details>
 
-## Reliability and performance
+The vault stays clean for these reasons:
 
-- The note graph uses only declared links. It does not infer relationships.
-- A graph snapshot must pass structure and checksum checks before recall uses it.
-- Scope filters run before provider ranking.
-- RRF combines independent provider rankings.
-- Bounded reranking limits query work.
-- One query loads context for all returned records.
-- Recall results omit internal provider diagnostics.
-- Incremental indexing skips unchanged Markdown files.
-- Incremental artifact indexing uses the committed change journal and bounded context dependencies.
-- Large vector corpora use ANN candidates with exact reranking.
-- Versioned generations preserve the last satisfactory state.
-- Recall uses only components from one generation.
-- Health reports missing and stale layers.
-- Artifact intake validates a complete batch before it changes SQLite.
-- Artifact backups verify a restored copy against the same digest.
-- A redaction moves object bytes to quarantine, because the project never deletes a file.
-- Evidence packets include canonical source paths and artifact references.
-- Source IDs keep identical vault paths separate.
+- Each note holds one topic, and each note starts with a summary that can stand alone.
+- The title, the file name, and the H1 heading match.
+- Obsidian Bases views list open actions, notes that need review, and schema health.
+- An agent adds missing aliases, exact strings, and links to a note that was hard to find.
+- Raw meetings and chats become notes with `artifact://` citations. Manual text outside the managed region stays unchanged.
+- The `ai-memory-migrate` command moves a legacy vault to this layout. It makes snapshots and supports rollback.
 
 ## Quick start
 
-AI Memory MCP runs on Windows, macOS, and Linux.
+Install Git and Python 3.11 or later.
+On Windows, the `.ps1` scripts also need PowerShell 5.1 or later.
 
-Install these items:
+1. Clone the repository.
 
-- Git
-- Python 3.11 or later
-- A Markdown memory directory
-
-Windows additionally requires PowerShell 5.1 or later if you use the `.ps1`
-entry points.
-
-Open a terminal in the repository root.
-Then, run the command for your platform.
-
-Windows (PowerShell):
-
-```powershell
-.\scripts\setup.ps1 -MemoryRoot 'C:\path\to\AI-Memory' -InstallClients
+```bash
+git clone <repository-url> ai-memory-mcp && cd ai-memory-mcp
 ```
+
+2. Run the setup command for your platform.
 
 macOS and Linux:
 
@@ -225,100 +197,95 @@ macOS and Linux:
 ./scripts/setup.sh --memory-root ~/AI-Memory --install-clients
 ```
 
-Every maintenance script has a `.ps1` wrapper, a `.sh` wrapper, and one shared
-Python implementation, so either shell produces the same result.
+Windows (PowerShell):
 
-Restart each configured client after the setup procedure is complete.
-
-Setup does not install Graphify.
-AI Memory builds its note graph without external tools.
-To upgrade an installation that used Graphify, read the [operations guide](docs/operations.md).
-
-For more setup information, read the [installation guide](docs/installation.md).
-For agent setup, read the [AI agent setup guide](docs/agent-new-system-setup.md).
-
-## Repository layout
-
-| Path | Contents |
-|---|---|
-| `src/ai_memory_mcp/` | MCP server, retrieval engine, indexer, and adapters |
-| `src/ai_memory_mcp/artifacts/` | Artifact schema, intake, search, bursts, and backup |
-| `scripts/` | Setup, client installation, retrieval checks, and upgrade tools |
-| `skill/ai-memory/` | Canonical AI Memory skill |
-| `graphify-codebase/` | Independent codebase-indexing skill and wrapper |
-| `archive/` | Recoverable copies of files that the project no longer uses |
-| `tests/` | Automated behavior and portability tests |
-| `benchmarks/` | Frozen retrieval contract and fixtures |
-| `docs/` | Architecture, setup, operations, and validation guides |
-
-## Documentation
-
-The [documentation index](docs/README.md) gives links to all project guides.
-
-- [Installation](docs/installation.md)
-- [Configuration](docs/configuration.md)
-- [Operations](docs/operations.md)
-- [Architecture](docs/architecture.md)
-- [Artifact storage](docs/artifact-storage.md)
-- [Development](docs/development.md)
-- [Validation](docs/validation-report.md)
-- [Writing standard](docs/writing-standard.md)
-
-## Skill discovery stubs
-
-This repository contains two canonical skills:
-
-- `skill/ai-memory/SKILL.md`
-- `graphify-codebase/skill/graphify/SKILL.md`
-
-AI harnesses must contain discovery stubs instead of canonical skill copies.
-A stub carries only the metadata a host needs to discover and trigger the
-skill, then redirects to the canonical `SKILL.md`. This keeps one source of
-truth and survives repository moves.
-
-Use this stub pattern:
-
-```markdown
-[Add any host-specific skill metadata here if the target platform expects a
-header before YAML frontmatter]
-
----
-name: <canonical-name>
-description: <copy the exact canonical description>
----
-
-Before following any instruction in this stub, first check the canonical skill
-header in '<canonical-path>'. If the source skill metadata has changed and this
-stub is out of date, update this stub to match the current source skill
-metadata before proceeding.
-
-Then read the SKILL.md in full from '<canonical-path>'
+```powershell
+.\scripts\setup.ps1 -MemoryRoot 'C:\path\to\AI-Memory' -InstallClients
 ```
 
-Rules:
+3. Restart each configured client.
+4. Ask the agent to call `memory_status`.
+5. Check that every layer is healthy.
 
-- Keep the stub folder name exactly the same as the canonical skill folder.
-- Copy the canonical `description` exactly, so host triggering is unchanged.
-- Copy any other metadata the target platform requires for discovery, in the
-  header format and location that platform expects.
-- The stub must tell the agent to compare its own header against the canonical
-  header and update itself whenever the canonical metadata changes. A stale
-  description stops a host from triggering the skill at all.
-- Never copy the canonical skill body into a stub.
+Setup creates the `.venv` environment and installs the project with its local embedding model.
+It writes the `.env` file, creates the internal data under `AI_MEMORY_WORK_DIR/.ai-memory/`, and publishes the first index generation.
+The `--install-clients` option registers the server and the skill with each supported client.
 
-Run `.\scripts\install-clients.ps1` (or `./scripts/install-clients.sh`) after a
-clone or repository move.
-The installer writes the correct canonical path into each stub.
+To add the starter dashboard, run this optional command.
 
-Read the [Graphify Codebase guide](graphify-codebase/README.md) for its independent boundary.
+macOS and Linux:
 
-## Source boundary
+```bash
+./.venv/bin/ai-memory-vault --root ~/AI-Memory
+```
+
+Windows (PowerShell):
+
+```powershell
+.\.venv\Scripts\ai-memory-vault.exe --root 'C:\path\to\AI-Memory'
+```
+
+After setup, agents search and save memory on their own.
+You can also ask directly:
+
+- "Remember that the staging database uses port 5433."
+- "What did we decide about the retry policy?"
+
+For more detail, read the [installation guide](docs/installation.md) and the [AI agent setup guide](docs/agent-new-system-setup.md).
+
+## Go deeper
+
+### MCP tools
+
+| Tool | Function |
+|---|---|
+| `memory_recall` | Returns cited Markdown and artifact evidence. |
+| `memory_artifact_read` | Returns ordered raw context for one `artifact://` citation. |
+| `memory_upsert` | Creates or updates one validated canonical record. |
+| `memory_sync` | Publishes one coordinated generation after a canonical change. |
+| `memory_status` | Reports strict health for every required layer. |
+
+### Command-line tools
+
+| Command | Function |
+|---|---|
+| `ai-memory-mcp` | Runs the MCP server. |
+| `ai-memory-sync` | Publishes one generation: Markdown index, artifact index, and note graph. |
+| `ai-memory-artifact` | Manages the canonical artifact database. It supplies `ingest`, `search`, `read`, `pending`, `backup`, `check`, and `restore`. |
+| `ai-memory-vault` | Creates the starter vault layout. |
+| `ai-memory-collection` | Creates a typed collection with an Obsidian Base. |
+| `ai-memory-migrate` | Moves a legacy vault to the current layout with snapshots and rollback. |
+| `ai-memory-benchmark` | Runs the frozen retrieval benchmark. |
+
+### Quality gates
+
+The frozen benchmark contract requires these results:
+
+- A pass rate of `1.0`, with recall at 5 of `1.0`.
+- A no-answer accuracy of `1.0`.
+- No scope leakage and no citation failures.
+- An approximate-search candidate recall at 10 of at least `0.95`.
+
+The benchmarks use synthetic data only.
+Read the [retrieval reliability validation](docs/retrieval-reliability-validation.md) for the measured results and the capacity evidence.
+
+### Documentation
+
+The [documentation index](docs/README.md) links to every guide.
+
+- [Installation](docs/installation.md) and [Configuration](docs/configuration.md)
+- [Operations](docs/operations.md), including the upgrade from the earlier Graphify-based release
+- [Architecture](docs/architecture.md) and [Artifact storage](docs/artifact-storage.md)
+- [Markdown intake contract](docs/intake-contract.md)
+- [Development](docs/development.md) and [Validation](docs/validation-report.md)
+- [Skill discovery stubs](docs/skill-discovery-stubs.md)
+
+The independent [Graphify Codebase](graphify-codebase/README.md) skill indexes software repositories.
+It never supplies data to AI Memory retrieval.
+
+### Contributing
 
 This is a public repository.
-This repository contains all project source files.
 It contains only neutral examples and synthetic benchmark fixtures.
-The user memory directory stays outside Git.
-Generated indexes, logs, and recovery files also stay outside Git.
-Machine-specific and organization-specific values stay in the ignored `.env` file.
-
-Read [AGENTS.md](AGENTS.md) before you change this repository.
+The user memory directory, generated indexes, logs, and the `.env` file stay outside Git.
+Read [AGENTS.md](AGENTS.md) and the [writing standard](docs/writing-standard.md) before you change this repository.
