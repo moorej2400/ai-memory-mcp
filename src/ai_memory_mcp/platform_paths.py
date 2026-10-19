@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 WINDOWS = os.name == "nt"
@@ -52,6 +53,41 @@ def venv_site_packages(venv_root: Path) -> list[Path]:
     if WINDOWS:
         return [venv_root / "Lib" / "site-packages"]
     return sorted((venv_root / "lib").glob("python*/site-packages"))
+
+
+def subprocess_python(
+    environment: Mapping[str, str] | None = None,
+) -> tuple[str, dict[str, str] | None]:
+    """Return a Python command whose PID belongs to the supervised interpreter.
+
+    Some Windows venv launchers create a second interpreter process. The
+    launcher PID cannot identify worker leases or reliably stop that child.
+    """
+    inherited = dict(os.environ if environment is None else environment)
+    if not WINDOWS or sys.prefix == sys.base_prefix:
+        return sys.executable, inherited if environment is not None else None
+
+    base_executable = getattr(sys, "_base_executable", None)
+    site_packages = venv_site_packages(Path(sys.prefix))
+    if (
+        not base_executable
+        or not Path(base_executable).is_file()
+        or not site_packages
+    ):
+        return sys.executable, inherited if environment is not None else None
+
+    # The base interpreter does not read the venv configuration, so expose the
+    # editable source and venv dependencies explicitly before ambient paths.
+    paths = [
+        str(Path(__file__).resolve().parents[1]),
+        *(str(path) for path in site_packages),
+        inherited.get("PYTHONPATH", ""),
+    ]
+    inherited["PYTHONPATH"] = os.pathsep.join(path for path in paths if path)
+    inherited["PYTHONNOUSERSITE"] = "1"
+    inherited["VIRTUAL_ENV"] = str(Path(sys.prefix))
+    inherited.pop("PYTHONHOME", None)
+    return str(base_executable), inherited
 
 
 def user_app_data_dir() -> Path:

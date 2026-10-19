@@ -58,6 +58,7 @@ def test_public_tool_surface_is_small_and_stable(
         "memory_artifact_read",
         "memory_upsert",
         "memory_sync",
+        "memory_sync_status",
         "memory_status",
     }
     assert tools["memory_recall"].annotations.readOnlyHint is True
@@ -366,16 +367,30 @@ def test_timeout_archives_the_dead_worker_generation_lease(tmp_path: Path) -> No
 
 def test_sync_updates_only_the_derived_index(
     benchmark_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    server = create_server(benchmark_settings)
+    settings = replace(benchmark_settings, state_dir=tmp_path / "sync-state")
+    from ai_memory_mcp import sync_worker
+
+    class Child:
+        pid = os.getpid()
+
+    monkeypatch.setattr(sync_worker.subprocess, "Popen", lambda *args, **kwargs: Child())
+    server = create_server(settings)
 
     async def call() -> object:
         return await server._tool_manager.call_tool("memory_sync", {})
 
     result = asyncio.run(call())
-    assert result.ok is True
-    assert result.index.documents == 13
-    assert result.index.removed == 0
+    assert result.state == "queued"
+    assert result.result is None
+    assert result.pending_refresh is False
+    async def status_call() -> object:
+        return await server._tool_manager.call_tool("memory_status", {})
+    status = asyncio.run(status_call())
+    assert status.sync_job.job_id == result.job_id
+    assert status.sync_job.state == "queued"
 
 
 def test_read_tools_do_not_build_a_missing_index(

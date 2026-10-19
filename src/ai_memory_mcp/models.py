@@ -271,6 +271,20 @@ class SyncResponse(StrictOutput):
     errors: list[str] = Field(default_factory=list)
 
 
+class SyncJobResponse(StrictOutput):
+    job_id: str
+    state: Literal["queued", "running", "completed", "failed"]
+    stage: str
+    queued_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    deadline_at: str
+    coalesced: bool = False
+    pending_refresh: bool = False
+    result: SyncResponse | None = None
+    error: str | None = None
+
+
 class MemoryUpsertResponse(StrictOutput):
     path: str
     memory_id: str
@@ -440,3 +454,4 @@ class StatusResponse(StrictOutput):
         default_factory=lambda: MemoryQualityStatus(available=False)
     )
     checked_at: str
+    sync_job: SyncJobResponse | None = None

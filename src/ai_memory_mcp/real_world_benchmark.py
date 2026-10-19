@@ -30,7 +30,7 @@ from .artifacts.store import ArtifactStore
 from .artifacts.vector_index import search_artifact_vectors
 from .config import Settings
 from .service import MemoryService
-from .models import RecallResponse, RecallResponseV2
+from .models import RecallResponse, RecallResponseV2, SyncJobResponse
 
 SOURCE = "synthetic-chat"
 SOURCE_INSTANCE = "real-world"
@@ -612,7 +612,19 @@ def _mcp_latencies(settings: Settings, cases: list[dict[str, Any]], repeats: int
                         or not _expected_ids(intake_case) & {e.memory_id for e in packet.evidence}):
                     raise RuntimeError("MCP did not expose fresh raw evidence during semantic lag.")
                 synced = await session.call_tool("memory_sync", {})
-                if synced.isError or not synced.structuredContent or not synced.structuredContent.get("ok"):
+                if synced.isError or not synced.structuredContent:
+                    raise RuntimeError("MCP failed to schedule the active-intake refresh.")
+                job = SyncJobResponse.model_validate(synced.structuredContent if "job_id" in synced.structuredContent else synced.structuredContent["result"])
+                # A queued refresh is not publication; read the worker result
+                # before checking whether semantic lag has closed.
+                deadline = time.monotonic() + 60
+                while job.state in ("queued", "running") and time.monotonic() < deadline:
+                    await asyncio.sleep(0.1)
+                    status = await session.call_tool("memory_sync_status", {"job_id": job.job_id})
+                    if status.isError or not status.structuredContent:
+                        raise RuntimeError("MCP failed to read the active-intake refresh.")
+                    job = SyncJobResponse.model_validate(status.structuredContent if "job_id" in status.structuredContent else status.structuredContent["result"])
+                if job.state != "completed" or job.result is None or not job.result.ok:
                     raise RuntimeError("MCP failed the active-intake refresh.")
                 refreshed = await session.call_tool("memory_recall", arguments)
                 _validate_mcp_packet(refreshed.structuredContent, intake_case)

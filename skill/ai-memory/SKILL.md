@@ -28,6 +28,7 @@ When a user asks to save, remember, update, or retrieve AI memory, use the dedic
 - Do not substitute a Codex internal note, session artifact, or `.codex/memories` extension for a user-requested AI Memory MCP write.
 - Write schema-version-2 Markdown with `memory_upsert` when the tool is available.
 - Call `memory_sync` after the write batch.
+- `memory_sync` queues work and returns a job ID. A queued or running job is not proof of indexing. Check `memory_sync_status` or `memory_status` for completion without holding the chat open; do not wait indefinitely for an automatic memory capture.
 - Report a sync failure separately from a successful canonical write.
 - If the MCP is unavailable, report that limitation instead of silently saving the requested memory somewhere else.
 
@@ -76,7 +77,7 @@ Run this workflow at meaningful checkpoints and before the final response of sub
 7. **Find useful relationships.** Add only links that give context, evidence, or navigation.
 8. **Write a small verified batch.** Preserve identity, provenance, useful links, and predecessor state.
 9. **Update views.** Touch only an applicable collection or operational view.
-10. **Refresh once.** After the material batch, publish one coordinated generation and verify each layer.
+10. **Refresh once.** After the material batch, queue one coordinated generation. Verify each layer when the job completes; otherwise report the job as pending.
 11. **Report separate outcomes.** State what was written, merged or superseded, and whether indexing succeeded.
 
 An explicit user request to save memory enters at step 1; it does not bypass search, scope, safety, deduplication, or verification.
@@ -266,7 +267,7 @@ After one or more material memory writes:
 1. Call `memory_sync` after a Markdown batch or raw artifact change.
 2. Confirm that synchronization reads all configured sources without writing to them.
 3. Confirm that Markdown vectors, artifact vectors, and the note graph use one generation ID.
-4. Call `memory_status` and verify every required layer, including `graph`.
+4. When the job completes, call `memory_status` and verify every required layer, including `graph`. Do not treat a queued or running job as indexed, and do not block the main task waiting for it.
 5. Confirm that each configured memory source is registered.
 6. If refresh fails, report `saved, not indexed` and keep all canonical data unchanged.
 

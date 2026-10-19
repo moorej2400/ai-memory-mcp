@@ -61,6 +61,46 @@ def test_posix_site_packages_is_discovered_not_assumed(
     assert platform_paths.venv_site_packages(venv) == [expected]
 
 
+def test_windows_subprocess_uses_the_real_venv_interpreter(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _reload_for(monkeypatch, "nt", "win32")
+    venv = tmp_path / ".venv"
+    site_packages = venv / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    base_executable = tmp_path / "base" / "python.exe"
+    base_executable.parent.mkdir()
+    base_executable.write_text("", encoding="utf-8")
+    monkeypatch.setattr(platform_paths.sys, "prefix", str(venv))
+    monkeypatch.setattr(platform_paths.sys, "base_prefix", str(base_executable.parent))
+    monkeypatch.setattr(
+        platform_paths.sys,
+        "executable",
+        str(venv / "Scripts" / "python.exe"),
+    )
+    monkeypatch.setattr(
+        platform_paths.sys,
+        "_base_executable",
+        str(base_executable),
+        raising=False,
+    )
+
+    command, environment = platform_paths.subprocess_python(
+        {"PYTHONHOME": "ignore", "PYTHONPATH": "existing"}
+    )
+
+    assert command == str(base_executable)
+    assert environment is not None
+    assert environment["PYTHONPATH"].split(platform_paths.os.pathsep) == [
+        str(Path(platform_paths.__file__).resolve().parents[1]),
+        str(site_packages),
+        "existing",
+    ]
+    assert environment["PYTHONNOUSERSITE"] == "1"
+    assert environment["VIRTUAL_ENV"] == str(venv)
+    assert "PYTHONHOME" not in environment
+
+
 @pytest.mark.parametrize(
     ("os_name", "sys_platform", "environment", "expected"),
     [
@@ -159,6 +199,7 @@ def test_module_exposes_only_helpers_that_are_used(tmp_path: Path) -> None:
         "venv_python",
         "venv_executable",
         "venv_site_packages",
+        "subprocess_python",
         "user_app_data_dir",
         "path_key",
     }

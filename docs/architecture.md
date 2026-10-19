@@ -115,6 +115,9 @@ Narrow scopes can combine independently corroborated evidence from multiple note
 
 A local embedding provider supplies paraphrase results.
 The default provider is Model2Vec with the `minishlab/potion-base-8M` model.
+Provision the model in the local Hugging Face cache before use.
+Normal indexing and recall load the cached model without network access.
+If the model is not in the cache, the provider reports an error without a download.
 The hashed feature provider is the automatic fallback.
 The semantic index stays local and does not need an external API.
 
@@ -271,7 +274,11 @@ The manifest and health files name the layers `markdown`, `artifact_vector`, and
 Older generations name the graph layer `graphify`, and readers accept both names.
 
 The update keeps the previous generation after any component failure.
-The `memory_sync` MCP tool and the `ai-memory-sync` console command run this procedure.
+The `memory_sync` MCP tool schedules this procedure in a separate worker and returns a job state.
+The `memory_sync_status` tool reads a job by ID.
+The `memory_status` tool reports the latest job.
+A queued job is not a published generation.
+The `ai-memory-sync` console command runs the procedure synchronously for scripts.
 An ordinary Markdown change uses `memory_sync`.
 An artifact data change also uses `memory_sync`.
 Each recall keeps one generation lease until retrieval finishes.

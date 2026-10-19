@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import sqlite3
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -16,6 +17,7 @@ from ai_memory_mcp.ann import (
 from ai_memory_mcp.embedding import (
     EmbeddingUnavailable,
     HashedProvider,
+    _load_cached_model,
     resolve_provider,
 )
 from ai_memory_mcp.index import build_index
@@ -235,6 +237,80 @@ def test_auto_prefers_model2vec_when_loadable(monkeypatch) -> None:
     )
     assert resolve_provider("auto", dimensions=64).name == "model2vec"
     assert resolve_provider("model2vec").name == "model2vec"
+
+
+def test_model2vec_loads_local_snapshot_without_network(tmp_path, monkeypatch) -> None:
+    import huggingface_hub
+
+    _load_cached_model.cache_clear()
+    model_name = "test/local-model"
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    requests: list[tuple[str, bool]] = []
+    loaded_paths: list[Path] = []
+
+    def cached_snapshot(*, repo_id: str, local_files_only: bool) -> str:
+        requests.append((repo_id, local_files_only))
+        return str(snapshot)
+
+    class FakeModel:
+        def encode(self, _text: str) -> list[float]:
+            return [0.5, 0.5]
+
+    class FakeStaticModel:
+        @staticmethod
+        def from_pretrained(path: Path):
+            loaded_paths.append(path)
+            return FakeModel()
+
+    fake = ModuleType("model2vec")
+    fake.StaticModel = FakeStaticModel  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "model2vec", fake)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", cached_snapshot)
+    try:
+        assert resolve_provider("model2vec", model=model_name).dimensions == 2
+        assert resolve_provider("model2vec", model=model_name).dimensions == 2
+        assert requests == [(model_name, True)]
+        assert loaded_paths == [snapshot]
+    finally:
+        _load_cached_model.cache_clear()
+
+
+def test_missing_model_fails_without_download(monkeypatch) -> None:
+    import huggingface_hub
+
+    _load_cached_model.cache_clear()
+
+    def unavailable(*, repo_id: str, local_files_only: bool):
+        assert repo_id == "test/missing-model"
+        assert local_files_only is True
+        raise FileNotFoundError("cached model missing")
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", unavailable)
+    with pytest.raises(EmbeddingUnavailable, match="cached model missing"):
+        resolve_provider("model2vec", model="test/missing-model")
+
+
+def test_auto_sync_does_not_rebuild_model2vec_index_when_cache_disappears(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = _settings(tmp_path)
+    _write_note(settings.memory_root, "Tools/Proxy.md", "mem-proxy", "Proxy", "Keep the record.")
+    original = build_index(settings, force=True)
+    with sqlite3.connect(original["snapshot"]) as connection:
+        connection.execute("UPDATE metadata SET value = 'model2vec' WHERE key = 'embedding_provider'")
+        connection.commit()
+
+    def unavailable(name: str, **_kwargs):
+        if name == "model2vec":
+            raise EmbeddingUnavailable("cached model missing")
+        return HashedProvider()
+
+    monkeypatch.setattr("ai_memory_mcp.index.resolve_provider", unavailable)
+    from dataclasses import replace
+
+    with pytest.raises(EmbeddingUnavailable, match="cached model missing"):
+        build_index(replace(settings, embedding_provider="auto"))
 
 
 def test_engine_disables_semantic_when_provider_unavailable(

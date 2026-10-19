@@ -22,8 +22,9 @@ from .models import (
     RecallResponseV2,
     RecallToolResponse,
     StatusResponse,
-    SyncResponse,
+    SyncJobResponse,
 )
+from .sync_worker import enqueue_sync, sync_job_status
 from .recall_worker import (
     WorkerDeadlineExceeded,
     WorkerExecutionFailed,
@@ -420,9 +421,9 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         ),
         structured_output=True,
     )
-    def memory_sync() -> SyncResponse:
+    def memory_sync() -> SyncJobResponse:
         """Update the derived indexes after canonical Markdown or artifact data changes."""
-        return service.sync()
+        return enqueue_sync(settings)
 
     @mcp.tool(
         annotations=ToolAnnotations(
@@ -435,7 +436,24 @@ def create_server(settings: Settings | None = None) -> FastMCP:
     )
     def memory_status() -> StatusResponse:
         """Report source, index, graph, and runtime status."""
-        return service.status()
+        status = service.status()
+        status.sync_job = sync_job_status(settings)
+        return status
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+        structured_output=True,
+    )
+    def memory_sync_status(
+        job_id: Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")],
+    ) -> SyncJobResponse | None:
+        """Read a sync job result by its identifier."""
+        return sync_job_status(settings, job_id)
 
     return mcp
 

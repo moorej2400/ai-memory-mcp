@@ -411,11 +411,22 @@ def _build_index(
         settings.index_lock_timeout_seconds,
     ) as lock_wait_ms:
         current = current_index_path(settings)
+        provider_started = time.perf_counter()
+        configured_provider = settings.embedding_provider
+        if (
+            current
+            and configured_provider.casefold() == "auto"
+            and _index_metadata_value(current, "embedding_provider") == "model2vec"
+        ):
+            # A missing model cache must not turn one-note incremental sync
+            # into a full hashed-vector rebuild of an existing model2vec index.
+            configured_provider = "model2vec"
         provider = resolve_provider(
-            settings.embedding_provider,
+            configured_provider,
             model=settings.embedding_model,
             dimensions=settings.semantic_dimensions,
         )
+        provider_load_ms = round((time.perf_counter() - provider_started) * 1000, 3)
         provider_fingerprint = fingerprint(provider)
         target_ann_backend = ANN_BACKEND if ann_available() else "exact"
         if current and _index_metadata_value(
@@ -480,6 +491,7 @@ def _build_index(
                     "parse_errors": [],
                     "_source_stats": source_stats,
                     "_lock_wait_ms": lock_wait_ms,
+                    "_provider_load_ms": provider_load_ms,
                     "elapsed_ms": round(
                         (time.perf_counter() - started) * 1000,
                         2,
@@ -677,6 +689,7 @@ def _build_index(
         "parse_errors": parse_errors,
         "_source_stats": source_stats,
         "_lock_wait_ms": lock_wait_ms,
+        "_provider_load_ms": provider_load_ms,
         "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
     }
 
@@ -738,6 +751,7 @@ def build_index(
         raise
     source_stats = result.pop("_source_stats")
     lock_wait_ms = result.pop("_lock_wait_ms")
+    provider_load_ms = result.pop("_provider_load_ms")
     telemetry_result = {
         key: value
         for key, value in result.items()
@@ -752,6 +766,7 @@ def build_index(
             **telemetry_result,
             "source_stats": source_stats,
             "lock_wait_ms": lock_wait_ms,
+            "provider_load_ms": provider_load_ms,
         },
     )
     return result
