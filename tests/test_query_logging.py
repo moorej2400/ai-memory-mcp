@@ -80,6 +80,15 @@ def test_compact_shortlist_does_not_pad_every_candidate_to_the_longest_identity(
     assert len(quantized_shortlist(rows, query, 4, 1, block_size=2)) == 1
 
 
+def test_compact_shortlist_ignores_empty_vectors_but_rejects_invalid_lengths():
+    np = pytest.importorskip("numpy")
+    query = np.ones(4, dtype=np.int8).tobytes()
+    rows = [("empty-first", b""), ("valid", query), ("empty-last", b"")]
+    assert quantized_shortlist(rows, query, 4, 2, block_size=2) == [(-4.0, "valid")]
+    with pytest.raises(ValueError, match="invalid byte length"):
+        quantized_shortlist([("truncated", query[:2])], query, 4, 1)
+
+
 def test_content_logging_is_explicit_and_does_not_change_digest_audit(benchmark_settings, tmp_path):
     settings = replace(benchmark_settings, log_dir=tmp_path / "logs")
     assert MemoryService(settings).sync().ok

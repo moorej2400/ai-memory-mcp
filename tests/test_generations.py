@@ -310,6 +310,9 @@ def test_retention_keeps_current_and_one_last_good_generation(
     assert len(markdown_snapshots) == 2
     assert len(graph_snapshots) == 2
     assert not (settings.state_dir / f"generation-{published[0]}.json").exists()
+    archived_manifest = settings.state_dir / "retired-generations" / f"generation-{published[0]}.json"
+    assert archived_manifest.is_file()
+    assert result.retention_removed_files > 0
     assert ArtifactStore(settings).count("message") == 1
     assert retained_object.read_bytes() == b"canonical object bytes"
 

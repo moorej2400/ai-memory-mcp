@@ -324,7 +324,8 @@ Only the independent Graphify Codebase skill uses that runtime.
 - Report health and freshness for every required layer.
 - Record privacy-safe latency, corpus, storage, growth, and failure metrics.
 - Return source paths for evidence.
-- Remove only derived snapshots through the approved retention process.
+- Archive old derived snapshots in `retired-generations` through the retention process.
+- Preserve canonical Markdown, raw artifacts, and stored objects during retention.
 - Stop and reap a recall worker when its deadline expires.
 
 ## Public tools
@@ -362,3 +363,9 @@ Each recall result contains `status`, `intent`, `evidence`, `citations`, `relati
 - [Cerebras knowledge base design](https://www.cerebras.ai/blog/how-we-built-our-knowledge-base)
 - [Anthropic contextual retrieval](https://www.anthropic.com/engineering/contextual-retrieval)
 - [Microsoft GraphRAG query modes](https://microsoft.github.io/graphrag/query/overview/)
+
+### Retention counters
+
+`retention_removed_files` and `retention_removed_bytes` count old derived files moved to `retired-generations`.
+The field names remain unchanged for compatibility.
+These counters do not indicate deletion of canonical memory.

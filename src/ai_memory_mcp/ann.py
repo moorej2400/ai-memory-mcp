@@ -59,6 +59,11 @@ def quantized_shortlist(
         block = list(islice(iterator, block_size))
         if not block:
             break
+        # An empty embedding has no ANN candidate. Older artifact segments can
+        # store its compact vector as an empty BLOB rather than NULL.
+        block = [row for row in block if row[1]]
+        if not block:
+            continue
         identities = numpy.asarray([str(row[0]) for row in block], dtype=object)
         payload = b"".join(bytes(row[1]) for row in block)
         if len(payload) != len(block) * dimensions:

@@ -262,6 +262,14 @@ Do not duplicate skill-authoring instructions inside ordinary memory notes.
 
 ## Refresh Derived Retrieval
 
+Normal synchronization maintains rebuildable indexes separately from canonical memory.
+Retention moves old derived snapshots into `retired-generations` and preserves active and last-good generations.
+The legacy `retention_removed_files` and `retention_removed_bytes` counters describe retirement from active index storage.
+They do not report deletion of canonical Markdown, raw artifact records, or stored objects.
+Temporary build files and stale leases can be removed during normal index maintenance.
+Do not treat these maintenance counters alone as memory loss or a reason to stop synchronization.
+Protect canonical data and report any actual canonical-data failure separately.
+
 After one or more material memory writes:
 
 1. Call `memory_sync` after a Markdown batch or raw artifact change.

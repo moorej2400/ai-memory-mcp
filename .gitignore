@@ -4,6 +4,7 @@ graphify-out/
 /logs/
 .migration-archive/
 .env
+.env.backup*
 /local.agents.md
 .coverage
 build/

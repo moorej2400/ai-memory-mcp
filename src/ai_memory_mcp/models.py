@@ -266,7 +266,10 @@ class SyncResponse(StrictOutput):
     graph_snapshot: str | None = None
     index: SyncIndexResult | None = None
     artifact_index: ArtifactIndexResult | None = None
-    retention_removed_files: int = Field(default=0, ge=0)
+    retention_removed_files: int = Field(
+        default=0, ge=0,
+        description="Derived files moved to retired-generations, not deleted memory.",
+    )
     retention_removed_bytes: int = Field(default=0, ge=0)
     errors: list[str] = Field(default_factory=list)
 
