@@ -186,7 +186,8 @@ Explicit identity-only requests retain their direct lookup path.
 Existing structured arguments retain their documented scope behavior.
 Exact dates serialize through the worker boundary in a canonical, timezone-aware format.
 Unsupported argument combinations return a clear validation error rather than a silently narrowed search.
-This work does not add new filters or a broader cross-source filter language.
+Historical-message follow-up adds explicit sender-name and parent-conversation filters.
+It does not infer these filters from ordinary query sentences.
 
 Scope restrictions apply before expansion, context reads, and graph traversal.
 These restrictions come from explicit arguments and access controls, not inferred sentence criteria.

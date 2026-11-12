@@ -72,6 +72,8 @@ class RecallArguments(BaseModel):
     path_prefix: str | None = None
     source_label: str | None = None
     source_instance: str | None = None
+    author_name: str | None = Field(default=None, min_length=1, max_length=500)
+    conversation: str | None = None
     artifact_kind: str | None = None
     date_from: datetime | None = None
     date_to: datetime | None = None

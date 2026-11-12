@@ -1107,3 +1107,12 @@ def test_sync_does_not_publish_a_partial_generation(
     assert result.artifact_index is None
     assert result.errors
     assert not settings.generation_pointer_path.exists()
+
+
+def test_query_uses_recorded_provider_after_configuration_change(artifact_settings):
+    _populate(artifact_settings)
+    build_artifact_vector_index(artifact_settings)
+    changed = replace(artifact_settings, embedding_provider="model2vec", embedding_model="not-a-cached-model")
+    result = search_artifact_vectors(changed, "deployment credential rotation", ArtifactScope(), 8)
+    assert result.hits
+    assert not result.stale

@@ -205,6 +205,8 @@ def test_markdown_backend_transition_rebuilds_all_ann_signatures(
 
 
 def test_auto_falls_back_to_hashed_without_model2vec(monkeypatch) -> None:
+    from ai_memory_mcp.embedding import _load_cached_model
+    _load_cached_model.cache_clear()
     monkeypatch.setitem(sys.modules, "model2vec", None)
     provider = resolve_provider("auto", dimensions=64)
     assert provider.name == "hashed"
@@ -212,6 +214,8 @@ def test_auto_falls_back_to_hashed_without_model2vec(monkeypatch) -> None:
 
 
 def test_explicit_model2vec_raises_when_missing(monkeypatch) -> None:
+    from ai_memory_mcp.embedding import _load_cached_model
+    _load_cached_model.cache_clear()
     monkeypatch.setitem(sys.modules, "model2vec", None)
     with pytest.raises(EmbeddingUnavailable) as error:
         resolve_provider("model2vec")

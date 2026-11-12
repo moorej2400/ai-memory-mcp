@@ -61,6 +61,8 @@ REVIEW_OVERDUE_PENALTY = 0.03
 RAW_FRESHNESS_CAP = 0.03
 RAW_CHAT_HALF_LIFE_DAYS = 30.0
 RAW_MEETING_HALF_LIFE_DAYS = 90.0
+MIXED_RRF_K = 10
+
 RAW_ARTIFACT_WARNING = (
     "Raw artifact evidence is a lead. Verify the source context or distill it "
     "before use as durable memory."
@@ -112,10 +114,12 @@ def merge_artifact_evidence(
     if markdown_packet is not None:
         for rank, original in enumerate(markdown_packet.results, start=1):
             hit = copy.deepcopy(original)
-            # Markdown has already been reranked and answer-checked. Preserve
-            # its final scores and ordering. Replacing scores with a single RRF
-            # vote lets two weak raw producers bury an answer-checked passage.
+            # Preserve the Markdown ordering, not its accumulated score scale.
+            # Keep a bounded preference for its leading answer-checked result.
             hit.ranks = {"distilled": rank}
+            hit.score = 1.0 / (MIXED_RRF_K + rank)
+            if rank == 1 and markdown_packet.answer_status == "answered":
+                hit.score += 0.10
             combined[hit.memory_id] = hit
 
     producer_ranks = {"artifact-fts": 0, "artifact-vector": 0}
@@ -129,7 +133,7 @@ def merge_artifact_evidence(
         # later producer lists weaker only because the caller concatenated them.
         producer_ranks[ranking] += 1
         rank = producer_ranks[ranking]
-        score = 1.0 / (settings.rrf_k + rank)
+        score = 1.0 / (MIXED_RRF_K + rank)
         hit = SearchHit(
             memory_id=raw.artifact_id,
             source_id=f"artifact-{raw.source}",
@@ -148,6 +152,8 @@ def merge_artifact_evidence(
             occurred_at=(
                 raw.occurred_at.isoformat() if raw.occurred_at is not None else None
             ),
+            author_name=raw.author_name,
+            parent_artifact_uri=raw.parent_artifact_uri,
             artifact_kind=raw.entity,
             external_id=raw.external_id,
             segment_id=raw.segment_id,
@@ -196,19 +202,22 @@ def merge_artifact_evidence(
         3,
     )
     rerank_started = time.perf_counter()
-    raw_candidates = list(combined[uri] for uri in raw_by_uri)
-    for hit in raw_candidates:
-        # Feed raw text the same bounded relevance signals as Markdown. Keep
-        # producer ranks for diagnostics; aliases are only reranker inputs.
-        if "artifact-fts" in hit.ranks:
-            hit.ranks["lexical"] = hit.ranks["artifact-fts"]
-        if "artifact-vector" in hit.ranks:
-            hit.ranks["semantic"] = hit.ranks["artifact-vector"]
-            hit.signals["semantic"] = hit.signals.get("artifact-vector", 0.0)
-    RetrievalEngine._rerank_hits(query, raw_candidates, len(raw_candidates), now)
-    for hit in raw_candidates:
-        hit.ranks.pop("lexical", None)
-        hit.ranks.pop("semantic", None)
+    # Compare all sources on the same rank scale. Similarity magnitudes from
+    # different embedding providers are not calibrated relevance probabilities.
+    query_terms = set(tokenize(query)) - STOPWORDS
+    for hit in combined.values():
+        # Correlated producers must not count as independent confirmation.
+        # Preserve the strongest rank and give agreement only a small bonus.
+        if hit.evidence_class != "distilled":
+            votes = sorted((1.0 / (MIXED_RRF_K + rank) for rank in hit.ranks.values()), reverse=True)
+            hit.score = votes[0] + 0.15 * sum(votes[1:])
+        text_terms = set(tokenize(f"{hit.title} {hit.heading} {hit.text} {hit.author_name}"))
+        coverage = len(query_terms & text_terms) / max(1, len(query_terms))
+        hit.signals["query_coverage"] = coverage
+        hit.score += 0.02 * coverage
+        if hit.author_name and set(tokenize(hit.author_name)) & query_terms:
+            hit.score += 0.03
+            hit.reasons.append("sender name match")
     for uri, raw in raw_by_uri.items():
         hit = combined[uri]
         reason = _raw_exact_reason(query, raw)
@@ -249,7 +258,7 @@ def merge_artifact_evidence(
         else {
             "scope": {},
             "retrievers": [],
-            "fusion": f"RRF(k={settings.rrf_k})",
+            "fusion": f"RRF(k={MIXED_RRF_K})",
             "rerank": True,
             "context_expansion": False,
         }
@@ -344,7 +353,7 @@ def _distributed_query_coverage(
     matched: set[str] = set()
     for hit in hits:
         searchable = (
-            f"{hit.memory_id} {hit.path} {hit.title} {hit.heading} {hit.text}"
+            f"{hit.memory_id} {hit.path} {hit.title} {hit.heading} {hit.text} {hit.author_name}"
         )
         matched.update(content_query & set(tokenize(searchable)))
     return len(matched) / len(content_query)
@@ -672,7 +681,7 @@ class RetrievalEngine:
         intent_expansions = _intent_expansions(query_tokens)
         identifiers = [value.casefold() for value in query_identifiers(query)]
         for hit in hits:
-            searchable = f"{hit.memory_id} {hit.path} {hit.title} {hit.heading} {hit.text}".casefold()
+            searchable = f"{hit.memory_id} {hit.path} {hit.title} {hit.heading} {hit.text} {hit.author_name}".casefold()
             title = hit.title.casefold()
             matched_ids = [identifier for identifier in identifiers if identifier in searchable]
             if matched_ids:

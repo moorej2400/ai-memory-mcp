@@ -264,6 +264,12 @@ def create_server(settings: Settings | None = None) -> FastMCP:
                 description="Optional raw artifact connector instance.",
             ),
         ] = None,
+        author_name: Annotated[
+            str | None, Field(min_length=1, max_length=500, description="Exact sender display name, case-insensitive."),
+        ] = None,
+        conversation: Annotated[
+            str | None, Field(description="Parent conversation artifact URI or artifact ID."),
+        ] = None,
         artifact_kind: Annotated[
             Literal[
                 "conversation",
@@ -311,6 +317,8 @@ def create_server(settings: Settings | None = None) -> FastMCP:
             "path_prefix": path_prefix,
             "source_label": source_label,
             "source_instance": source_instance,
+            "author_name": author_name,
+            "conversation": conversation,
             "artifact_kind": artifact_kind,
             "date_from": date_from,
             "date_to": date_to,

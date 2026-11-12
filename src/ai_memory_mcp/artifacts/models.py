@@ -189,6 +189,7 @@ class ArtifactIngestReceipt(StrictModel):
 
 
 class ArtifactScope(StrictModel):
+    author_name: str | None = Field(default=None, min_length=1, max_length=500)
     source: str | None = Field(default=None, pattern=SOURCE_PATTERN.pattern)
     source_instance: str | None = Field(
         default=None, pattern=SOURCE_PATTERN.pattern

@@ -80,6 +80,8 @@ class SearchHit:
     artifact_uri: str | None = None
     source_label: str | None = None
     source_instance: str | None = None
+    author_name: str = ""
+    parent_artifact_uri: str | None = None
     occurred_at: str | None = None
     artifact_kind: str | None = None
     external_id: str | None = None
@@ -126,6 +128,8 @@ class RecallEvidence(StrictOutput):
     artifact_uri: str | None = None
     source_label: str | None = None
     source_instance: str | None = None
+    author_name: str = ""
+    parent_artifact_uri: str | None = None
     occurred_at: str | None = None
     segment_id: str | None = None
     segment_start: int | None = Field(default=None, ge=0)
@@ -144,6 +148,8 @@ class RecallCitation(StrictOutput):
     artifact_uri: str | None = None
     source_label: str | None = None
     source_instance: str | None = None
+    author_name: str = ""
+    parent_artifact_uri: str | None = None
     occurred_at: str | None = None
     segment_id: str | None = None
     segment_start: int | None = Field(default=None, ge=0)

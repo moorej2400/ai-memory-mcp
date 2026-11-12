@@ -151,6 +151,10 @@ For recall requests:
 
 1. Determine the likely domain, collection, record type, and generic scope.
 2. Call `memory_recall` with the narrowest known filters.
+   For historical messages, set `artifact_kind="message"` and the known `source_label`.
+   Use `author_name` for an exact sender name. Use `conversation` for a known parent artifact URI.
+   Keep the topic in `query`. Do not require a remembered command or exact quotation.
+   If recall misses an expected message, retry a shorter topic query and inspect nearby source context.
 3. Inspect the returned source ID, Markdown path, status, freshness, and provenance.
 4. Prefer an active canonical memory note over legacy session or vault results.
 5. Check `execution` before you interpret `result_kind` in response version 2.

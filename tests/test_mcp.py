@@ -81,6 +81,8 @@ def test_public_tool_surface_is_small_and_stable(
         "source_label",
         "source_instance",
         "artifact_kind",
+        "author_name",
+        "conversation",
         "date_from",
         "date_to",
     } <= set(tools["memory_recall"].parameters["properties"])

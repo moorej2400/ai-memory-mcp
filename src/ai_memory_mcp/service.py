@@ -428,6 +428,8 @@ class MemoryService:
         path_prefix: str | None = None,
         source_label: str | None = None,
         source_instance: str | None = None,
+        author_name: str | None = None,
+        conversation: str | None = None,
         artifact_kind: str | None = None,
         date_from: str | datetime | None = None,
         date_to: str | datetime | None = None,
@@ -453,6 +455,8 @@ class MemoryService:
             "path_prefix": path_prefix is not None,
             "source_label": source_label is not None,
             "source_instance": source_instance is not None,
+            "author_name": author_name is not None,
+            "conversation": conversation is not None,
             "artifact_kind": artifact_kind is not None,
             "date_from": date_from is not None,
             "date_to": date_to is not None,
@@ -463,6 +467,8 @@ class MemoryService:
             for value in (
                 source_label,
                 source_instance,
+                author_name,
+                conversation,
                 artifact_kind,
                 date_from,
                 date_to,
@@ -538,6 +544,8 @@ class MemoryService:
                     path_prefix=path_prefix,
                     source_label=source_label,
                     source_instance=source_instance,
+                    author_name=author_name,
+                    conversation=conversation,
                     artifact_kind=artifact_kind,
                     date_from=date_from,
                     date_to=date_to,
@@ -545,6 +553,10 @@ class MemoryService:
                     pinned=pinned,
                     execution_state=execution_state,
                 )
+                if metadata.get("embedding_provider") == "hashed" and "artifact_fts" in execution_state.completed_providers:
+                    response.warnings.append(
+                        "Artifact similarity uses hashed word and character features, not a language model."
+                    )
                 if pinned.engine is not None and "markdown" in execution_state.completed_providers:
                     if pinned.engine.provider_warning:
                         execution_state.reason_codes.append("semantic_unavailable")
@@ -630,6 +642,8 @@ class MemoryService:
         path_prefix: str | None = None,
         source_label: str | None = None,
         source_instance: str | None = None,
+        author_name: str | None = None,
+        conversation: str | None = None,
         artifact_kind: str | None = None,
         date_from: str | datetime | None = None,
         date_to: str | datetime | None = None,
@@ -661,6 +675,8 @@ class MemoryService:
             for value in (
                 source_label,
                 source_instance,
+                author_name,
+                conversation,
                 artifact_kind,
                 date_from,
                 date_to,
@@ -717,6 +733,8 @@ class MemoryService:
             artifact_scope = ArtifactScope(
                 source=source_label,
                 source_instance=source_instance,
+                author_name=author_name,
+                parent=conversation,
                 entities=(artifact_kind,) if artifact_kind else (),
                 date_from=date_from,
                 date_to=date_to,
@@ -775,6 +793,8 @@ class MemoryService:
             artifact_scope = ArtifactScope(
                 source=source_label,
                 source_instance=source_instance,
+                author_name=author_name,
+                parent=conversation,
                 entities=(artifact_kind,) if artifact_kind else (),
                 date_from=date_from,
                 date_to=date_to,
@@ -1027,6 +1047,8 @@ class MemoryService:
                 artifact_uri=hit.artifact_uri,
                 source_label=hit.source_label,
                 source_instance=hit.source_instance,
+                author_name=hit.author_name,
+                parent_artifact_uri=hit.parent_artifact_uri,
                 occurred_at=hit.occurred_at,
                 segment_id=hit.segment_id,
                 segment_start=hit.segment_start,
@@ -1047,6 +1069,8 @@ class MemoryService:
                 artifact_uri=hit.artifact_uri,
                 source_label=hit.source_label,
                 source_instance=hit.source_instance,
+                author_name=hit.author_name,
+                parent_artifact_uri=hit.parent_artifact_uri,
                 occurred_at=hit.occurred_at,
                 segment_id=hit.segment_id,
                 segment_start=hit.segment_start,
@@ -1069,6 +1093,8 @@ class MemoryService:
         warnings.extend(source_warnings)
         if markdown_used and self.engine.provider_warning:
             warnings.append(self.engine.provider_warning)
+        if markdown_used and self.engine.provider is not None and self.engine.provider.name == "hashed":
+            warnings.append("Markdown similarity uses hashed word and character features, not a language model.")
         semantic_details = packet.diagnostics.get("semantic_search", {})
         if markdown_used and semantic_details.get("budget_exhausted"):
             warnings.append(

@@ -74,6 +74,10 @@ flowchart TB
 
 Each signal group supplies its own ranked view.
 Fusion combines those views, and no group receives a rank penalty from list order.
+Mixed-source fusion compares producer ranks, not embedding score magnitudes.
+A bounded bonus preserves an answer-checked leading note.
+Sender names remain available during ranking and in source citations.
+Explicit sender and conversation filters apply before candidate limits.
 
 ## Components
 
@@ -104,6 +108,8 @@ The index includes scope fields and source identities for segment visibility che
 The next successful synchronization rebuilds incompatible derived vector indexes.
 Canonical Markdown and artifact records do not change.
 
+See [historical message retrieval](historical-message-retrieval.md) for sender filters and local model setup.
+
 ### Exact and lexical retrieval
 
 SQLite FTS5 supplies exact and lexical results.
@@ -119,6 +125,8 @@ Provision the model in the local Hugging Face cache before use.
 Normal indexing and recall load the cached model without network access.
 If the model is not in the cache, the provider reports an error without a download.
 The hashed feature provider is the automatic fallback.
+Recall reports this limited word and character similarity in its warnings.
+It does not describe hashed features as equivalent to language embeddings.
 The semantic index stays local and does not need an external API.
 
 The index records the embedding provider that built it.

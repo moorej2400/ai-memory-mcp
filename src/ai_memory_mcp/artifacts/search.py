@@ -188,6 +188,9 @@ class ArtifactSearch:
         if selected_scope.source_instance is not None:
             conditions.append("a.source_instance = ?")
             parameters.append(selected_scope.source_instance)
+        if selected_scope.author_name is not None:
+            conditions.append("a.author_name = ? COLLATE NOCASE")
+            parameters.append(selected_scope.author_name)
         if selected_scope.entities:
             if selected_scope.entities == ("meeting",):
                 conditions.append(
@@ -197,6 +200,9 @@ class ArtifactSearch:
                 placeholders = ", ".join("?" for _ in selected_scope.entities)
                 conditions.append(f"a.entity IN ({placeholders})")
                 parameters.extend(selected_scope.entities)
+        if selected_scope.parent is not None:
+            conditions.append("a.parent_artifact_id = ?")
+            parameters.append(_parent_id(selected_scope.parent))
         if selected_scope.parent is not None:
             conditions.append("a.parent_artifact_id = ?")
             parameters.append(_parent_id(selected_scope.parent))
@@ -285,6 +291,9 @@ class ArtifactSearch:
         if selected_scope.source_instance is not None:
             conditions.append("a.source_instance = ?")
             parameters.append(selected_scope.source_instance)
+        if selected_scope.author_name is not None:
+            conditions.append("a.author_name = ? COLLATE NOCASE")
+            parameters.append(selected_scope.author_name)
         if selected_scope.entities:
             placeholders = ", ".join("?" for _ in selected_scope.entities)
             conditions.append(f"a.entity IN ({placeholders})")
@@ -372,6 +381,9 @@ class ArtifactSearch:
         if selected_scope.source_instance is not None:
             conditions.append("source_instance = ?")
             parameters.append(selected_scope.source_instance)
+        if selected_scope.author_name is not None:
+            conditions.append("author_name = ? COLLATE NOCASE")
+            parameters.append(selected_scope.author_name)
         if selected_scope.entities:
             placeholders = ", ".join("?" for _ in selected_scope.entities)
             conditions.append(f"entity IN ({placeholders})")

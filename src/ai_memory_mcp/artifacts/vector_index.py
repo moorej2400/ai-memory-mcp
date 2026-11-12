@@ -1406,12 +1406,13 @@ def search_artifact_vectors(
     current = index_path or current_artifact_index_path(settings)
     if current is None:
         return ArtifactVectorSearchResult()
-    provider = _query_provider(
-        settings.embedding_provider,
-        settings.embedding_model,
-        settings.semantic_dimensions,
-    )
     metadata = _metadata(current)
+    # A newly installed model must not change queries against an older index.
+    provider = _query_provider(
+        metadata.get("embedding_provider", "hashed"),
+        metadata.get("embedding_model", ""),
+        int(metadata.get("embedding_dimensions", settings.semantic_dimensions)),
+    )
     if not settings.artifact_db.is_file():
         return ArtifactVectorSearchResult(available=True, stale=True)
     canonical_counter = (
@@ -1434,6 +1435,9 @@ def search_artifact_vectors(
     if scope.source_instance is not None:
         conditions.append("b.source_instance = ?")
         parameters.append(scope.source_instance)
+    if scope.author_name is not None:
+        conditions.append("b.burst_id IN (SELECT burst_id FROM bursts WHERE author_name = ? COLLATE NOCASE)")
+        parameters.append(scope.author_name)
     meeting_scope = scope.entities == ("meeting",)
     if scope.entities:
         if meeting_scope:

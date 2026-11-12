@@ -178,6 +178,7 @@ def test_artifact_producer_agreement_adds_both_fusion_votes(
     hit = packet.results[0]
     assert hit.ranks == {"artifact-fts": 1, "artifact-vector": 1}
     assert hit.score >= (2.0 / (artifact_settings.rrf_k + 1))
+    assert hit.score < (2.0 / 11)  # Correlated producers are not two full votes.
 
 
 def test_empty_exact_candidate_does_not_answer_from_a_burst(
@@ -612,3 +613,80 @@ def test_status_and_ordered_read_include_artifact_state(
     read = service.artifact_read(reference, include_payload=True)
     assert read.focus == reference
     assert read.records[0].text == "Use the documented rotation procedure."
+
+
+def test_historical_instructions_survive_vector_distractors(artifact_settings):
+    """A strong lexical match must not lose to a page of weak vector matches."""
+    from ai_memory_mcp.models import EvidencePacket, SearchHit
+
+    target = ArtifactSearchHit(
+        artifact_id="instructions", artifact_uri="artifact://message/instructions",
+        entity="message", source="chat-source", source_instance="workspace",
+        author_name="Morgan, Casey", text="Dashboard local setup: use the emulator and bootstrap your identity.",
+        score=0.98,
+    )
+    distractors = [ArtifactSearchHit(
+        artifact_id=f"noise-{i}", artifact_uri=f"artifact://message/noise-{i}",
+        entity="message", source="chat-source", source_instance="workspace",
+        text="A local service is running.", evidence_class="burst", score=0.9,
+    ) for i in range(64)]
+    summaries = EvidencePacket(query="", answer_status="no_answer", plan={}, diagnostics={}, results=[
+        SearchHit(memory_id="generic", source_id="core", path="generic.md", title="Local setup",
+                  heading="", text="Generic setup for another application", score=0.9)
+    ])
+    result = merge_artifact_evidence(
+        "Casey dashboard local setup", summaries, [target, *distractors],
+        settings=artifact_settings, now=datetime.now(timezone.utc), limit=8,
+    )
+    assert result.results[0].memory_id == "instructions"
+    assert result.results[0].author_name == "Morgan, Casey"
+
+
+def test_author_scope_reaches_recall_and_exact_lookup(artifact_settings):
+    from ai_memory_mcp.artifacts.models import ArtifactActor
+    store = ArtifactStore(artifact_settings)
+    for i, name in enumerate(["Morgan, Casey", "Lee, Taylor"]):
+        batch = _raw_batch(batch_id=f"author-{i}", external_id=f"author-message-{i}", text="Dashboard emulator setup instructions.")
+        batch.events[0].payload.author = ArtifactActor(name=name)
+        store.apply_batch(batch)
+    service = MemoryService(artifact_settings)
+    assert service.sync().ok
+    result = service.recall("dashboard emulator", author_name="morgan, casey", artifact_kind="message")
+    assert result.evidence
+    assert all(x.author_name == "Morgan, Casey" for x in result.evidence)
+    assert all(x.author_name == "Morgan, Casey" for x in result.citations)
+    exact = service.recall(result.evidence[0].artifact_uri, author_name="Lee, Taylor")
+    assert not exact.evidence
+    assert any("hashed" in w for w in result.warnings)
+
+
+def test_conversation_filter_applies_before_lexical_limit(artifact_settings):
+    from ai_memory_mcp.artifacts.models import ArtifactReference
+    store = ArtifactStore(artifact_settings)
+    for i in range(2):
+        store.apply_batch(_raw_batch(batch_id=f"parent-{i}", external_id=f"chat-{i}", entity="conversation"))
+        batch = _raw_batch(batch_id=f"child-{i}", external_id=f"child-{i}", text="Dashboard emulator setup instructions.")
+        batch.events[0].parent = ArtifactReference(entity="conversation", external_id=f"chat-{i}")
+        store.apply_batch(batch)
+    service = MemoryService(artifact_settings)
+    assert service.sync().ok
+    parent = artifact_uri("conversation", artifact_id("chat-source", "workspace", "conversation", "chat-0"))
+    result = service.recall("dashboard emulator", conversation=parent)
+    assert result.evidence
+    assert all(x.parent_artifact_uri == parent for x in result.evidence)
+
+
+def test_worker_preserves_sender_filter(artifact_settings):
+    from ai_memory_mcp.artifacts.models import ArtifactActor
+    from ai_memory_mcp.recall_worker import recall_in_worker, _close_pools
+    batch = _raw_batch(text="Dashboard local emulator setup.")
+    batch.events[0].payload.author = ArtifactActor(name="Morgan, Casey")
+    ArtifactStore(artifact_settings).apply_batch(batch)
+    assert MemoryService(artifact_settings).sync().ok
+    try:
+        response = recall_in_worker(artifact_settings, {
+            "query": "dashboard local", "author_name": "Morgan, Casey", "artifact_kind": "message"
+        })
+        assert response.evidence[0].author_name == "Morgan, Casey"
+    finally:
+        _close_pools()
